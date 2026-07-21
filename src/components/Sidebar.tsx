@@ -33,7 +33,7 @@ const NAV: NavDef[] = [
 export default function Sidebar() {
   return (
     <div class="app-pane w-236px flex-none bg-sidebar border-r border-border flex flex-col p-[22px_14px] box-border">
-      <div class="flex items-center gap-2.5 p-[2px_6px_18px]">
+      <button class="flex items-center gap-2.5 p-[2px_6px_18px]" onClick={() => actions.openInformationModal()}>
         <div class="w-28px h-28px rounded-8px bg-accent flex-none flex items-center justify-center shadow-sm">
           <span class="font-display text-accent-fg text-15px font-700 leading-none pt-0.5">Y</span>
         </div>
@@ -41,7 +41,7 @@ export default function Sidebar() {
           <div class="font-display font-600 text-15.5px tracking-[0.06em] text-fg">YELLOW LORE</div>
           <div class="text-9.5px text-fg-muted tracking-[0.18em] uppercase mt-0.75">Codex de saber</div>
         </div>
-      </div>
+      </button>
 
       <VaultSwitcher />
 

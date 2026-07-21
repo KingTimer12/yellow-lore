@@ -117,6 +117,7 @@ export type State = {
   settings: Settings;
   savedToast: boolean;
   vaultModalOpen: boolean;
+  informationModalOpen: boolean;
   /// True when the vault was embedded with a different model than the current
   /// one — offer a reindex. `reindexing` guards the in-flight re-embed.
   indexStale: boolean;
@@ -170,6 +171,7 @@ const initial: State = {
   settings: DEFAULT_SETTINGS,
   savedToast: false,
   vaultModalOpen: false,
+  informationModalOpen: false,
   indexStale: false,
   reindexing: false,
   citation: null,
@@ -286,6 +288,8 @@ export const actions = {
     }
   },
 
+  openInformationModal: () => setState({ informationModalOpen: true }),
+  closeInformationModal: () => setState({ informationModalOpen: false }),
   openVaultModal: () => setState({ vaultModalOpen: true }),
   closeVaultModal: () => setState({ vaultModalOpen: false }),
   /// Confirm the create-vault modal: persist the chosen provider settings, then

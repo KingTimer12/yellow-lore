@@ -9,6 +9,7 @@ import PlacesView from "./components/PlacesView";
 import SettingsView from "./components/SettingsView";
 import EditDrawer from "./components/EditDrawer";
 import CreateVaultModal from "./components/CreateVaultModal";
+import InformationModal from "./components/InformationModal";
 import CitationModal from "./components/CitationModal";
 import Ornament from "./components/Ornament";
 
@@ -100,6 +101,7 @@ export default function App() {
         </div>
       </Show>
       <CreateVaultModal />
+      <InformationModal />
       <CitationModal />
     </div>
   );
