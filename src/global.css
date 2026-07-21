@@ -1,0 +1,77 @@
+/* Base tweaks the UnoCSS reset does not cover. */
+* {
+  box-sizing: border-box;
+}
+body {
+  margin: 0;
+}
+input,
+textarea {
+  font-family: inherit;
+}
+input::placeholder,
+textarea::placeholder {
+  color: inherit;
+  opacity: 0.5;
+}
+input:focus,
+textarea:focus {
+  border-color: var(--accent);
+}
+
+/* ---- Motion --------------------------------------------------------------
+   Transform/opacity only, 160–260ms, ease-out on enter. Every animation
+   conveys a spatial relationship (view swap, message arrival, drawer origin).
+   Fully disabled under prefers-reduced-motion. */
+
+@keyframes dc-fade-up {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: none; }
+}
+@keyframes dc-fade {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+@keyframes dc-pop {
+  from { opacity: 0; transform: scale(0.96); }
+  to   { opacity: 1; transform: none; }
+}
+@keyframes dc-slide-in {
+  from { transform: translateX(100%); }
+  to   { transform: none; }
+}
+@keyframes dc-blink {
+  0%, 80%, 100% { opacity: 0.2; transform: translateY(0); }
+  40%           { opacity: 1;   transform: translateY(-2px); }
+}
+
+.anim-view    { animation: dc-fade-up 0.24s cubic-bezier(0.16, 1, 0.3, 1) both; }
+.anim-fade    { animation: dc-fade 0.2s ease-out both; }
+.anim-pop     { animation: dc-pop 0.2s cubic-bezier(0.16, 1, 0.3, 1) both; }
+.anim-msg     { animation: dc-fade-up 0.26s cubic-bezier(0.16, 1, 0.3, 1) both; }
+.anim-overlay { animation: dc-fade 0.18s ease-out both; }
+.anim-drawer  { animation: dc-slide-in 0.26s cubic-bezier(0.16, 1, 0.3, 1) both; }
+
+/* Staggered card/list entrance (30–50ms per item). */
+.anim-stagger { animation: dc-fade-up 0.28s cubic-bezier(0.16, 1, 0.3, 1) both; }
+
+/* Typing / retrieval indicator */
+.typing-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  animation: dc-blink 1.2s infinite ease-in-out both;
+}
+.typing-dot:nth-child(2) { animation-delay: 0.16s; }
+.typing-dot:nth-child(3) { animation-delay: 0.32s; }
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+}
