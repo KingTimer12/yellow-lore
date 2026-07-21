@@ -6,9 +6,8 @@ export default function VaultSwitcher() {
   const [open, setOpen] = createSignal(false);
   const active = () => state.vaults.find((v) => v.id === state.activeVaultId);
 
-  async function newVault() {
-    const name = window.prompt("Nome do novo vault (obra):");
-    if (name) await actions.createVault(name);
+  function newVault() {
+    actions.openVaultModal();
     setOpen(false);
   }
   async function rename(id: string, current: string) {
@@ -16,7 +15,6 @@ export default function VaultSwitcher() {
     if (name) await actions.renameVault(id, name);
   }
   async function remove(id: string, name: string) {
-    if (state.vaults.length <= 1) return;
     if (window.confirm(`Excluir o vault "${name}" e todo o seu conhecimento?`)) {
       await actions.deleteVault(id);
     }
@@ -54,14 +52,12 @@ export default function VaultSwitcher() {
                 >
                   editar
                 </div>
-                <Show when={state.vaults.length > 1}>
-                  <div
-                    class="hidden group-hover:block text-12px text-fg-muted hover:text-danger px-1"
-                    onClick={(e) => { e.stopPropagation(); remove(v.id, v.name); }}
-                  >
-                    ×
-                  </div>
-                </Show>
+                <div
+                  class="hidden group-hover:block text-12px text-fg-muted hover:text-danger px-1"
+                  onClick={(e) => { e.stopPropagation(); remove(v.id, v.name); }}
+                >
+                  ×
+                </div>
               </div>
             )}
           </For>
