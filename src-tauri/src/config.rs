@@ -18,6 +18,11 @@ pub struct RagConfig {
     pub openai_api_key: String,
     pub openai_base_url: String,
     pub ollama_endpoint: String,
+    /// vLLM OpenAI-compatible server (e.g. http://localhost:8000/v1). Key optional.
+    #[serde(default = "default_vllm_base_url")]
+    pub vllm_base_url: String,
+    #[serde(default)]
+    pub vllm_api_key: String,
 
     // --- Agent behaviour ---
     /// System prompt the user can tune to steer answers.
@@ -28,6 +33,19 @@ pub struct RagConfig {
     pub chunk_overlap: usize, // approx tokens of overlap
     pub top_k: usize,         // retrieved chunks per query
     pub show_sources: bool,
+
+    /// Run an extra LLM pass after extraction to merge entities that refer to the
+    /// same person/place (nicknames, titles) beyond the name-substring heuristic.
+    #[serde(default = "default_true")]
+    pub dedup_entities: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_vllm_base_url() -> String {
+    "http://localhost:8000/v1".into()
 }
 
 pub const DEFAULT_SYSTEM_PROMPT: &str = "Você é o assistente do Yellow Lore. \
@@ -45,11 +63,14 @@ impl Default for RagConfig {
             openai_api_key: String::new(),
             openai_base_url: "https://api.openai.com/v1".into(),
             ollama_endpoint: "http://localhost:11434".into(),
+            vllm_base_url: default_vllm_base_url(),
+            vllm_api_key: String::new(),
             system_prompt: DEFAULT_SYSTEM_PROMPT.into(),
             chunk_size: 800,
             chunk_overlap: 120,
             top_k: 5,
             show_sources: true,
+            dedup_entities: true,
         }
     }
 }
