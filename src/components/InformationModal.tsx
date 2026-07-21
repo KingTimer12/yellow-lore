@@ -1,103 +1,98 @@
-import { For, Show } from "solid-js";
+import { Show, onCleanup, onMount } from "solid-js";
 import { state, actions } from "../store";
-import { type ProviderMeta } from "../theme";
+import { appVersion } from "../version";
+import Ornament from "./Ornament";
+import logo from "../assets/logo.svg";
 
-/// First-run modal: name the vault and set the minimum provider info needed to
-/// use it. Provider fields write straight to settings and are persisted on
-/// confirm; full tuning still lives in Configurações.
+/// "Sobre" modal: identity, version and credits. Opened from the sidebar brand.
 export default function InformationModal() {
-  function close() {
-    actions.closeInformationModal();
-  }
-
   return (
     <Show when={state.informationModalOpen}>
-      <div
-        onClick={close}
-        class="fixed inset-0 z-50 flex items-center justify-center p-6 anim-overlay"
-        style={{ background: "oklch(0 0 0 / 0.5)" }}
-      >
-        <div
-          onClick={(e) => e.stopPropagation()}
-          class="w-540px max-w-full max-h-[88vh] overflow-y-auto bg-panel border border-border rounded-16px p-7 box-border anim-pop"
-        >
-          <div class="flex items-center justify-between mb-1.5">
-            <div class="font-serif text-21px font-600">Yellow Lore</div>
-            <div
-              onClick={close}
-              class="w-7 h-7 rounded-6px flex items-center justify-center cursor-pointer text-fg-muted text-16px transition-colors duration-150 hover:bg-hover hover:text-fg"
-            >
-              ×
-            </div>
-          </div>
-          <p>Versão: 0.1.0</p>
-          <p>Desenvolvido por: Aaron King</p>
-        </div>
-      </div>
+      <ModalBody />
     </Show>
   );
 }
 
-// ---- pieces ---------------------------------------------------------------
+function ModalBody() {
+  const close = () => actions.closeInformationModal();
 
-function ProviderPick(props: {
-  title: string;
-  providers: ProviderMeta[];
-  selected: string;
-  onSelect: (id: string) => void;
-  model: string;
-  onModel: (v: string) => void;
-  modelPlaceholder: string;
-}) {
+  // Esc closes — the listener only lives while the modal is mounted.
+  onMount(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") close();
+    };
+    window.addEventListener("keydown", onKey);
+    onCleanup(() => window.removeEventListener("keydown", onKey));
+  });
+
   return (
-    <div class="flex flex-col gap-2.5">
-      <div class="text-11.5px font-bold text-fg-muted uppercase tracking-[0.04em]">{props.title}</div>
-      <div class="grid grid-cols-3 gap-2">
-        <For each={props.providers}>
-          {(p) => {
-            const active = () => p.id === props.selected;
-            return (
-              <div
-                onClick={() => props.onSelect(p.id)}
-                class="px-2.5 py-2 rounded-8px cursor-pointer border-1.5 text-center transition-all duration-150"
-                classList={{ "border-accent bg-accent-soft": active(), "border-border bg-bg hover:border-fg-muted": !active() }}
-              >
-                <div class="text-12.5px font-bold">{p.label}</div>
-              </div>
-            );
-          }}
-        </For>
+    <div
+      onClick={close}
+      class="fixed inset-0 z-50 flex items-center justify-center p-6 anim-overlay"
+      style={{ background: "oklch(0 0 0 / 0.5)", "backdrop-filter": "blur(3px)" }}
+    >
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-label="Sobre o Yellow Lore"
+        onClick={(e) => e.stopPropagation()}
+        class="relative w-420px max-w-full max-h-[88vh] overflow-y-auto bg-panel border border-border rounded-16px px-8 pt-9 pb-7 box-border anim-pop shadow-[0_24px_70px_-18px_rgba(0,0,0,0.65)]"
+      >
+        <button
+          onClick={close}
+          aria-label="Fechar"
+          class="absolute top-3.5 right-3.5 w-7 h-7 rounded-6px flex items-center justify-center cursor-pointer bg-transparent border-none text-fg-muted transition-colors duration-150 hover:bg-hover hover:text-fg"
+        >
+          <div class="i-lucide-x text-15px" />
+        </button>
+
+        {/* Brand */}
+        <div class="flex flex-col items-center text-center gap-3">
+          <img
+            src={logo}
+            alt="Yellow Lore"
+            class="w-16 h-16 rounded-full flex-none bg-transparent shadow-[0_6px_20px_-4px_rgba(0,0,0,0.5)]"
+          />
+          <div class="flex flex-col items-center gap-1">
+            <div class="font-display text-24px font-700 tracking-[0.08em] uppercase">Yellow Lore</div>
+            <div class="text-10.5px text-fg-muted tracking-[0.22em] uppercase">Codex de saber</div>
+          </div>
+          <Ornament class="max-w-72px my-0.5" />
+          <p class="font-reading text-14px text-fg-muted leading-[1.6] max-w-320px">
+            Base de conhecimento com IA. Guarde suas obras em vaults isolados e
+            interrogue-as — o assistente sempre busca na base antes de responder.
+          </p>
+        </div>
+
+        {/* Meta */}
+        <div class="mt-6 flex flex-col rounded-12px border border-border overflow-hidden">
+          <InfoRow label="Versão" value={appVersion()} />
+          <InfoRow label="Autor" value="Aaron King" />
+          <InfoRow label="Licença" value="MIT" />
+          <InfoRow label="Stack" value="SolidJS · UnoCSS · Tauri · SQLite" last />
+        </div>
+
+        <button
+          onClick={close}
+          class="mt-6 w-full py-3 rounded-8px bg-accent text-accent-fg text-13.5px font-bold cursor-pointer border-none transition-transform active:scale-95"
+        >
+          Fechar
+        </button>
       </div>
-      <input
-        value={props.model}
-        placeholder={props.modelPlaceholder}
-        onInput={(e) => props.onModel(e.currentTarget.value)}
-        class="w-full px-3 py-2.5 rounded-8px border border-border bg-bg text-fg text-14px box-border outline-none transition-colors"
-      />
     </div>
   );
 }
 
-function Divider(props: { label: string }) {
+function InfoRow(props: { label: string; value: string; last?: boolean }) {
   return (
-    <div class="flex items-center gap-3">
-      <div class="text-11.5px font-bold text-fg-muted uppercase tracking-[0.04em] whitespace-nowrap">{props.label}</div>
-      <div class="flex-1 h-px bg-border" />
-    </div>
-  );
-}
-
-function Field(props: { label: string; value: string; onInput: (v: string) => void; type?: string; placeholder?: string }) {
-  return (
-    <div>
-      <label class="text-11.5px font-semibold text-fg-muted uppercase tracking-[0.04em]">{props.label}</label>
-      <input
-        type={props.type ?? "text"}
-        value={props.value}
-        placeholder={props.placeholder ?? ""}
-        onInput={(e) => props.onInput(e.currentTarget.value)}
-        class="w-full mt-1.5 px-3 py-2.5 rounded-8px border border-border bg-bg text-fg text-14px box-border outline-none transition-colors"
-      />
+    <div
+      class="flex items-center justify-between gap-4 px-4 py-3 bg-bg"
+      classList={{ "border-b border-border": !props.last }}
+    >
+      <div class="text-11px font-bold text-fg-muted uppercase tracking-[0.06em] flex-none">
+        {props.label}
+      </div>
+      <div class="text-13px text-fg text-right">{props.value}</div>
     </div>
   );
 }

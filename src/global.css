@@ -8,8 +8,18 @@
 * {
   box-sizing: border-box;
 }
-body {
+/* Opaque window: native decoration is off, but the window itself is opaque and
+   fills edge-to-edge, so the OS draws the shadow (and corner rounding) around
+   the real window bounds — no transparent gutter. Solid dark base avoids a
+   white flash before the app mounts. */
+html,
+body,
+#root {
   margin: 0;
+  height: 100%;
+  background: oklch(0.17 0.01 260);
+}
+body {
   font-family: -apple-system, 'Inter', 'Helvetica Neue', Helvetica, Arial, sans-serif;
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;

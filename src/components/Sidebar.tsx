@@ -2,6 +2,7 @@ import { For, Show } from "solid-js";
 import { state, actions, type View } from "../store";
 import VaultSwitcher from "./VaultSwitcher";
 import Ornament from "./Ornament";
+import logo from "../assets/logo.svg";
 
 function openSession(id: string) {
   actions.openSession(id);
@@ -33,15 +34,13 @@ const NAV: NavDef[] = [
 export default function Sidebar() {
   return (
     <div class="app-pane w-236px flex-none bg-sidebar border-r border-border flex flex-col p-[22px_14px] box-border">
-      <button class="flex items-center gap-2.5 p-[2px_6px_18px]" onClick={() => actions.openInformationModal()}>
-        <div class="w-28px h-28px rounded-8px bg-accent flex-none flex items-center justify-center shadow-sm">
-          <span class="font-display text-accent-fg text-15px font-700 leading-none pt-0.5">Y</span>
-        </div>
+      {/*<button class="flex items-center gap-2.5 p-[2px_6px_18px]" onClick={() => actions.openInformationModal()}>
+        <img src={logo} alt="Yellow Lore" class="w-28px h-28px rounded-full flex-none bg-transparent shadow-[0_3px_12px_-2px_rgba(0,0,0,0.45)]" />
         <div class="flex flex-col leading-none">
           <div class="font-display font-600 text-15.5px tracking-[0.06em] text-fg">YELLOW LORE</div>
           <div class="text-9.5px text-fg-muted tracking-[0.18em] uppercase mt-0.75">Codex de saber</div>
         </div>
-      </button>
+      </button>*/}
 
       <VaultSwitcher />
 
