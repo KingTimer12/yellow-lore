@@ -19,40 +19,43 @@ export type ThemeTokens = {
   danger: string;
 };
 
+// "The Amber Codex": a night scriptorium. The name Yellow Lore is taken
+// literally — the accent is lamplight gold, set against warm ink (dark) and
+// aged parchment (light). Hues sit in the warm 60–90° band, never cold blue.
 export const DARK: ThemeTokens = {
-  bg: "oklch(0.17 0.01 260)",
-  panel: "oklch(0.205 0.012 260)",
-  sidebar: "oklch(0.14 0.01 260)",
-  fg: "oklch(0.95 0.004 260)",
-  "fg-muted": "oklch(0.64 0.012 260)",
-  border: "oklch(0.30 0.012 260)",
-  hover: "oklch(0.26 0.012 260)",
-  accent: "oklch(0.68 0.17 255)",
-  "accent-fg": "oklch(0.99 0.005 255)",
-  "accent-soft": "oklch(0.68 0.17 255 / 0.16)",
-  success: "oklch(0.68 0.15 145)",
-  "success-soft": "oklch(0.68 0.15 145 / 0.16)",
-  warning: "oklch(0.75 0.14 80)",
-  "warning-soft": "oklch(0.75 0.14 80 / 0.16)",
-  danger: "oklch(0.63 0.18 25)",
+  bg: "oklch(0.168 0.014 66)",
+  panel: "oklch(0.212 0.016 68)",
+  sidebar: "oklch(0.138 0.013 64)",
+  fg: "oklch(0.935 0.018 82)",
+  "fg-muted": "oklch(0.66 0.028 78)",
+  border: "oklch(0.305 0.02 70)",
+  hover: "oklch(0.258 0.018 70)",
+  accent: "oklch(0.805 0.135 82)",
+  "accent-fg": "oklch(0.20 0.035 70)",
+  "accent-soft": "oklch(0.805 0.135 82 / 0.15)",
+  success: "oklch(0.72 0.12 152)",
+  "success-soft": "oklch(0.72 0.12 152 / 0.16)",
+  warning: "oklch(0.74 0.145 52)",
+  "warning-soft": "oklch(0.74 0.145 52 / 0.16)",
+  danger: "oklch(0.64 0.185 28)",
 };
 
 export const LIGHT: ThemeTokens = {
-  bg: "oklch(0.985 0.003 260)",
-  panel: "oklch(1 0 0)",
-  sidebar: "oklch(0.965 0.005 260)",
-  fg: "oklch(0.24 0.01 260)",
-  "fg-muted": "oklch(0.50 0.012 260)",
-  border: "oklch(0.885 0.008 260)",
-  hover: "oklch(0.94 0.006 260)",
-  accent: "oklch(0.56 0.16 255)",
-  "accent-fg": "oklch(0.99 0.005 255)",
-  "accent-soft": "oklch(0.56 0.16 255 / 0.10)",
-  success: "oklch(0.55 0.14 145)",
-  "success-soft": "oklch(0.55 0.14 145 / 0.12)",
-  warning: "oklch(0.60 0.14 70)",
-  "warning-soft": "oklch(0.60 0.14 70 / 0.14)",
-  danger: "oklch(0.55 0.18 25)",
+  bg: "oklch(0.963 0.016 88)",
+  panel: "oklch(0.992 0.008 88)",
+  sidebar: "oklch(0.942 0.018 86)",
+  fg: "oklch(0.255 0.022 62)",
+  "fg-muted": "oklch(0.48 0.028 64)",
+  border: "oklch(0.865 0.02 82)",
+  hover: "oklch(0.922 0.02 84)",
+  accent: "oklch(0.585 0.13 68)",
+  "accent-fg": "oklch(0.99 0.012 86)",
+  "accent-soft": "oklch(0.585 0.13 68 / 0.12)",
+  success: "oklch(0.52 0.13 152)",
+  "success-soft": "oklch(0.52 0.13 152 / 0.13)",
+  warning: "oklch(0.58 0.14 55)",
+  "warning-soft": "oklch(0.58 0.14 55 / 0.14)",
+  danger: "oklch(0.55 0.19 28)",
 };
 
 export function themeVars(theme: "dark" | "light"): Record<string, string> {
@@ -62,11 +65,13 @@ export function themeVars(theme: "dark" | "light"): Record<string, string> {
   );
 }
 
+// Warm, codex-friendly avatar hues (amber, rust, wine, moss, bronze).
 export const AVATAR_HUES = [
-  "oklch(0.62 0.15 255)",
-  "oklch(0.62 0.15 20)",
-  "oklch(0.62 0.15 320)",
-  "oklch(0.62 0.15 145)",
+  "oklch(0.70 0.14 78)",
+  "oklch(0.62 0.16 40)",
+  "oklch(0.55 0.15 15)",
+  "oklch(0.60 0.12 150)",
+  "oklch(0.58 0.10 95)",
 ];
 
 export function initials(name: string): string {
@@ -76,16 +81,18 @@ export function initials(name: string): string {
 
 export type ProviderMeta = { id: string; label: string; hint: string };
 
-// Only Ollama (local) and OpenAI are wired in the Rust backend. LLM and
-// embedding pick a provider independently.
+// Ollama (local), OpenAI and vLLM (OpenAI-compatible server) are wired in the
+// Rust backend. LLM and embedding pick a provider independently.
 export const LLM_PROVIDERS: ProviderMeta[] = [
   { id: "ollama", label: "Ollama (local)", hint: "Modelos locais, sem API key" },
   { id: "openai", label: "OpenAI", hint: "GPT-4o, GPT-4.1, o-series" },
+  { id: "vllm", label: "vLLM", hint: "Servidor OpenAI-compatível (self-hosted)" },
 ];
 
 export const EMBED_PROVIDERS: ProviderMeta[] = [
   { id: "ollama", label: "Ollama (local)", hint: "nomic-embed-text, mxbai-embed-large" },
   { id: "openai", label: "OpenAI", hint: "text-embedding-3-small / large" },
+  { id: "vllm", label: "vLLM", hint: "Modelos de embedding servidos via vLLM" },
 ];
 
 export function providerLabel(id: string): string {

@@ -27,8 +27,15 @@ export default defineConfig({
       danger: "var(--danger)",
     },
     fontFamily: {
-      sans: "-apple-system, 'Helvetica Neue', Helvetica, Arial, sans-serif",
-      mono: "ui-monospace, 'SF Mono', Menlo, monospace",
+      // UI chrome stays in a clean humanist sans.
+      sans: "-apple-system, 'Inter', 'Helvetica Neue', Helvetica, Arial, sans-serif",
+      // Display: engraved caps for the brand / big titles (Cinzel → serif).
+      display: "'Cinzel', 'Cormorant Garamond', 'Iowan Old Style', Georgia, serif",
+      // Serif: characterful headings (Cormorant Garamond).
+      serif: "'Cormorant Garamond', 'Iowan Old Style', Georgia, 'Times New Roman', serif",
+      // Reading: the prose face for assistant answers (Crimson Pro).
+      reading: "'Crimson Pro', 'Iowan Old Style', Georgia, serif",
+      mono: "ui-monospace, 'SF Mono', 'JetBrains Mono', Menlo, monospace",
     },
   },
 });
