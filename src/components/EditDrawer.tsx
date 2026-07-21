@@ -19,7 +19,7 @@ export default function EditDrawer() {
           class="w-420px h-full bg-panel border-l border-border p-7 box-border overflow-y-auto anim-drawer"
         >
           <div class="flex items-center justify-between mb-5.5">
-            <div class="text-16px font-bold">{title()}</div>
+            <div class="font-serif text-20px font-600">{title()}</div>
             <div
               onClick={actions.closeEdit}
               class="w-7 h-7 rounded-6px flex items-center justify-center cursor-pointer text-fg-muted text-16px transition-colors duration-150 hover:bg-hover hover:text-fg"

@@ -9,11 +9,14 @@ export default function SettingsView() {
   const usesOllama = createMemo(
     () => state.settings.llmProvider === "ollama" || state.settings.embeddingProvider === "ollama",
   );
+  const usesVllm = createMemo(
+    () => state.settings.llmProvider === "vllm" || state.settings.embeddingProvider === "vllm",
+  );
 
   return (
     <div class="p-8 overflow-y-auto overflow-x-hidden h-full w-full box-border flex flex-col gap-7.5 anim-view">
       <div>
-        <div class="text-18px font-bold">Configurações</div>
+        <div class="font-serif text-24px font-600 tracking-[0.01em]">Configurações</div>
         <div class="text-13px text-fg-muted mt-1">
           LLM e embedding são configurados separadamente. O agente sempre busca na base antes de responder.
         </div>
@@ -57,6 +60,13 @@ export default function SettingsView() {
           <Field label="Endpoint local" value={state.settings.ollamaEndpoint} onInput={(v) => actions.setSetting("ollamaEndpoint", v)} placeholder="http://localhost:11434" />
         </div>
       </Show>
+      <Show when={usesVllm()}>
+        <div class="flex flex-col gap-4">
+          <Divider label="vLLM" />
+          <Field label="Base URL" value={state.settings.vllmBaseUrl} onInput={(v) => actions.setSetting("vllmBaseUrl", v)} placeholder="http://localhost:8000/v1" />
+          <Field label="API Key (opcional)" type="password" value={state.settings.vllmApiKey} onInput={(v) => actions.setSetting("vllmApiKey", v)} />
+        </div>
+      </Show>
 
       {/* System prompt */}
       <div class="flex flex-col gap-4">
@@ -79,21 +89,17 @@ export default function SettingsView() {
           <Slider label={`Overlap (${state.settings.chunkOverlap} tk)`} min={0} max={400} step={20} value={state.settings.chunkOverlap} onInput={(v) => actions.setSetting("chunkOverlap", v)} />
           <Slider label={`Top-k (${state.settings.topK})`} min={1} max={12} step={1} value={state.settings.topK} onInput={(v) => actions.setSetting("topK", v)} />
         </div>
-        <div
-          onClick={() => actions.setSetting("showSources", !state.settings.showSources)}
-          class="flex items-center gap-2.5 cursor-pointer"
-        >
-          <div
-            class="w-9 h-5 rounded-10px relative flex-none transition-colors duration-150"
-            classList={{ "bg-accent": state.settings.showSources, "bg-border": !state.settings.showSources }}
-          >
-            <div
-              class="w-4 h-4 rounded-full bg-white absolute top-0.5 transition-all duration-150"
-              classList={{ "left-4.5": state.settings.showSources, "left-0.5": !state.settings.showSources }}
-            />
-          </div>
-          <div class="text-13px">Mostrar trechos-fonte nas respostas do chat</div>
-        </div>
+        <Toggle
+          on={state.settings.showSources}
+          onToggle={() => actions.setSetting("showSources", !state.settings.showSources)}
+          label="Mostrar trechos-fonte nas respostas do chat"
+        />
+        <Toggle
+          on={state.settings.dedupEntities}
+          onToggle={() => actions.setSetting("dedupEntities", !state.settings.dedupEntities)}
+          label="Unificar entidades duplicadas via LLM na extração"
+          hint="Passo extra que mescla apelidos/nomes parciais (ex.: “Cesar” = “Cesar Magnus”). Uma chamada de LLM a mais por extração."
+        />
       </div>
 
       <div class="flex items-center gap-3.5">
@@ -126,7 +132,7 @@ function ProviderSection(props: {
   return (
     <div class="flex flex-col gap-3">
       <div class="text-12px font-bold text-fg-muted uppercase tracking-[0.04em]">{props.title}</div>
-      <div class="grid grid-cols-2 gap-2.5">
+      <div class="grid grid-cols-3 gap-2.5">
         <For each={props.providers}>
           {(p) => {
             const active = () => p.id === props.selected;
@@ -144,6 +150,28 @@ function ProviderSection(props: {
         </For>
       </div>
       <Field label={props.modelLabel} value={props.model} onInput={props.onModel} placeholder={props.modelPlaceholder} />
+    </div>
+  );
+}
+
+function Toggle(props: { on: boolean; onToggle: () => void; label: string; hint?: string }) {
+  return (
+    <div>
+      <div onClick={props.onToggle} class="flex items-center gap-2.5 cursor-pointer">
+        <div
+          class="w-9 h-5 rounded-10px relative flex-none transition-colors duration-150"
+          classList={{ "bg-accent": props.on, "bg-border": !props.on }}
+        >
+          <div
+            class="w-4 h-4 rounded-full bg-white absolute top-0.5 transition-all duration-150"
+            classList={{ "left-4.5": props.on, "left-0.5": !props.on }}
+          />
+        </div>
+        <div class="text-13px">{props.label}</div>
+      </div>
+      <Show when={props.hint}>
+        <div class="text-11.5px text-fg-muted mt-1 ml-11.5 leading-[1.45]">{props.hint}</div>
+      </Show>
     </div>
   );
 }

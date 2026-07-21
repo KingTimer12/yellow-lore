@@ -6,7 +6,7 @@ export default function PlacesView() {
     <div class="p-8 overflow-y-auto h-full box-border flex flex-col gap-5.5 anim-view">
       <div class="flex items-center justify-between flex-wrap gap-3.5">
         <div>
-          <div class="text-18px font-bold">Lugares</div>
+          <div class="font-serif text-24px font-600 tracking-[0.01em]">Lugares</div>
           <div class="text-13px text-fg-muted mt-1">
             Locais e resumos de lore extraídos da base — edite para corrigir
           </div>
@@ -40,7 +40,7 @@ export default function PlacesView() {
               <div class="flex items-center gap-3">
                 <div class="w-10 h-10 flex-none rounded-10px bg-accent-soft" />
                 <div class="flex-1 min-w-0">
-                  <div class="text-14.5px font-bold">{p.name}</div>
+                  <div class="font-serif text-17px font-600 leading-tight">{p.name}</div>
                   <div class="text-12px text-fg-muted">{p.type}</div>
                 </div>
                 <div

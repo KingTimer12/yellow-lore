@@ -11,14 +11,31 @@ export default function KnowledgeView() {
   const [busy, setBusy] = createSignal(false);
   const [err, setErr] = createSignal("");
 
+  const BINARY_EXT = /\.(pdf|docx)$/i;
+
+  function toBase64(buf: ArrayBuffer): string {
+    const bytes = new Uint8Array(buf);
+    let bin = "";
+    const CHUNK = 0x8000; // avoid arg-length limits on large files
+    for (let i = 0; i < bytes.length; i += CHUNK) {
+      bin += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
+    }
+    return btoa(bin);
+  }
+
   async function handleFiles(files: FileList | null) {
     if (!files || !files.length) return;
     setErr("");
     setBusy(true);
     try {
       for (const file of Array.from(files)) {
-        const content = await file.text();
-        await actions.ingestDocument(file.name, content);
+        if (BINARY_EXT.test(file.name)) {
+          const data = toBase64(await file.arrayBuffer());
+          await actions.ingestBinaryDocument(file.name, data);
+        } else {
+          const content = await file.text();
+          await actions.ingestDocument(file.name, content);
+        }
       }
     } catch (e) {
       setErr(String(e));
@@ -32,7 +49,7 @@ export default function KnowledgeView() {
     <div class="p-8 overflow-y-auto h-full box-border flex flex-col gap-5.5 anim-view">
       <div class="flex items-center justify-between flex-wrap gap-3.5">
         <div>
-          <div class="text-18px font-bold">Base de conhecimento</div>
+          <div class="font-serif text-24px font-600 tracking-[0.01em]">Base de conhecimento</div>
           <div class="text-13px text-fg-muted mt-1">Documentos indexados para busca (RAG)</div>
         </div>
         <input
@@ -43,11 +60,30 @@ export default function KnowledgeView() {
         />
       </div>
 
+      <Show when={state.indexStale}>
+        <div class="flex items-center gap-3.5 rounded-12px border border-warning bg-warning-soft px-4 py-3">
+          <div class="i-lucide-refresh-cw w-4.5 h-4.5 flex-none text-warning" classList={{ "animate-spin": state.reindexing }} />
+          <div class="flex-1 min-w-0">
+            <div class="text-13px font-semibold text-fg">Índice desatualizado</div>
+            <div class="text-12px text-fg-muted mt-0.5">
+              O modelo de embedding mudou. Reindexe para que a busca use os vetores do modelo atual.
+            </div>
+          </div>
+          <button
+            onClick={() => actions.reindex()}
+            disabled={state.reindexing}
+            class="px-3.5 py-2 rounded-8px bg-accent text-accent-fg text-12.5px font-bold cursor-pointer border-none whitespace-nowrap transition-transform active:scale-95 disabled:opacity-60 disabled:cursor-not-allowed"
+          >
+            {state.reindexing ? "Reindexando..." : "Reindexar"}
+          </button>
+        </div>
+      </Show>
+
       <input
         ref={fileInput}
         type="file"
         multiple
-        accept=".txt,.md,.markdown,text/*"
+        accept=".txt,.md,.markdown,.pdf,.docx,text/*,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
         class="hidden"
         onChange={(e) => handleFiles(e.currentTarget.files)}
       />
@@ -62,7 +98,7 @@ export default function KnowledgeView() {
         <div class="text-13.5px font-semibold">
           {busy() ? "Indexando..." : "Arraste arquivos aqui ou clique para selecionar"}
         </div>
-        <div class="text-12px">TXT, Markdown (PDF/DOCX em breve)</div>
+        <div class="text-12px">TXT, Markdown, PDF, DOCX</div>
       </div>
       <Show when={err()}>
         <div class="text-12.5px text-danger">{err()}</div>
