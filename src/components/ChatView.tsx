@@ -127,13 +127,27 @@ export default function ChatView() {
           placeholder="Pergunte algo sobre seus documentos..."
           class="flex-1 px-4 py-3 rounded-10px border border-border bg-panel text-fg text-14px outline-none transition-colors"
         />
-        <button
-          onClick={() => actions.sendMessage()}
-          disabled={state.pending || !state.chatInput.trim()}
-          class="gap-2 px-4 py-3 rounded-10px bg-accent text-accent-fg text-14px font-bold cursor-pointer whitespace-nowrap border-none transition-all active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed"
+        <Show
+          when={state.pending}
+          fallback={
+            <button
+              onClick={() => actions.sendMessage()}
+              disabled={!state.chatInput.trim()}
+              aria-label="Enviar"
+              class="flex items-center justify-center px-4 py-3 rounded-10px bg-accent text-accent-fg text-14px font-bold cursor-pointer whitespace-nowrap border-none transition-all active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              <i class="i-lucide-send w-4.5 h-4.5" />
+            </button>
+          }
         >
-          <i class="i-lucide-send p-2" /> 
-        </button>
+          <button
+            onClick={() => actions.stopGeneration()}
+            aria-label="Parar"
+            class="flex items-center gap-2 px-4 py-3 rounded-10px bg-danger text-white text-14px font-bold cursor-pointer whitespace-nowrap border-none transition-all active:scale-95"
+          >
+            <i class="i-lucide-square w-4 h-4" /> Parar
+          </button>
+        </Show>
       </div>
     </div>
   );

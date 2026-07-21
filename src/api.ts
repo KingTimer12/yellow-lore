@@ -55,6 +55,8 @@ export const api = {
     channel.onmessage = onEvent;
     return tauriInvoke<void>("ask_stream", { question, history, onEvent: channel });
   },
+  // stop an in-flight streaming answer
+  cancelGeneration: () => tauriInvoke<void>("cancel_generation"),
 
   // chat sessions
   listSessions: () => tauriInvoke<Session[]>("list_sessions"),

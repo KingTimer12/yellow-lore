@@ -10,6 +10,7 @@ export default function KnowledgeView() {
   let fileInput: HTMLInputElement | undefined;
   const [busy, setBusy] = createSignal(false);
   const [err, setErr] = createSignal("");
+  const [dragOver, setDragOver] = createSignal(false);
 
   const BINARY_EXT = /\.(pdf|docx)$/i;
 
@@ -89,14 +90,24 @@ export default function KnowledgeView() {
       />
       <div
         onClick={() => fileInput?.click()}
-        onDragOver={(e) => e.preventDefault()}
-        onDrop={(e) => { e.preventDefault(); handleFiles(e.dataTransfer?.files ?? null); }}
-        class="border-1.5 border-dashed border-border rounded-14px p-8.5 flex flex-col items-center gap-2.5 text-fg-muted cursor-pointer transition-colors duration-150 hover:border-accent hover:text-accent"
-        classList={{ "opacity-60 pointer-events-none": busy() }}
+        onDragEnter={(e) => { e.preventDefault(); setDragOver(true); }}
+        onDragOver={(e) => { e.preventDefault(); if (e.dataTransfer) e.dataTransfer.dropEffect = "copy"; }}
+        onDragLeave={(e) => { e.preventDefault(); setDragOver(false); }}
+        onDrop={(e) => {
+          e.preventDefault();
+          setDragOver(false);
+          void handleFiles(e.dataTransfer?.files ?? null);
+        }}
+        class="border-1.5 border-dashed rounded-14px p-8.5 flex flex-col items-center gap-2.5 cursor-pointer transition-colors duration-150"
+        classList={{
+          "opacity-60 pointer-events-none": busy(),
+          "border-accent text-accent bg-accent-soft": dragOver(),
+          "border-border text-fg-muted hover:border-accent hover:text-accent": !dragOver(),
+        }}
       >
         <div class="w-34px h-34px rounded-10px border-2 border-current" />
         <div class="text-13.5px font-semibold">
-          {busy() ? "Indexando..." : "Arraste arquivos aqui ou clique para selecionar"}
+          {busy() ? "Indexando..." : dragOver() ? "Solte para indexar" : "Arraste arquivos aqui ou clique para selecionar"}
         </div>
         <div class="text-12px">TXT, Markdown, PDF, DOCX</div>
       </div>
