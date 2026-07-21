@@ -1,6 +1,11 @@
 import { Match, Show, Switch, onMount } from "solid-js";
 import { state, actions } from "./store";
 import { themeVars } from "./theme";
+import { initWindow } from "./window";
+import { loadAppVersion } from "./version";
+import { checkForUpdates } from "./update";
+import TitleBar from "./components/TitleBar";
+import UpdateBanner from "./components/UpdateBanner";
 import Sidebar from "./components/Sidebar";
 import ChatView from "./components/ChatView";
 import KnowledgeView from "./components/KnowledgeView";
@@ -63,46 +68,52 @@ function SettingsStandalone() {
 }
 
 export default function App() {
-  onMount(() => { void actions.init(); });
+  onMount(() => { void actions.init(); void initWindow(); void loadAppVersion(); void checkForUpdates(); });
   const hasVault = () => !!state.activeVaultId;
   return (
     <div
-      class="app-shell flex w-100vw h-100vh bg-bg text-fg font-sans overflow-hidden"
+      class="win-root flex w-100vw h-100vh box-border"
       style={themeVars(state.theme)}
     >
-      <Show
-        when={hasVault()}
-        fallback={
-          <Show when={state.view === "settings"} fallback={<NoVault />}>
-            <SettingsStandalone />
+      <div class="app-shell flex flex-col flex-1 min-w-0 bg-bg text-fg font-sans overflow-hidden">
+        <TitleBar />
+        <UpdateBanner />
+        <div class="flex flex-1 min-h-0 overflow-hidden">
+          <Show
+            when={hasVault()}
+            fallback={
+              <Show when={state.view === "settings"} fallback={<NoVault />}>
+                <SettingsStandalone />
+              </Show>
+            }
+          >
+            <Sidebar />
+            <div class="app-pane flex-1 flex flex-col min-w-0">
+              <Switch>
+                <Match when={state.view === "chat"}>
+                  <ChatView />
+                </Match>
+                <Match when={state.view === "knowledge"}>
+                  <KnowledgeView />
+                </Match>
+                <Match when={state.view === "characters"}>
+                  <CharactersView />
+                </Match>
+                <Match when={state.view === "places"}>
+                  <PlacesView />
+                </Match>
+                <Match when={state.view === "settings"}>
+                  <SettingsView />
+                </Match>
+              </Switch>
+              <EditDrawer />
+            </div>
           </Show>
-        }
-      >
-        <Sidebar />
-        <div class="app-pane flex-1 flex flex-col min-w-0">
-          <Switch>
-            <Match when={state.view === "chat"}>
-              <ChatView />
-            </Match>
-            <Match when={state.view === "knowledge"}>
-              <KnowledgeView />
-            </Match>
-            <Match when={state.view === "characters"}>
-              <CharactersView />
-            </Match>
-            <Match when={state.view === "places"}>
-              <PlacesView />
-            </Match>
-            <Match when={state.view === "settings"}>
-              <SettingsView />
-            </Match>
-          </Switch>
-          <EditDrawer />
         </div>
-      </Show>
-      <CreateVaultModal />
-      <InformationModal />
-      <CitationModal />
+        <CreateVaultModal />
+        <InformationModal />
+        <CitationModal />
+      </div>
     </div>
   );
 }

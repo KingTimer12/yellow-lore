@@ -13,6 +13,7 @@ use db::{Character, ChatSession, Db, DocMeta, Entities, Place, StoredMessage, Va
 use error::{AppError, AppResult};
 use rag::Answer;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::Manager;
 use tokio::sync::Mutex;
 
@@ -22,6 +23,8 @@ struct AppState {
     db: Db,
     config: Mutex<RagConfig>,
     data_dir: PathBuf,
+    /// Set by `cancel_generation` to stop an in-flight streaming answer.
+    cancel: AtomicBool,
 }
 
 impl AppState {
@@ -257,6 +260,9 @@ async fn ask_stream(
     let cfg = state.config.lock().await.clone();
     let chunks = state.db.load_chunks(&vault)?;
 
+    // Fresh generation — clear any leftover cancel request.
+    state.cancel.store(false, Ordering::Relaxed);
+
     let ch = on_event.clone();
     let result = rag::ask_stream(
         &state.client,
@@ -264,6 +270,7 @@ async fn ask_stream(
         &chunks,
         question,
         history.unwrap_or_default(),
+        &state.cancel,
         |tok| {
             let _ = ch.send(StreamEvent::Token { value: tok.to_string() });
         },
@@ -279,6 +286,13 @@ async fn ask_stream(
         }
     }
     Ok(())
+}
+
+/// Stop an in-flight streaming answer. The stream loop checks this flag and
+/// returns the partial text generated so far.
+#[tauri::command]
+fn cancel_generation(state: tauri::State<'_, AppState>) {
+    state.cancel.store(true, Ordering::Relaxed);
 }
 
 // ---- Chat sessions --------------------------------------------------------
@@ -373,7 +387,16 @@ fn update_place(state: tauri::State<'_, AppState>, place: Place) -> AppResult<()
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let builder = tauri::Builder::default();
+
+    // Auto-update stack (desktop only): the updater downloads/installs the signed
+    // bundle from the GitHub Release; process enables the relaunch afterwards.
+    #[cfg(desktop)]
+    let builder = builder
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_updater::Builder::new().build());
+
+    builder
         .setup(|app| {
             let data_dir = app
                 .path()
@@ -390,6 +413,7 @@ pub fn run() {
                 db,
                 config: Mutex::new(config),
                 data_dir,
+                cancel: AtomicBool::new(false),
             });
             Ok(())
         })
@@ -410,6 +434,7 @@ pub fn run() {
             reindex,
             ask,
             ask_stream,
+            cancel_generation,
             list_sessions,
             create_session,
             rename_session,
