@@ -58,6 +58,8 @@ export default function SettingsView() {
         <div class="flex flex-col gap-4">
           <Divider label="Ollama" />
           <Field label="Endpoint local" value={state.settings.ollamaEndpoint} onInput={(v) => actions.setSetting("ollamaEndpoint", v)} placeholder="http://localhost:11434" />
+          <Slider label={`Contexto — num_ctx (${state.settings.ollamaNumCtx})`} min={2048} max={32768} step={2048} value={state.settings.ollamaNumCtx} onInput={(v) => actions.setSetting("ollamaNumCtx", v)} />
+          <div class="text-11.5px text-fg-muted">Janela de contexto do Ollama. Modelos que "pensam" muito precisam de mais para não cortar a resposta no meio; reduza para poupar RAM/VRAM.</div>
         </div>
       </Show>
       <Show when={usesVllm()}>
@@ -88,6 +90,7 @@ export default function SettingsView() {
           <Slider label={`Chunk (${state.settings.chunkSize} tk)`} min={200} max={2000} step={50} value={state.settings.chunkSize} onInput={(v) => actions.setSetting("chunkSize", v)} />
           <Slider label={`Overlap (${state.settings.chunkOverlap} tk)`} min={0} max={400} step={20} value={state.settings.chunkOverlap} onInput={(v) => actions.setSetting("chunkOverlap", v)} />
           <Slider label={`Top-k (${state.settings.topK})`} min={1} max={12} step={1} value={state.settings.topK} onInput={(v) => actions.setSetting("topK", v)} />
+          <Slider label={`Temperatura (${state.settings.temperature.toFixed(1)})`} min={0} max={1} step={0.1} value={state.settings.temperature} onInput={(v) => actions.setSetting("temperature", v)} />
         </div>
         <Toggle
           on={state.settings.showSources}

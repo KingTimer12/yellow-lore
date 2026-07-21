@@ -72,12 +72,14 @@ export type Settings = {
   openaiApiKey: string;
   openaiBaseUrl: string;
   ollamaEndpoint: string;
+  ollamaNumCtx: number;
   vllmBaseUrl: string;
   vllmApiKey: string;
   systemPrompt: string;
   chunkSize: number;
   chunkOverlap: number;
   topK: number;
+  temperature: number;
   showSources: boolean;
   dedupEntities: boolean;
 };
@@ -134,6 +136,7 @@ export const DEFAULT_SETTINGS: Settings = {
   openaiApiKey: "",
   openaiBaseUrl: "https://api.openai.com/v1",
   ollamaEndpoint: "http://localhost:11434",
+  ollamaNumCtx: 8192,
   vllmBaseUrl: "http://localhost:8000/v1",
   vllmApiKey: "",
   systemPrompt:
@@ -141,6 +144,7 @@ export const DEFAULT_SETTINGS: Settings = {
   chunkSize: 800,
   chunkOverlap: 120,
   topK: 5,
+  temperature: 0.2,
   showSources: true,
   dedupEntities: true,
 };
@@ -346,12 +350,23 @@ export const actions = {
   },
 
   setChatInput: (chatInput: string) => setState({ chatInput }),
+  /// Stop an in-flight answer. Backend returns the partial text and fires the
+  /// `done` event, which clears `pending`.
+  stopGeneration() {
+    if (!state.pending) return;
+    if (isTauri) api.cancelGeneration().catch((e) => console.error(e));
+  },
   async sendMessage() {
     const text = state.chatInput.trim();
     if (!text || state.pending) return;
     // Snapshot the conversation so far as memory for the LLM (excludes the
-    // thinking blocks — only the final answers are replayed as context).
-    const history = state.messages.map((m) => ({ role: m.role, text: m.text }));
+    // thinking blocks — only the final answers are replayed as context). Skip any
+    // malformed or empty turn: a generation that was cancelled/truncated leaves an
+    // assistant message with empty text (and possibly no role), which would both
+    // pollute context and crash the command args (`missing field role`).
+    const history = state.messages
+      .filter((m) => (m.role === "user" || m.role === "assistant") && m.text.trim())
+      .map((m) => ({ role: m.role, text: m.text }));
 
     // A blank chat becomes a new saved session on its first message.
     let sessionId = state.currentSessionId;
