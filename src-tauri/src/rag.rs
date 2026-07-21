@@ -9,7 +9,10 @@ use uuid::Uuid;
 #[derive(Debug, Clone, Serialize)]
 pub struct Source {
     pub doc: String,
+    /// Short preview centered on the part of the chunk that matched the query.
     pub quote: String,
+    /// The full retrieved passage, shown in the citation modal.
+    pub text: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -70,13 +73,46 @@ fn file_kind(name: &str) -> String {
     }
 }
 
-fn short_quote(text: &str) -> String {
-    let trimmed = text.trim();
-    let mut q: String = trimmed.chars().take(160).collect();
-    if trimmed.chars().count() > 160 {
-        q.push('…');
+/// A ~200-char preview of `text`, centered on the earliest query term that
+/// appears in the chunk — so the quote shows *why* the passage was retrieved,
+/// not just its opening words. Falls back to the start when nothing matches.
+fn snippet(text: &str, question: &str) -> String {
+    let chars: Vec<char> = text.trim().chars().collect();
+    let n = chars.len();
+    if n == 0 {
+        return String::new();
     }
-    format!("\"{q}\"")
+    let lower: String = text.to_lowercase();
+
+    // Query terms worth matching (skip short stop-ish words).
+    let terms: Vec<String> = question
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| w.chars().count() > 3)
+        .map(|w| w.to_string())
+        .collect();
+
+    // Earliest byte match of any term → convert to a char index.
+    let hit_byte = terms.iter().filter_map(|t| lower.find(t.as_str())).min();
+    let center = match hit_byte {
+        Some(b) => lower[..b].chars().count(),
+        None => 0,
+    };
+
+    const WIN: usize = 200;
+    let start = center.saturating_sub(WIN / 3);
+    let end = (start + WIN).min(n);
+    let start = end.saturating_sub(WIN).min(start);
+
+    let mut out = String::new();
+    if start > 0 {
+        out.push('…');
+    }
+    out.extend(chars[start..end].iter());
+    if end < n {
+        out.push('…');
+    }
+    format!("\"{}\"", out.trim())
 }
 
 // ---- Ingestion ------------------------------------------------------------
@@ -89,7 +125,9 @@ pub async fn build_document(
     content: String,
 ) -> AppResult<BuiltDoc> {
     let pieces = chunk_text(&content, cfg.chunk_size, cfg.chunk_overlap);
-    let doc_id = Uuid::new_v4().to_string();
+    // Content-addressed id: re-ingesting identical bytes yields the same id, so
+    // the document row is replaced in place rather than duplicated.
+    let doc_id = blake3::hash(content.as_bytes()).to_hex().to_string();
     let vectors = if pieces.is_empty() {
         Vec::new()
     } else {
@@ -111,12 +149,23 @@ pub async fn build_document(
 
 // ---- Ask (RAG-first) ------------------------------------------------------
 
-pub async fn ask(
+/// One prior turn of the conversation, sent from the frontend so the LLM keeps
+/// context across the whole chat.
+#[derive(Debug, Clone, Deserialize)]
+pub struct HistoryTurn {
+    pub role: String, // "user" | "assistant"
+    pub text: String,
+}
+
+/// Retrieve context for a question and build the full chat message list
+/// (system + history + user), returning it alongside the deduped sources.
+async fn build_chat(
     client: &reqwest::Client,
     cfg: &RagConfig,
     chunks: &[Chunk],
     question: String,
-) -> AppResult<Answer> {
+    history: Vec<HistoryTurn>,
+) -> AppResult<(Vec<ChatMessage>, Vec<Source>)> {
     let mut sources: Vec<Source> = Vec::new();
     let mut context = String::new();
 
@@ -132,7 +181,8 @@ pub async fn ask(
             ));
             sources.push(Source {
                 doc: hit.chunk.doc_name.clone(),
-                quote: short_quote(&hit.chunk.text),
+                quote: snippet(&hit.chunk.text, &question),
+                text: hit.chunk.text.trim().to_string(),
             });
         }
     }
@@ -146,14 +196,94 @@ pub async fn ask(
         "{}\n\nContexto recuperado da base de conhecimento:\n{}",
         cfg.system_prompt, context_block
     );
-    let messages = vec![
-        ChatMessage { role: "system", content: system },
-        ChatMessage { role: "user", content: question },
-    ];
-    let text = providers::chat(client, cfg, &messages).await?;
+    let mut messages = vec![ChatMessage { role: "system", content: system }];
+    for turn in history {
+        let role = if turn.role == "assistant" { "assistant" } else { "user" };
+        messages.push(ChatMessage { role, content: turn.text });
+    }
+    messages.push(ChatMessage { role: "user", content: question });
 
     sources.dedup_by(|a, b| a.doc == b.doc && a.quote == b.quote);
+    Ok((messages, sources))
+}
+
+pub async fn ask(
+    client: &reqwest::Client,
+    cfg: &RagConfig,
+    chunks: &[Chunk],
+    question: String,
+    history: Vec<HistoryTurn>,
+) -> AppResult<Answer> {
+    let (messages, sources) = build_chat(client, cfg, chunks, question, history).await?;
+    let text = providers::chat(client, cfg, &messages).await?;
     Ok(Answer { text, sources })
+}
+
+/// Streaming variant of [`ask`]: `on_token` fires per generated text delta.
+/// The sources are returned once retrieval + generation complete.
+pub async fn ask_stream<F: FnMut(&str)>(
+    client: &reqwest::Client,
+    cfg: &RagConfig,
+    chunks: &[Chunk],
+    question: String,
+    history: Vec<HistoryTurn>,
+    on_token: F,
+) -> AppResult<Vec<Source>> {
+    let (messages, sources) = build_chat(client, cfg, chunks, question, history).await?;
+    providers::chat_stream(client, cfg, &messages, on_token).await?;
+    Ok(sources)
+}
+
+/// Generate a short session title (≈3–6 words) summarizing the topic, from the
+/// first user message and the assistant's answer. No quotes, no trailing period.
+pub async fn summarize_title(
+    client: &reqwest::Client,
+    cfg: &RagConfig,
+    question: &str,
+    answer: &str,
+) -> AppResult<String> {
+    let system = "Gere um TÍTULO curto (no máximo 6 palavras) que resuma o assunto da conversa. \
+Responda só o título, no idioma da conversa, sem aspas, sem markdown, sem ponto final. \
+Seja específico e conciso, como um título de conversa de chat. \
+Não raciocine em voz alta nem inclua qualquer texto além do título. /no_think";
+    let mut ans = answer.to_string();
+    ans.truncate(800);
+    let user = format!("Pergunta do usuário:\n{question}\n\nResposta:\n{ans}\n\nTítulo:");
+    let messages = vec![
+        ChatMessage { role: "system", content: system.to_string() },
+        ChatMessage { role: "user", content: user },
+    ];
+    let raw = providers::chat(client, cfg, &messages).await?;
+    // Reasoning models emit a <think>…</think> block first — drop it so the
+    // title isn't literally "<think>".
+    let raw = strip_think(&raw);
+    // Take the first non-empty line, strip surrounding quotes / trailing punctuation.
+    let mut t = raw
+        .lines()
+        .map(|l| l.trim())
+        .find(|l| !l.is_empty())
+        .unwrap_or("")
+        .trim_matches(|c| c == '"' || c == '\'' || c == '«' || c == '»' || c == '.')
+        .trim()
+        .to_string();
+    // Strip a leading "Título:" the model may echo.
+    if let Some(rest) = t.strip_prefix("Título:").or_else(|| t.strip_prefix("Titulo:")) {
+        t = rest.trim().to_string();
+    }
+    let chars: String = t.chars().take(60).collect();
+    Ok(chars)
+}
+
+/// Strip a leading `<think>…</think>` reasoning block (closed or still open).
+fn strip_think(raw: &str) -> String {
+    let s = raw.trim_start();
+    match s.find("<think>") {
+        None => raw.to_string(),
+        Some(open) => match s[open..].find("</think>") {
+            Some(rel) => s[open + rel + "</think>".len()..].trim().to_string(),
+            None => String::new(), // only reasoning arrived; no title yet
+        },
+    }
 }
 
 // ---- Entity extraction ----------------------------------------------------
@@ -217,39 +347,126 @@ pub async fn extract_entities(
         ));
     }
 
-    // Bound the context so the prompt stays reasonable.
-    let mut corpus = String::new();
+    // Split the whole corpus into ~12k-char windows on chunk boundaries, run the
+    // LLM per window, and merge — so large works are covered, not just the head.
+    const WINDOW_CHARS: usize = 12_000;
+    const MAX_WINDOWS: usize = 12; // cost/time guard for very large vaults
+    let mut windows: Vec<String> = Vec::new();
+    let mut cur = String::new();
     for c in chunks {
-        if corpus.len() > 12000 {
-            break;
+        cur.push_str(&format!("[{}]\n{}\n\n", c.doc_name, c.text));
+        if cur.len() >= WINDOW_CHARS {
+            windows.push(std::mem::take(&mut cur));
+            if windows.len() >= MAX_WINDOWS {
+                break;
+            }
         }
-        corpus.push_str(&format!("[{}]\n{}\n\n", c.doc_name, c.text));
+    }
+    if !cur.trim().is_empty() && windows.len() < MAX_WINDOWS {
+        windows.push(cur);
     }
 
-    let system = "Você extrai entidades de textos de ficção/worldbuilding. \
-Responda APENAS com JSON válido, sem texto extra, sem markdown. Formato:\n\
-{\"characters\":[{\"name\":\"\",\"role\":\"\",\"summary\":\"\",\"traits\":[\"\"],\"sourceDoc\":\"\",\"sourceQuote\":\"\"}],\
-\"places\":[{\"name\":\"\",\"type\":\"\",\"summary\":\"\",\"sourceDoc\":\"\",\"sourceQuote\":\"\"}],\
-\"relations\":[{\"from\":\"\",\"to\":\"\",\"label\":\"\"}]}\n\
-sourceQuote deve ser uma citação curta e literal do texto. Use o idioma do texto.";
+    // Accumulate + merge across windows.
+    let mut chars_map: std::collections::HashMap<String, ExtractedChar> = Default::default();
+    let mut places_map: std::collections::HashMap<String, ExtractedPlace> = Default::default();
+    let mut rel_set: std::collections::HashSet<(String, String, String)> = Default::default();
+    let mut relations_out: Vec<ExtractedRel> = Vec::new();
 
-    let user = format!(
-        "Extraia personagens, lugares e relações do conhecimento abaixo:\n\n{corpus}"
-    );
+    for window in &windows {
+        let parsed = match extract_window(client, cfg, window).await {
+            Ok(p) => p,
+            Err(_) => continue, // a bad window shouldn't abort the whole run
+        };
+        for c in parsed.characters {
+            if c.name.trim().is_empty() {
+                continue;
+            }
+            merge_char(&mut chars_map, c);
+        }
+        for p in parsed.places {
+            if p.name.trim().is_empty() {
+                continue;
+            }
+            merge_place(&mut places_map, p);
+        }
+        for r in parsed.relations {
+            if r.from.trim().is_empty() || r.to.trim().is_empty() {
+                continue;
+            }
+            let key = (r.from.to_lowercase(), r.to.to_lowercase(), r.label.to_lowercase());
+            if rel_set.insert(key) {
+                relations_out.push(r);
+            }
+        }
+    }
 
-    let messages = vec![
-        ChatMessage { role: "system", content: system.to_string() },
-        ChatMessage { role: "user", content: user },
-    ];
-    let raw = providers::chat(client, cfg, &messages).await?;
-    let json = extract_json_block(&raw)
-        .ok_or_else(|| AppError::Msg("modelo não retornou JSON válido para extração".into()))?;
-    let parsed: Extraction = serde_json::from_str(&json)
-        .map_err(|e| AppError::Msg(format!("falha ao ler JSON da extração: {e}")))?;
+    if chars_map.is_empty() && places_map.is_empty() {
+        return Err(AppError::Msg(
+            "o modelo não retornou entidades válidas — tente outro modelo de LLM".into(),
+        ));
+    }
 
-    let characters = parsed
-        .characters
+    // Coreference: "Cesar" and "Cesar Magnus" are the same character. Canonicalize
+    // each partial name to the fullest matching name (within its own type), then
+    // re-merge and rewrite relation endpoints so the graph links them as one.
+    let char_names: Vec<String> = chars_map.values().map(|c| c.name.clone()).collect();
+    let place_names: Vec<String> = places_map.values().map(|p| p.name.clone()).collect();
+    let mut char_canon = canonical_map(&char_names);
+    let mut place_canon = canonical_map(&place_names);
+
+    // Optional LLM dedup: catches aliases the substring heuristic can't (titles,
+    // nicknames like "o Caçador" = "Cesar Magnus"). Failures are non-fatal.
+    if cfg.dedup_entities {
+        if let Ok(m) = llm_dedup(client, cfg, "personagens", &char_names).await {
+            for (k, v) in m { char_canon.insert(k, v); }
+            chain_resolve(&mut char_canon);
+        }
+        if let Ok(m) = llm_dedup(client, cfg, "lugares", &place_names).await {
+            for (k, v) in m { place_canon.insert(k, v); }
+            chain_resolve(&mut place_canon);
+        }
+    }
+
+    let mut chars_final: std::collections::HashMap<String, ExtractedChar> = Default::default();
+    for mut c in chars_map.into_values() {
+        if let Some(full) = char_canon.get(&c.name.to_lowercase()) {
+            c.name = full.clone();
+        }
+        merge_char(&mut chars_final, c);
+    }
+    let mut places_final: std::collections::HashMap<String, ExtractedPlace> = Default::default();
+    for mut p in places_map.into_values() {
+        if let Some(full) = place_canon.get(&p.name.to_lowercase()) {
+            p.name = full.clone();
+        }
+        merge_place(&mut places_final, p);
+    }
+    let chars_map = chars_final;
+    let places_map = places_final;
+
+    // Rewrite relations to canonical names (either type) and de-dupe again.
+    let resolve = |name: &str| -> String {
+        let k = name.to_lowercase();
+        char_canon
+            .get(&k)
+            .or_else(|| place_canon.get(&k))
+            .cloned()
+            .unwrap_or_else(|| name.to_string())
+    };
+    let mut seen: std::collections::HashSet<(String, String, String)> = Default::default();
+    let relations_out: Vec<ExtractedRel> = relations_out
         .into_iter()
+        .map(|r| ExtractedRel { from: resolve(&r.from), to: resolve(&r.to), label: r.label })
+        .filter(|r| {
+            if r.from.eq_ignore_ascii_case(&r.to) {
+                return false; // self-loop after canonicalization
+            }
+            seen.insert((r.from.to_lowercase(), r.to.to_lowercase(), r.label.to_lowercase()))
+        })
+        .collect();
+
+    let characters = chars_map
+        .into_values()
         .map(|c| Character {
             id: Uuid::new_v4().to_string(),
             name: c.name,
@@ -262,9 +479,8 @@ sourceQuote deve ser uma citação curta e literal do texto. Use o idioma do tex
         })
         .collect();
 
-    let places = parsed
-        .places
-        .into_iter()
+    let places = places_map
+        .into_values()
         .map(|p| Place {
             id: Uuid::new_v4().to_string(),
             name: p.name,
@@ -276,13 +492,206 @@ sourceQuote deve ser uma citação curta e literal do texto. Use o idioma do tex
         })
         .collect();
 
-    let relations = parsed
-        .relations
+    let relations = relations_out
         .into_iter()
         .map(|r| Relation { from: r.from, to: r.to, label: r.label })
         .collect();
 
     Ok((characters, places, relations))
+}
+
+/// Run extraction over a single corpus window.
+async fn extract_window(
+    client: &reqwest::Client,
+    cfg: &RagConfig,
+    corpus: &str,
+) -> AppResult<Extraction> {
+    let system = "Você extrai entidades de textos de ficção/worldbuilding. \
+Responda APENAS com JSON válido, sem texto extra, sem markdown. Formato:\n\
+{\"characters\":[{\"name\":\"\",\"role\":\"\",\"summary\":\"\",\"traits\":[\"\"],\"sourceDoc\":\"\",\"sourceQuote\":\"\"}],\
+\"places\":[{\"name\":\"\",\"type\":\"\",\"summary\":\"\",\"sourceDoc\":\"\",\"sourceQuote\":\"\"}],\
+\"relations\":[{\"from\":\"\",\"to\":\"\",\"label\":\"\"}]}\n\
+sourceQuote deve ser uma citação curta e literal do texto. Use o idioma do texto. \
+Use SEMPRE o nome mais completo de cada personagem/lugar (ex.: \"Cesar Magnus\", não só \"Cesar\"); \
+se o texto citar só o primeiro nome ou um apelido, trate como o mesmo personagem e use o nome completo. \
+Nas relações, use exatamente esses mesmos nomes completos.";
+
+    let user = format!("Extraia personagens, lugares e relações do conhecimento abaixo:\n\n{corpus}");
+    let messages = vec![
+        ChatMessage { role: "system", content: system.to_string() },
+        ChatMessage { role: "user", content: user },
+    ];
+    let raw = providers::chat(client, cfg, &messages).await?;
+    let json = extract_json_block(&raw)
+        .ok_or_else(|| AppError::Msg("modelo não retornou JSON válido para extração".into()))?;
+    serde_json::from_str(&json)
+        .map_err(|e| AppError::Msg(format!("falha ao ler JSON da extração: {e}")))
+}
+
+/// Merge a character into the map: first non-empty text wins, traits union.
+fn merge_char(map: &mut std::collections::HashMap<String, ExtractedChar>, c: ExtractedChar) {
+    let key = c.name.to_lowercase();
+    match map.get_mut(&key) {
+        None => {
+            map.insert(key, c);
+        }
+        Some(existing) => {
+            if existing.role.is_empty() { existing.role = c.role; }
+            if existing.summary.len() < c.summary.len() { existing.summary = c.summary; }
+            if existing.source_doc.is_empty() { existing.source_doc = c.source_doc; }
+            if existing.source_quote.is_empty() { existing.source_quote = c.source_quote; }
+            for t in c.traits {
+                if !existing.traits.iter().any(|e| e.eq_ignore_ascii_case(&t)) {
+                    existing.traits.push(t);
+                }
+            }
+        }
+    }
+}
+
+fn merge_place(map: &mut std::collections::HashMap<String, ExtractedPlace>, p: ExtractedPlace) {
+    let key = p.name.to_lowercase();
+    match map.get_mut(&key) {
+        None => {
+            map.insert(key, p);
+        }
+        Some(existing) => {
+            if existing.kind.is_empty() { existing.kind = p.kind; }
+            if existing.summary.len() < p.summary.len() { existing.summary = p.summary; }
+            if existing.source_doc.is_empty() { existing.source_doc = p.source_doc; }
+            if existing.source_quote.is_empty() { existing.source_quote = p.source_quote; }
+        }
+    }
+}
+
+/// Lowercased word tokens (len ≥ 2) of a name.
+fn name_tokens(name: &str) -> Vec<String> {
+    name.to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| t.chars().count() >= 2)
+        .map(|t| t.to_string())
+        .collect()
+}
+
+/// Whether `short`'s tokens appear in `long` in order (a subsequence).
+fn is_subsequence(short: &[String], long: &[String]) -> bool {
+    let mut it = long.iter();
+    short.iter().all(|s| it.any(|l| l == s))
+}
+
+/// Map each partial name (lowercased) to the fullest name that contains it as a
+/// token subsequence — so "Cesar" resolves to "Cesar Magnus". Only shorter →
+/// longer, and resolution is chained so aliases collapse to one canonical name.
+fn canonical_map(names: &[String]) -> std::collections::HashMap<String, String> {
+    let toks: Vec<(String, Vec<String>)> =
+        names.iter().map(|n| (n.clone(), name_tokens(n))).collect();
+    let mut out: std::collections::HashMap<String, String> = Default::default();
+    for (name, t) in &toks {
+        if t.is_empty() {
+            continue;
+        }
+        let mut best: Option<&(String, Vec<String>)> = None;
+        for cand in &toks {
+            if cand.0 == *name {
+                continue;
+            }
+            if cand.1.len() > t.len() && is_subsequence(t, &cand.1) {
+                if best.map_or(true, |b| b.1.len() < cand.1.len()) {
+                    best = Some(cand);
+                }
+            }
+        }
+        if let Some(b) = best {
+            out.insert(name.to_lowercase(), b.0.clone());
+        }
+    }
+    chain_resolve(&mut out);
+    out
+}
+
+/// Collapse alias chains (a → b → c) so every key points at the fullest name.
+fn chain_resolve(out: &mut std::collections::HashMap<String, String>) {
+    let keys: Vec<String> = out.keys().cloned().collect();
+    for k in keys {
+        let mut cur = out.get(&k).cloned().unwrap();
+        let mut guard = 0;
+        while let Some(next) = out.get(&cur.to_lowercase()) {
+            if *next == cur || guard > 8 {
+                break;
+            }
+            cur = next.clone();
+            guard += 1;
+        }
+        out.insert(k, cur);
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct DedupGroup {
+    #[serde(default)]
+    canonical: String,
+    #[serde(default)]
+    aliases: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DedupResult {
+    #[serde(default)]
+    groups: Vec<DedupGroup>,
+}
+
+/// Ask the LLM which names in `names` refer to the same entity. Returns a map of
+/// alias (lowercased) → canonical display name. Only groups of 2+ matter.
+async fn llm_dedup(
+    client: &reqwest::Client,
+    cfg: &RagConfig,
+    kind: &str,
+    names: &[String],
+) -> AppResult<std::collections::HashMap<String, String>> {
+    let mut out = std::collections::HashMap::new();
+    if names.len() < 2 {
+        return Ok(out);
+    }
+    let list = names
+        .iter()
+        .map(|n| format!("- {n}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let system = format!(
+        "Você recebe uma lista de nomes de {kind} extraídos da MESMA obra. \
+Alguns podem se referir à mesma entidade (primeiro nome, apelido, título, variação). \
+Agrupe apenas os que são claramente a mesma entidade. Responda APENAS com JSON, sem markdown:\n\
+{{\"groups\":[{{\"canonical\":\"nome mais completo/canônico\",\"aliases\":[\"outro nome\",\"...\"]}}]}}\n\
+Inclua SOMENTE grupos com 2 ou mais nomes. Se não houver duplicatas, retorne {{\"groups\":[]}}. \
+Na dúvida, NÃO agrupe."
+    );
+    let user = format!("Nomes:\n{list}");
+    let messages = vec![
+        ChatMessage { role: "system", content: system },
+        ChatMessage { role: "user", content: user },
+    ];
+    let raw = providers::chat(client, cfg, &messages).await?;
+    let json = extract_json_block(&raw)
+        .ok_or_else(|| AppError::Msg("dedup: JSON inválido".into()))?;
+    let parsed: DedupResult =
+        serde_json::from_str(&json).map_err(|e| AppError::Msg(format!("dedup: {e}")))?;
+
+    // Only trust groups whose members actually came from the extracted list.
+    let known: std::collections::HashSet<String> = names.iter().map(|n| n.to_lowercase()).collect();
+    for g in parsed.groups {
+        let canonical = if g.canonical.trim().is_empty() {
+            continue;
+        } else {
+            g.canonical.clone()
+        };
+        for alias in g.aliases.iter().chain(std::iter::once(&g.canonical)) {
+            let low = alias.to_lowercase();
+            if known.contains(&low) && !low.eq_ignore_ascii_case(&canonical) {
+                out.insert(low, canonical.clone());
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Pull the outermost `{ ... }` JSON object out of a possibly noisy LLM reply
