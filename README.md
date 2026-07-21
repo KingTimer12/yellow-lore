@@ -11,11 +11,14 @@ nada de servidores externos ou Python.
 ## Funcionalidades
 
 - **Chat RAG** — recupera os trechos mais relevantes e responde com fontes.
-- **Base de conhecimento** — ingestão de `.txt` / `.md` (PDF/DOCX no roadmap).
-- **Vaults** — cada obra/história é uma base isolada (SQLite).
+- **Base de conhecimento** — ingestão de `.txt`, `.md`, `.pdf` e `.docx`.
+- **Vaults** — cada obra/história é uma base isolada (SQLite). App inicia sem
+  vault; você cria o primeiro (estilo Obsidian).
+- **Memória de conversa** — o chat inicia vazio e mantém o contexto de toda a
+  conversa entre turnos.
 - **Extração de entidades** — LLM identifica personagens, lugares e relações.
-- **Provedores** — Ollama (local) e OpenAI; modelo de LLM e de embedding
-  configurados de forma **independente**.
+- **Provedores** — Ollama (local), OpenAI e vLLM (servidor OpenAI-compatível);
+  modelo de LLM e de embedding configurados de forma **independente**.
 - **RAG configurável** — chunk size, overlap, top-k, prompt do sistema.
 - Tema claro/escuro, micro-animações, tudo offline-first.
 
