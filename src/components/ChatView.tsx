@@ -23,7 +23,7 @@ export default function ChatView() {
 
   return (
     <div class="flex flex-col h-full box-border anim-view">
-      <div class="flex items-center justify-between px-8 py-5 border-b border-border flex-none">
+      <div class="flex items-center justify-between px-8 py-3.5 border-b border-border flex-none">
         <div class="font-serif text-24px font-600 tracking-[0.01em]">Chat</div>
         <div
           onClick={() => actions.setView("settings")}
@@ -118,21 +118,21 @@ export default function ChatView() {
         </For>
       </div>
 
-      <div class="px-8 pt-4.5 pb-6 border-t border-border flex gap-3 flex-none">
+      <div class="px-8 pt-2 pb-6 border-t border-border flex gap-3 flex-none">
         <input
           value={state.chatInput}
           disabled={state.pending}
           onInput={(e) => actions.setChatInput(e.currentTarget.value)}
           onKeyDown={(e) => { if (e.key === "Enter") actions.sendMessage(); }}
           placeholder="Pergunte algo sobre seus documentos..."
-          class="flex-1 px-4 py-3.25 rounded-10px border border-border bg-panel text-fg text-14px outline-none transition-colors"
+          class="flex-1 px-4 py-3 rounded-10px border border-border bg-panel text-fg text-14px outline-none transition-colors"
         />
         <button
           onClick={() => actions.sendMessage()}
           disabled={state.pending || !state.chatInput.trim()}
-          class="px-6 py-3.25 rounded-10px bg-accent text-accent-fg text-14px font-bold cursor-pointer whitespace-nowrap border-none transition-all active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed"
+          class="gap-2 px-4 py-3 rounded-10px bg-accent text-accent-fg text-14px font-bold cursor-pointer whitespace-nowrap border-none transition-all active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed"
         >
-          Enviar
+          <i class="i-lucide-send p-2" /> 
         </button>
       </div>
     </div>
