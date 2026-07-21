@@ -2,6 +2,7 @@ use crate::config::RagConfig;
 use crate::error::{AppError, AppResult};
 use futures_util::StreamExt;
 use serde_json::{json, Value};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 pub struct ChatMessage {
@@ -52,10 +53,10 @@ pub async fn chat(
 ) -> AppResult<String> {
     match cfg.llm_provider.as_str() {
         "openai" => {
-            oai_chat(client, &cfg.openai_base_url, &cfg.openai_api_key, &cfg.llm_model, messages, true).await
+            oai_chat(client, &cfg.openai_base_url, &cfg.openai_api_key, &cfg.llm_model, messages, true, cfg.temperature).await
         }
         "vllm" => {
-            oai_chat(client, &cfg.vllm_base_url, &cfg.vllm_api_key, &cfg.llm_model, messages, false).await
+            oai_chat(client, &cfg.vllm_base_url, &cfg.vllm_api_key, &cfg.llm_model, messages, false, cfg.temperature).await
         }
         "ollama" => ollama_chat(client, cfg, messages).await,
         other => Err(AppError::Provider(format!(
@@ -100,6 +101,7 @@ async fn oai_chat(
     model: &str,
     messages: &[ChatMessage],
     key_required: bool,
+    temperature: f32,
 ) -> AppResult<String> {
     if key_required && api_key.trim().is_empty() {
         return Err(AppError::Provider("API Key da OpenAI não configurada".into()));
@@ -109,7 +111,9 @@ async fn oai_chat(
         .iter()
         .map(|m| json!({ "role": m.role, "content": m.content }))
         .collect();
-    let mut req = client.post(url).json(&json!({ "model": model, "messages": msgs }));
+    let mut req = client
+        .post(url)
+        .json(&json!({ "model": model, "messages": msgs, "temperature": temperature }));
     if !api_key.trim().is_empty() {
         req = req.bearer_auth(api_key);
     }
@@ -121,6 +125,16 @@ async fn oai_chat(
 }
 
 // ---- Ollama (local) -------------------------------------------------------
+
+/// Shared Ollama generation options. `num_ctx` is only sent when configured
+/// (> 0); otherwise Ollama uses the model's own default.
+fn ollama_options(cfg: &RagConfig) -> Value {
+    let mut opts = json!({ "temperature": cfg.temperature });
+    if cfg.ollama_num_ctx > 0 {
+        opts["num_ctx"] = json!(cfg.ollama_num_ctx);
+    }
+    opts
+}
 
 async fn ollama_embed(
     client: &reqwest::Client,
@@ -150,14 +164,22 @@ async fn ollama_chat(
         .iter()
         .map(|m| json!({ "role": m.role, "content": m.content }))
         .collect();
-    let req = client
-        .post(&url)
-        .json(&json!({ "model": cfg.llm_model, "messages": msgs, "stream": false }));
+    let req = client.post(&url).json(&json!({
+        "model": cfg.llm_model,
+        "messages": msgs,
+        "stream": false,
+        "options": ollama_options(cfg),
+    }));
     let body: Value = post_json(req).await?;
-    Ok(body["message"]["content"]
-        .as_str()
-        .unwrap_or_default()
-        .to_string())
+    let content = body["message"]["content"].as_str().unwrap_or_default();
+    let thinking = body["message"]["thinking"].as_str().unwrap_or_default();
+    // Fold any reasoning into a <think> block so callers that strip it (title /
+    // extraction) behave the same for thinking and non-thinking models.
+    if thinking.is_empty() {
+        Ok(content.to_string())
+    } else {
+        Ok(format!("<think>{thinking}</think>{content}"))
+    }
 }
 
 // ---- helpers --------------------------------------------------------------
@@ -233,16 +255,17 @@ pub async fn chat_stream<F: FnMut(&str)>(
     client: &reqwest::Client,
     cfg: &RagConfig,
     messages: &[ChatMessage],
+    cancel: &AtomicBool,
     on_token: F,
 ) -> AppResult<String> {
     match cfg.llm_provider.as_str() {
         "openai" => {
-            oai_chat_stream(client, &cfg.openai_base_url, &cfg.openai_api_key, &cfg.llm_model, messages, true, on_token).await
+            oai_chat_stream(client, &cfg.openai_base_url, &cfg.openai_api_key, &cfg.llm_model, messages, true, cfg.temperature, cancel, on_token).await
         }
         "vllm" => {
-            oai_chat_stream(client, &cfg.vllm_base_url, &cfg.vllm_api_key, &cfg.llm_model, messages, false, on_token).await
+            oai_chat_stream(client, &cfg.vllm_base_url, &cfg.vllm_api_key, &cfg.llm_model, messages, false, cfg.temperature, cancel, on_token).await
         }
-        "ollama" => ollama_chat_stream(client, cfg, messages, on_token).await,
+        "ollama" => ollama_chat_stream(client, cfg, messages, cancel, on_token).await,
         other => Err(AppError::Provider(format!(
             "provedor de LLM desconhecido: {other}"
         ))),
@@ -267,6 +290,8 @@ async fn oai_chat_stream<F: FnMut(&str)>(
     model: &str,
     messages: &[ChatMessage],
     key_required: bool,
+    temperature: f32,
+    cancel: &AtomicBool,
     mut on_token: F,
 ) -> AppResult<String> {
     if key_required && api_key.trim().is_empty() {
@@ -279,7 +304,7 @@ async fn oai_chat_stream<F: FnMut(&str)>(
         .collect();
     let mut req = client
         .post(url)
-        .json(&json!({ "model": model, "messages": msgs, "stream": true }));
+        .json(&json!({ "model": model, "messages": msgs, "stream": true, "temperature": temperature }));
     if !api_key.trim().is_empty() {
         req = req.bearer_auth(api_key);
     }
@@ -289,6 +314,9 @@ async fn oai_chat_stream<F: FnMut(&str)>(
     let mut buf = String::new();
     let mut full = String::new();
     while let Some(chunk) = stream.next().await {
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(full);
+        }
         buf.push_str(&String::from_utf8_lossy(&chunk?));
         // Process complete lines; keep the trailing partial in `buf`.
         while let Some(nl) = buf.find('\n') {
@@ -318,6 +346,7 @@ async fn ollama_chat_stream<F: FnMut(&str)>(
     client: &reqwest::Client,
     cfg: &RagConfig,
     messages: &[ChatMessage],
+    cancel: &AtomicBool,
     mut on_token: F,
 ) -> AppResult<String> {
     let base = cfg.ollama_endpoint.trim_end_matches('/');
@@ -326,15 +355,30 @@ async fn ollama_chat_stream<F: FnMut(&str)>(
         .iter()
         .map(|m| json!({ "role": m.role, "content": m.content }))
         .collect();
-    let req = client
-        .post(&url)
-        .json(&json!({ "model": cfg.llm_model, "messages": msgs, "stream": true }));
+    let req = client.post(&url).json(&json!({
+        "model": cfg.llm_model,
+        "messages": msgs,
+        "stream": true,
+        "options": ollama_options(cfg),
+    }));
     let resp = stream_status_guard(req.send().await?).await?;
 
     let mut stream = resp.bytes_stream();
     let mut buf = String::new();
     let mut full = String::new();
+    // Thinking-capable models (e.g. deepseek-r1, qwen3, some gemma builds) stream
+    // their reasoning in a separate `message.thinking` field while `content`
+    // stays empty. Surface it wrapped in <think>…</think> so the UI shows the
+    // reasoning instead of hanging on the loading dots.
+    let mut in_think = false;
     while let Some(chunk) = stream.next().await {
+        if cancel.load(Ordering::Relaxed) {
+            if in_think {
+                full.push_str("</think>");
+                on_token("</think>");
+            }
+            return Ok(full);
+        }
         buf.push_str(&String::from_utf8_lossy(&chunk?));
         while let Some(nl) = buf.find('\n') {
             let line = buf[..nl].trim().to_string();
@@ -343,17 +387,40 @@ async fn ollama_chat_stream<F: FnMut(&str)>(
                 continue;
             }
             if let Ok(v) = serde_json::from_str::<Value>(&line) {
+                if let Some(th) = v["message"]["thinking"].as_str() {
+                    if !th.is_empty() {
+                        if !in_think {
+                            full.push_str("<think>");
+                            on_token("<think>");
+                            in_think = true;
+                        }
+                        full.push_str(th);
+                        on_token(th);
+                    }
+                }
                 if let Some(tok) = v["message"]["content"].as_str() {
                     if !tok.is_empty() {
+                        if in_think {
+                            full.push_str("</think>");
+                            on_token("</think>");
+                            in_think = false;
+                        }
                         full.push_str(tok);
                         on_token(tok);
                     }
                 }
                 if v["done"].as_bool().unwrap_or(false) {
+                    if in_think {
+                        full.push_str("</think>");
+                        on_token("</think>");
+                    }
                     return Ok(full);
                 }
             }
         }
+    }
+    if in_think {
+        on_token("</think>");
     }
     Ok(full)
 }
