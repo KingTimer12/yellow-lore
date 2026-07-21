@@ -136,10 +136,12 @@ pub async fn build_document(
     let chunks = pieces
         .into_iter()
         .zip(vectors)
-        .map(|(text, vector)| Chunk {
+        .enumerate()
+        .map(|(i, (text, vector))| Chunk {
             id: Uuid::new_v4().to_string(),
             doc_id: doc_id.clone(),
             doc_name: name.clone(),
+            ordinal: i,
             text,
             vector,
         })
@@ -170,20 +172,103 @@ async fn build_chat(
     let mut context = String::new();
 
     if !chunks.is_empty() {
-        let qvec = providers::embed(client, cfg, &[question.clone()]).await?;
-        let hits = vector_store::search(chunks, &qvec[0], cfg.top_k);
-        for (i, hit) in hits.iter().enumerate() {
-            context.push_str(&format!(
-                "[{}] Documento: {}\n{}\n\n",
-                i + 1,
-                hit.chunk.doc_name,
-                hit.chunk.text
-            ));
+        // If the question names a specific chapter/document ("capítulo 1", "cap. 2"),
+        // pull THAT document's own chunks in reading order instead of a semantic mix
+        // that could surface other chapters. Retrieving the wrong chapter is what
+        // makes the model spiral ("this is chapter 3, not 1…") and truncate its
+        // answer; giving it the right document removes the confusion outright.
+        let chapters = referenced_chapters(&question);
+        let target_docs = if chapters.is_empty() {
+            std::collections::HashSet::new()
+        } else {
+            docs_for_chapters(&chapters, chunks)
+        };
+
+        let hits: Vec<vector_store::ScoredChunk> = if !target_docs.is_empty() {
+            let mut selected: Vec<&Chunk> =
+                chunks.iter().filter(|c| target_docs.contains(&c.doc_id)).collect();
+            selected.sort_by(|a, b| {
+                a.doc_name.cmp(&b.doc_name).then(a.ordinal.cmp(&b.ordinal))
+            });
+            // Budget the material so a long chapter can't blow up the context window
+            // (which itself causes truncated answers on reasoning models).
+            const TARGET_DOC_BUDGET: usize = 14_000;
+            let mut used = 0usize;
+            let mut out = Vec::new();
+            for c in selected {
+                used += c.text.len();
+                out.push(vector_store::ScoredChunk { chunk: c.clone(), score: 1.0 });
+                if used >= TARGET_DOC_BUDGET {
+                    break;
+                }
+            }
+            out
+        } else {
+            let qvec = providers::embed(client, cfg, &[question.clone()]).await?;
+            let mut hits = vector_store::search(chunks, &qvec[0], cfg.top_k);
+
+            // Hybrid retrieval: add lexical matches the embedding model under-ranked.
+            // A question like "onde caiu o meteorito?" must surface the chunk with the
+            // literal word "meteorito" even if cosine ranked it outside top-k.
+            let have: std::collections::HashSet<String> =
+                hits.iter().map(|h| h.chunk.id.clone()).collect();
+            let lexical: Vec<vector_store::ScoredChunk> =
+                vector_store::keyword_search(chunks, &question, cfg.top_k)
+                    .into_iter()
+                    .filter(|h| !have.contains(&h.chunk.id))
+                    .collect();
+            hits.extend(lexical);
+
+            // Positional questions ("primeira frase", "como começa") are about a
+            // document's opening, which semantic search rarely ranks near the query.
+            // Force-inject every document's opening chunk (ordinal 0) so the model has
+            // the real start to work from; reading-order labels let it pick the doc
+            // whose name matches the chapter asked.
+            if wants_opening(&question) {
+                let have: std::collections::HashSet<&str> =
+                    hits.iter().map(|h| h.chunk.id.as_str()).collect();
+                let openings: Vec<vector_store::ScoredChunk> = chunks
+                    .iter()
+                    .filter(|c| c.ordinal == 0 && !have.contains(c.id.as_str()))
+                    .map(|c| vector_store::ScoredChunk { chunk: c.clone(), score: 1.0 })
+                    .collect();
+                hits.extend(openings);
+            }
+            hits
+        };
+
+        // Sources keep relevance order (best match first) for citations.
+        for hit in &hits {
             sources.push(Source {
                 doc: hit.chunk.doc_name.clone(),
                 quote: snippet(&hit.chunk.text, &question),
                 text: hit.chunk.text.trim().to_string(),
             });
+        }
+
+        // Context is re-sorted into reading order, grouped by document, and each
+        // fragment is labeled with its position — so the model can answer
+        // positional questions ("primeira frase", "início do capítulo") and never
+        // confuses fragments of one document with another's.
+        let mut ordered: Vec<&vector_store::ScoredChunk> = hits.iter().collect();
+        ordered.sort_by(|a, b| {
+            a.chunk
+                .doc_name
+                .cmp(&b.chunk.doc_name)
+                .then(a.chunk.ordinal.cmp(&b.chunk.ordinal))
+        });
+        for hit in ordered {
+            // Only the opening is a meaningful, stable landmark. Do NOT expose the
+            // raw chunk index — it's an internal ~200-word slice, not a document
+            // section, and leaking the number makes the model (and user) treat
+            // "trecho 4" as real structure. Reading order is conveyed by position
+            // in the prompt.
+            let label = if hit.chunk.ordinal == 0 {
+                format!("{} · início do documento", hit.chunk.doc_name)
+            } else {
+                hit.chunk.doc_name.clone()
+            };
+            context.push_str(&format!("[Documento: {}]\n{}\n\n", label, hit.chunk.text));
         }
     }
 
@@ -193,7 +278,15 @@ async fn build_chat(
         context
     };
     let system = format!(
-        "{}\n\nContexto recuperado da base de conhecimento:\n{}",
+        "{}\n\nCada trecho abaixo vem rotulado com [Documento: nome]. Os trechos de um \
+mesmo documento aparecem em ordem de leitura; \"início do documento\" marca a abertura \
+do texto. Os trechos são recortes parciais da base — NÃO são seções ou capítulos \
+numerados, então não invente nem cite \"trecho N\". Ao responder sobre um documento \
+específico (ex.: \"capítulo 1\"), use SOMENTE os trechos cujo nome de documento \
+corresponde — nunca misture documentos diferentes. Para perguntas sobre a abertura \
+(\"primeira frase\", \"como começa\"), use o trecho marcado \"início do documento\" \
+daquele documento; se ele não estiver presente, diga que não recuperou a abertura.\n\n\
+Contexto recuperado da base de conhecimento:\n{}",
         cfg.system_prompt, context_block
     );
     let mut messages = vec![ChatMessage { role: "system", content: system }];
@@ -227,10 +320,11 @@ pub async fn ask_stream<F: FnMut(&str)>(
     chunks: &[Chunk],
     question: String,
     history: Vec<HistoryTurn>,
+    cancel: &std::sync::atomic::AtomicBool,
     on_token: F,
 ) -> AppResult<Vec<Source>> {
     let (messages, sources) = build_chat(client, cfg, chunks, question, history).await?;
-    providers::chat_stream(client, cfg, &messages, on_token).await?;
+    providers::chat_stream(client, cfg, &messages, cancel, on_token).await?;
     Ok(sources)
 }
 
@@ -272,6 +366,82 @@ Não raciocine em voz alta nem inclua qualquer texto além do título. /no_think
     }
     let chars: String = t.chars().take(60).collect();
     Ok(chars)
+}
+
+/// Chapter numbers explicitly named in a phrase ("capítulo 1", "cap. 2", "cap 3").
+/// Scans for a token starting with "cap" followed (within two tokens) by a number.
+fn referenced_chapters(text: &str) -> Vec<u32> {
+    let lower = text.to_lowercase();
+    let tokens: Vec<&str> = lower
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .collect();
+    let mut out = Vec::new();
+    for i in 0..tokens.len() {
+        let tok = tokens[i];
+        // Only real chapter markers: "cap", "capitulo"/"capítulo" (any accent),
+        // optionally glued to the number ("cap2", "capitulo3"). Avoids "capaz".
+        let letters: String = tok.chars().take_while(|c| c.is_alphabetic()).collect();
+        let is_marker = letters == "cap" || letters.starts_with("capitul") || letters.starts_with("capítul");
+        if !is_marker {
+            continue;
+        }
+        // "cap1"/"capitulo1" glued to the number...
+        let rest: String = tok.trim_start_matches(char::is_alphabetic).to_string();
+        if let Ok(n) = rest.parse::<u32>() {
+            out.push(n);
+            continue;
+        }
+        // ...or a numeric token within the next two.
+        for tok in tokens.iter().skip(i + 1).take(2) {
+            if let Ok(n) = tok.parse::<u32>() {
+                out.push(n);
+                break;
+            }
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// Document ids whose name references one of the given chapter numbers.
+fn docs_for_chapters(
+    chapters: &[u32],
+    chunks: &[vector_store::Chunk],
+) -> std::collections::HashSet<String> {
+    let mut ids = std::collections::HashSet::new();
+    for c in chunks {
+        let in_name = referenced_chapters(&c.doc_name);
+        if chapters.iter().any(|ch| in_name.contains(ch)) {
+            ids.insert(c.doc_id.clone());
+        }
+    }
+    ids
+}
+
+/// Heuristic: does the question target a position near the opening of a text?
+/// These need the document's first chunk (to read/count from), which semantic
+/// retrieval alone rarely surfaces. Covers "primeira frase", "segunda frase",
+/// "terceiro parágrafo", "como começa", "início do capítulo", etc.
+fn wants_opening(question: &str) -> bool {
+    let q = question.to_lowercase();
+
+    // Direct opening cues — fire on their own.
+    const DIRECT: [&str; 6] = ["como começa", "como comeca", "início do", "inicio do", "abertura", "começo do"];
+    if DIRECT.iter().any(|c| q.contains(c)) {
+        return true;
+    }
+
+    // A textual unit ("frase"/"linha"/"parágrafo"/"palavra") combined with a low
+    // ordinal ("primeir…"/"segund…"/"terceir…") is a count-from-the-start query.
+    let has_unit = ["frase", "linha", "parágrafo", "paragrafo", "palavra"]
+        .iter()
+        .any(|u| q.contains(u));
+    let has_low_ordinal = ["primeir", "segund", "terceir", "quart", "quint"]
+        .iter()
+        .any(|o| q.contains(o));
+    has_unit && has_low_ordinal
 }
 
 /// Strip a leading `<think>…</think>` reasoning block (closed or still open).
@@ -514,7 +684,7 @@ Responda APENAS com JSON válido, sem texto extra, sem markdown. Formato:\n\
 sourceQuote deve ser uma citação curta e literal do texto. Use o idioma do texto. \
 Use SEMPRE o nome mais completo de cada personagem/lugar (ex.: \"Cesar Magnus\", não só \"Cesar\"); \
 se o texto citar só o primeiro nome ou um apelido, trate como o mesmo personagem e use o nome completo. \
-Nas relações, use exatamente esses mesmos nomes completos.";
+Nas relações, use exatamente esses mesmos nomes completos. /no_think";
 
     let user = format!("Extraia personagens, lugares e relações do conhecimento abaixo:\n\n{corpus}");
     let messages = vec![
@@ -522,6 +692,9 @@ Nas relações, use exatamente esses mesmos nomes completos.";
         ChatMessage { role: "user", content: user },
     ];
     let raw = providers::chat(client, cfg, &messages).await?;
+    // Reasoning models (and Ollama's `thinking` field) prepend a <think>…</think>
+    // block whose braces would corrupt the JSON span — drop it before parsing.
+    let raw = strip_think(&raw);
     let json = extract_json_block(&raw)
         .ok_or_else(|| AppError::Msg("modelo não retornou JSON válido para extração".into()))?;
     serde_json::from_str(&json)
@@ -671,6 +844,7 @@ Na dúvida, NÃO agrupe."
         ChatMessage { role: "user", content: user },
     ];
     let raw = providers::chat(client, cfg, &messages).await?;
+    let raw = strip_think(&raw);
     let json = extract_json_block(&raw)
         .ok_or_else(|| AppError::Msg("dedup: JSON inválido".into()))?;
     let parsed: DedupResult =

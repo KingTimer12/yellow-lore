@@ -296,8 +296,11 @@ impl Db {
     /// and by entity extraction.
     pub fn load_chunks(&self, vault: &str) -> AppResult<Vec<Chunk>> {
         let conn = self.lock();
+        // rowid order == insertion order == document reading order (chunks are
+        // inserted sequentially in build_document). Assign each chunk its 0-based
+        // position within its own doc so retrieval can reason about "first".
         let mut stmt = conn
-            .prepare("SELECT id, doc_id, doc_name, text, vector FROM chunks WHERE vault_id = ?1")
+            .prepare("SELECT id, doc_id, doc_name, text, vector FROM chunks WHERE vault_id = ?1 ORDER BY rowid ASC")
             .map_err(sql)?;
         let rows = stmt
             .query_map(params![vault], |r| {
@@ -305,12 +308,22 @@ impl Db {
                     id: r.get(0)?,
                     doc_id: r.get(1)?,
                     doc_name: r.get(2)?,
+                    ordinal: 0,
                     text: r.get(3)?,
                     vector: read_vector(r.get_ref(4)?),
                 })
             })
             .map_err(sql)?;
-        Ok(rows.filter_map(|r| r.ok()).collect())
+        let mut counters: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let mut out: Vec<Chunk> = Vec::new();
+        for c in rows.filter_map(|r| r.ok()) {
+            let n = counters.entry(c.doc_id.clone()).or_insert(0);
+            let mut c = c;
+            c.ordinal = *n;
+            *n += 1;
+            out.push(c);
+        }
+        Ok(out)
     }
 
     /// Look up a document by its (content-hash) id within a vault.
