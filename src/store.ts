@@ -5,13 +5,27 @@ import { api, isTauri, mockAnswer } from "./api";
 
 export type View = "chat" | "knowledge" | "characters" | "places" | "settings";
 
-export type Source = { doc: string; quote: string };
+export type Source = { doc: string; quote: string; text: string };
 
 export type Message = {
   role: "user" | "assistant";
   text: string;
+  /// Reasoning captured from a `<think>…</think>` block, shown separately.
+  thinking?: string;
   sources?: Source[];
 };
+
+/// Split a raw model reply into its `<think>` reasoning and the final answer.
+/// Handles the still-open case during streaming (no closing tag yet).
+export function splitThink(raw: string): { thinking: string; text: string } {
+  const open = raw.indexOf("<think>");
+  if (open === -1) return { thinking: "", text: raw };
+  const pre = raw.slice(0, open);
+  const after = raw.slice(open + "<think>".length);
+  const close = after.indexOf("</think>");
+  if (close === -1) return { thinking: after, text: pre };
+  return { thinking: after.slice(0, close), text: pre + after.slice(close + "</think>".length) };
+}
 
 export type Doc = {
   id: string;
@@ -47,6 +61,8 @@ export type Relation = { from: string; to: string; label: string };
 
 export type Vault = { id: string; name: string; createdAt: string };
 
+export type Session = { id: string; title: string; createdAt: string; updatedAt: string };
+
 /// Mirrors the Rust `RagConfig` (camelCase). LLM and embedding are independent.
 export type Settings = {
   llmProvider: string;
@@ -56,11 +72,14 @@ export type Settings = {
   openaiApiKey: string;
   openaiBaseUrl: string;
   ollamaEndpoint: string;
+  vllmBaseUrl: string;
+  vllmApiKey: string;
   systemPrompt: string;
   chunkSize: number;
   chunkOverlap: number;
   topK: number;
   showSources: boolean;
+  dedupEntities: boolean;
 };
 
 export type EditTarget = { kind: "character" | "place"; id: string } | null;
@@ -82,10 +101,14 @@ export type State = {
   extracting: boolean;
   chatInput: string;
   messages: Message[];
+  /// Saved conversations for the active vault. `currentSessionId` is "" for a
+  /// fresh, not-yet-saved chat (the app opens on this blank state).
+  sessions: Session[];
+  currentSessionId: string;
   pending: boolean;
   docsFilter: string;
   docs: Doc[];
-  charactersTab: "grid" | "relations";
+  charactersTab: "grid" | "graph";
   characters: Character[];
   relations: Relation[];
   places: Place[];
@@ -93,6 +116,13 @@ export type State = {
   editForm: EditForm | null;
   settings: Settings;
   savedToast: boolean;
+  vaultModalOpen: boolean;
+  /// True when the vault was embedded with a different model than the current
+  /// one — offer a reindex. `reindexing` guards the in-flight re-embed.
+  indexStale: boolean;
+  reindexing: boolean;
+  /// Citation modal: the document and its retrieved passages, or null.
+  citation: { doc: string; passages: { quote: string; text: string }[] } | null;
 };
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -103,12 +133,15 @@ export const DEFAULT_SETTINGS: Settings = {
   openaiApiKey: "",
   openaiBaseUrl: "https://api.openai.com/v1",
   ollamaEndpoint: "http://localhost:11434",
+  vllmBaseUrl: "http://localhost:8000/v1",
+  vllmApiKey: "",
   systemPrompt:
     "Você é o assistente do Yellow Lore. Responda SEMPRE com base nos trechos de conhecimento fornecidos no contexto. Se a resposta não estiver no contexto, diga que não encontrou nos documentos indexados.",
   chunkSize: 800,
   chunkOverlap: 120,
   topK: 5,
   showSources: true,
+  dedupEntities: true,
 };
 
 // ---- Seed data (browser preview only) -------------------------------------
@@ -116,38 +149,30 @@ export const DEFAULT_SETTINGS: Settings = {
 const initial: State = {
   view: "chat",
   theme: "dark",
-  vaults: [{ id: "local", name: "Yellow Lore", createdAt: "" }],
-  activeVaultId: "local",
+  // Vaults start empty (Obsidian-style) — the user creates the first vault.
+  vaults: [],
+  activeVaultId: "",
   extracting: false,
   chatInput: "",
   pending: false,
-  messages: [
-    { role: "assistant", text: "Olá! Sou seu assistente de conhecimento. Carregue documentos na aba Conhecimento e pergunte sobre eles — eu sempre busco na base antes de responder." },
-  ],
+  // Chat starts empty, like a fresh AI conversation.
+  messages: [],
+  sessions: [],
+  currentSessionId: "",
   docsFilter: "",
-  docs: [
-    { id: "d1", name: "Crônicas de Vharren - Cap. 1-5.pdf", type: "PDF", pages: 82, status: "Indexado", addedLabel: "há 3 dias" },
-    { id: "d2", name: "Notas de worldbuilding.txt", type: "TXT", pages: 14, status: "Indexado", addedLabel: "há 3 dias" },
-    { id: "d3", name: "Diálogos - Ato II.docx", type: "DOCX", pages: 31, status: "Processando", addedLabel: "há 2 horas" },
-  ],
+  docs: [],
   charactersTab: "grid",
-  characters: [
-    { id: "c1", name: "Elandra Voss", role: "Protagonista, exilada da corte", summary: "Ex-arquivista real acusada de traição, agora busca provar sua inocência.", traits: ["Estratégica", "Desconfiada", "Leal aos poucos"], status: "Extraído", sourceDoc: "Crônicas de Vharren - Cap. 1-5.pdf", sourceQuote: '"Elandra jamais esqueceria o dia em que a guarda a arrastou da Biblioteca Real..."' },
-    { id: "c2", name: "Kaelen Thorne", role: "Mercenário, aliado de Elandra", summary: "Contratado para escoltar Elandra, desenvolve lealdade inesperada.", traits: ["Cínico", "Habilidoso com espadas", "Passado obscuro"], status: "Editado", sourceDoc: "Crônicas de Vharren - Cap. 1-5.pdf", sourceQuote: '"Kaelen aceitou o contrato sem saber que a exilada guardava mais segredos do que moedas para pagá-lo."' },
-    { id: "c3", name: "Vozes do Conselho", role: "Antagonista coletivo", summary: "Conselho de nobres que orquestrou a queda de Elandra.", traits: ["Corrupto", "Poderoso"], status: "Extraído", sourceDoc: "Notas de worldbuilding.txt", sourceQuote: '"O Conselho de Nym decide em sete votos — e Elandra teve contra si os sete."' },
-  ],
-  relations: [
-    { from: "Elandra Voss", to: "Kaelen Thorne", label: "aliado de" },
-    { from: "Elandra Voss", to: "Vozes do Conselho", label: "perseguida por" },
-  ],
-  places: [
-    { id: "p1", name: "Cidade de Nym", type: "Capital", summary: "Capital do reino, sede do Conselho e da Biblioteca Real.", status: "Extraído", sourceDoc: "Notas de worldbuilding.txt", sourceQuote: '"Nym se ergue sobre sete pontes, cada uma vigiada por um dos sete conselheiros."' },
-    { id: "p2", name: "Floresta de Vharren", type: "Região selvagem", summary: "Floresta antiga onde Elandra se refugia após o exílio.", status: "Extraído", sourceDoc: "Crônicas de Vharren - Cap. 1-5.pdf", sourceQuote: '"A Floresta de Vharren não perdoa quem entra sem convite dos antigos."' },
-  ],
+  characters: [],
+  relations: [],
+  places: [],
   editing: null,
   editForm: null,
   settings: DEFAULT_SETTINGS,
   savedToast: false,
+  vaultModalOpen: false,
+  indexStale: false,
+  reindexing: false,
+  citation: null,
 };
 
 // ---- Store + actions ------------------------------------------------------
@@ -160,13 +185,42 @@ let toastTimer: ReturnType<typeof setTimeout> | undefined;
 /// Reload the docs + extracted entities for the active vault (Tauri only).
 async function loadActiveVault() {
   if (!isTauri) return;
-  const [docs, entities] = await Promise.all([api.listDocuments(), api.getEntities()]);
+  const [docs, entities, index, sessions] = await Promise.all([
+    api.listDocuments(),
+    api.getEntities(),
+    api.indexInfo().catch(() => ({ stale: false })),
+    api.listSessions().catch(() => [] as Session[]),
+  ]);
   setState({
     docs,
     characters: entities.characters,
     places: entities.places,
     relations: entities.relations,
+    indexStale: index.stale,
+    sessions,
+    // Open on a blank new chat — "what do you want to do?".
+    messages: [],
+    currentSessionId: "",
   });
+}
+
+/// Move a session to the top of the list (most recent activity first).
+function bumpSession(id: string) {
+  setState("sessions", (list) => {
+    const found = list.find((s) => s.id === id);
+    if (!found) return list;
+    return [found, ...list.filter((s) => s.id !== id)];
+  });
+}
+
+async function refreshIndexInfo() {
+  if (!isTauri) return;
+  try {
+    const info = await api.indexInfo();
+    setState({ indexStale: info.stale });
+  } catch {
+    /* no active vault yet */
+  }
 }
 
 export const actions = {
@@ -179,8 +233,8 @@ export const actions = {
         api.listVaults(),
         api.getActiveVault(),
       ]);
-      setState({ settings: cfg, vaults, activeVaultId });
-      await loadActiveVault();
+      setState({ settings: cfg, vaults, activeVaultId: activeVaultId ?? "" });
+      if (activeVaultId) await loadActiveVault();
     } catch (e) {
       console.error("init falhou", e);
     }
@@ -188,7 +242,8 @@ export const actions = {
 
   // --- Vaults ---
   async selectVault(id: string) {
-    setState({ activeVaultId: id });
+    // Switching vault = new knowledge base → fresh conversation.
+    setState({ activeVaultId: id, messages: [] });
     if (isTauri) {
       await api.setActiveVault(id);
       await loadActiveVault();
@@ -199,13 +254,14 @@ export const actions = {
     if (!clean) return;
     if (isTauri) {
       const vault = await api.createVault(clean);
-      setState(produce((s) => { s.vaults.push(vault); s.activeVaultId = vault.id; }));
+      setState(produce((s) => { s.vaults.push(vault); s.activeVaultId = vault.id; s.messages = []; }));
       await loadActiveVault();
     } else {
       const vault: Vault = { id: crypto.randomUUID(), name: clean, createdAt: "" };
       setState(produce((s) => {
         s.vaults.push(vault);
         s.activeVaultId = vault.id;
+        s.messages = [];
         s.docs = []; s.characters = []; s.places = []; s.relations = [];
       }));
     }
@@ -217,40 +273,151 @@ export const actions = {
     setState("vaults", (v) => v.id === id, "name", clean);
   },
   async deleteVault(id: string) {
-    if (state.vaults.length <= 1) return;
     if (isTauri) await api.deleteVault(id);
     const remaining = state.vaults.filter((v) => v.id !== id);
     setState("vaults", remaining);
-    if (state.activeVaultId === id && remaining[0]) {
-      await actions.selectVault(remaining[0].id);
+    if (state.activeVaultId === id) {
+      if (remaining[0]) {
+        await actions.selectVault(remaining[0].id);
+      } else {
+        // No vaults left → back to the empty state.
+        setState({ activeVaultId: "", messages: [], docs: [], characters: [], places: [], relations: [], sessions: [], currentSessionId: "" });
+      }
     }
   },
 
+  openVaultModal: () => setState({ vaultModalOpen: true }),
+  closeVaultModal: () => setState({ vaultModalOpen: false }),
+  /// Confirm the create-vault modal: persist the chosen provider settings, then
+  /// create + activate the vault.
+  async confirmCreateVault(name: string) {
+    const clean = name.trim();
+    if (!clean) return;
+    if (isTauri) {
+      try {
+        await api.saveConfig({ ...state.settings });
+      } catch (e) {
+        console.error("saveConfig falhou", e);
+      }
+    }
+    await actions.createVault(clean);
+    setState({ vaultModalOpen: false, view: "chat" });
+  },
+
+  openCitation: (doc: string, passages: { quote: string; text: string }[]) =>
+    setState({ citation: { doc, passages } }),
+  closeCitation: () => setState({ citation: null }),
+
   setView: (view: View) => setState({ view }),
   toggleTheme: () => setState("theme", (t) => (t === "dark" ? "light" : "dark")),
+
+  // --- Chat sessions ---
+  /// Start a fresh, unsaved conversation (persisted on the first message).
+  newChat: () => setState({ messages: [], currentSessionId: "" }),
+  async openSession(id: string) {
+    if (!isTauri) { setState({ currentSessionId: id }); return; }
+    setState({ currentSessionId: id });
+    try {
+      const msgs = await api.sessionMessages(id);
+      setState("messages", msgs.map((m) => ({
+        role: m.role,
+        text: m.text,
+        thinking: m.thinking || undefined,
+        sources: m.sources,
+      })));
+    } catch (e) {
+      console.error("sessão falhou", e);
+    }
+  },
+  async deleteSession(id: string) {
+    if (isTauri) await api.deleteSession(id).catch((e) => console.error(e));
+    setState("sessions", (s) => s.filter((x) => x.id !== id));
+    if (state.currentSessionId === id) setState({ messages: [], currentSessionId: "" });
+  },
+  async renameSession(id: string, title: string) {
+    const t = title.trim();
+    if (!t) return;
+    if (isTauri) await api.renameSession(id, t).catch((e) => console.error(e));
+    setState("sessions", (s) => s.id === id, "title", t);
+  },
 
   setChatInput: (chatInput: string) => setState({ chatInput }),
   async sendMessage() {
     const text = state.chatInput.trim();
     if (!text || state.pending) return;
+    // Snapshot the conversation so far as memory for the LLM (excludes the
+    // thinking blocks — only the final answers are replayed as context).
+    const history = state.messages.map((m) => ({ role: m.role, text: m.text }));
+
+    // A blank chat becomes a new saved session on its first message.
+    let sessionId = state.currentSessionId;
+    const isNewSession = isTauri && !sessionId;
+    if (isTauri && !sessionId) {
+      const title = text.length > 48 ? text.slice(0, 48) + "…" : text;
+      try {
+        const s = await api.createSession(title);
+        sessionId = s.id;
+        setState(produce((st) => { st.currentSessionId = s.id; st.sessions.unshift(s); }));
+      } catch (e) {
+        console.error("criar sessão falhou", e);
+      }
+    }
+
     setState(produce((s) => {
       s.messages.push({ role: "user", text });
+      s.messages.push({ role: "assistant", text: "", thinking: "" });
       s.chatInput = "";
       s.pending = true;
     }));
-    try {
-      const reply: Message = isTauri
-        ? { role: "assistant", ...(await api.ask(text)) }
-        : mockAnswer(text);
-      setState("messages", (m) => [...m, reply]);
-    } catch (e) {
-      setState("messages", (m) => [
-        ...m,
-        { role: "assistant", text: `Erro ao consultar: ${e}`, sources: [] },
-      ]);
-    } finally {
+    const idx = state.messages.length - 1; // the assistant placeholder
+
+    if (!isTauri) {
+      const reply = mockAnswer(text);
+      setState("messages", idx, (m) => ({ ...m, text: reply.text, sources: reply.sources }));
       setState("pending", false);
+      return;
     }
+
+    // Persist the user turn immediately (survives a failed generation).
+    if (sessionId) api.addMessage(sessionId, "user", text, "", []).catch((e) => console.error(e));
+
+    let raw = "";
+    await new Promise<void>((resolve) => {
+      const finish = () => { setState("pending", false); resolve(); };
+      api
+        .askStream(text, history, (e) => {
+          if (e.type === "token") {
+            raw += e.value;
+            const { thinking, text: body } = splitThink(raw);
+            setState("messages", idx, (m) => ({ ...m, thinking, text: body }));
+          } else if (e.type === "done") {
+            const { thinking, text: body } = splitThink(raw);
+            setState("messages", idx, (m) => ({ ...m, sources: e.sources }));
+            if (sessionId) {
+              api.addMessage(sessionId, "assistant", body, thinking, e.sources).catch((er) => console.error(er));
+              bumpSession(sessionId);
+              // Summarize the first exchange into a concise title (like ChatGPT).
+              if (isNewSession && body.trim()) {
+                api.generateSessionTitle(sessionId, text, body)
+                  .then((title) => {
+                    if (title.trim()) setState("sessions", (s) => s.id === sessionId, "title", title.trim());
+                  })
+                  .catch((er) => console.error(er));
+              }
+            }
+            finish();
+          } else if (e.type === "error") {
+            const msg = `Erro ao consultar: ${e.message}`;
+            setState("messages", idx, (m) => ({ ...m, text: msg }));
+            if (sessionId) api.addMessage(sessionId, "assistant", msg, "", []).catch((er) => console.error(er));
+            finish();
+          }
+        })
+        .catch((err) => {
+          setState("messages", idx, (m) => ({ ...m, text: `Erro ao consultar: ${err}` }));
+          finish();
+        });
+    });
   },
 
   setDocsFilter: (docsFilter: string) => setState({ docsFilter }),
@@ -263,12 +430,36 @@ export const actions = {
       setState("docs", (d) => [doc, ...d]);
     }
   },
+  /// Ingest a binary document (PDF/DOCX) — `data` is base64 of the file bytes.
+  async ingestBinaryDocument(name: string, data: string) {
+    if (isTauri) {
+      const doc = await api.ingestBinary(name, data);
+      setState("docs", (d) => [doc, ...d.filter((x) => x.id !== doc.id)]);
+    } else {
+      const doc: Doc = { id: crypto.randomUUID(), name, type: (name.split(".").pop() ?? "DOC").toUpperCase(), pages: 1, status: "Indexado", addedLabel: "agora" };
+      setState("docs", (d) => [doc, ...d]);
+    }
+  },
   async removeDoc(id: string) {
     if (isTauri) await api.removeDocument(id).catch((e) => console.error(e));
     setState("docs", (docs) => docs.filter((d) => d.id !== id));
   },
 
-  setCharactersTab: (charactersTab: "grid" | "relations") => setState({ charactersTab }),
+  /// Re-embed the whole vault with the current embedding model.
+  async reindex() {
+    if (!isTauri || state.reindexing) return;
+    setState("reindexing", true);
+    try {
+      await api.reindex();
+      setState("indexStale", false);
+    } catch (e) {
+      alert(`Reindexação falhou: ${e}`);
+    } finally {
+      setState("reindexing", false);
+    }
+  },
+
+  setCharactersTab: (charactersTab: "grid" | "graph") => setState({ charactersTab }),
 
   /// Run LLM extraction over the active vault's knowledge → characters/places/relations.
   async extractEntities() {
@@ -352,6 +543,7 @@ export const actions = {
         console.error("saveConfig falhou", e);
       }
     }
+    await refreshIndexInfo();
     setState({ savedToast: true });
     clearTimeout(toastTimer);
     toastTimer = setTimeout(() => setState({ savedToast: false }), 2200);
