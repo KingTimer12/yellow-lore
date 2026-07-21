@@ -1,12 +1,15 @@
 mod config;
 mod db;
 mod error;
+mod extract;
 mod providers;
 mod rag;
 mod vector_store;
 
+use base64::Engine;
+
 use config::RagConfig;
-use db::{Character, Db, DocMeta, Entities, Place, Vault};
+use db::{Character, ChatSession, Db, DocMeta, Entities, Place, StoredMessage, Vault};
 use error::{AppError, AppResult};
 use rag::Answer;
 use std::path::PathBuf;
@@ -63,8 +66,8 @@ fn list_vaults(state: tauri::State<'_, AppState>) -> AppResult<Vec<Vault>> {
 }
 
 #[tauri::command]
-fn get_active_vault(state: tauri::State<'_, AppState>) -> AppResult<String> {
-    state.active()
+fn get_active_vault(state: tauri::State<'_, AppState>) -> AppResult<Option<String>> {
+    state.db.active_vault()
 }
 
 #[tauri::command]
@@ -108,7 +111,52 @@ async fn ingest_document(
     }
     let vault = state.active()?;
     let cfg = state.config.lock().await.clone();
-    let built = rag::build_document(&state.client, &cfg, name, content).await?;
+    persist_document(&state, &vault, &cfg, name, content).await
+}
+
+/// Ingest a binary document (PDF/DOCX) sent as base64. Text is extracted in
+/// Rust, then it flows through the same chunk→embed pipeline as plain text.
+#[tauri::command]
+async fn ingest_binary(
+    state: tauri::State<'_, AppState>,
+    name: String,
+    data: String,
+) -> AppResult<DocMeta> {
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data.as_bytes())
+        .map_err(|e| AppError::Msg(format!("base64 inválido: {e}")))?;
+    let content = extract::extract_text(&name, &bytes)?;
+    if content.trim().is_empty() {
+        return Err(AppError::Msg("nenhum texto extraído do documento".into()));
+    }
+    let vault = state.active()?;
+    let cfg = state.config.lock().await.clone();
+    persist_document(&state, &vault, &cfg, name, content).await
+}
+
+/// The embedding a vault is (or would be) indexed with: "provider/model".
+fn emb_tag(cfg: &RagConfig) -> String {
+    format!("{}/{}", cfg.embedding_provider, cfg.embedding_model)
+}
+
+/// Shared ingest tail: skip identical docs already embedded with the current
+/// model, otherwise chunk + embed + persist and stamp the vault's index model.
+async fn persist_document(
+    state: &tauri::State<'_, AppState>,
+    vault: &str,
+    cfg: &RagConfig,
+    name: String,
+    content: String,
+) -> AppResult<DocMeta> {
+    let id = blake3::hash(content.as_bytes()).to_hex().to_string();
+    let tag = emb_tag(cfg);
+    // Same bytes, already embedded with the same model → nothing to do.
+    if state.db.indexed_embedding(vault)?.as_deref() == Some(tag.as_str()) {
+        if let Some(existing) = state.db.get_document(vault, &id)? {
+            return Ok(existing);
+        }
+    }
+    let built = rag::build_document(&state.client, cfg, name, content).await?;
     let meta = DocMeta {
         id: built.id,
         name: built.name,
@@ -117,8 +165,54 @@ async fn ingest_document(
         status: "Indexado".into(),
         added_label: "agora".into(),
     };
-    state.db.add_document(&vault, &meta, &built.chunks)?;
+    state.db.add_document(vault, &meta, &built.chunks)?;
+    state.db.set_indexed_embedding(vault, &tag)?;
     Ok(meta)
+}
+
+/// Index state for the active vault, so the UI can offer a reindex when the
+/// embedding model has changed since the documents were embedded.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct IndexInfo {
+    indexed: String,
+    current: String,
+    stale: bool,
+}
+
+#[tauri::command]
+async fn index_info(state: tauri::State<'_, AppState>) -> AppResult<IndexInfo> {
+    let vault = state.active()?;
+    let cfg = state.config.lock().await.clone();
+    let indexed = state.db.indexed_embedding(&vault)?.unwrap_or_default();
+    let current = emb_tag(&cfg);
+    let stale = !indexed.is_empty() && indexed != current;
+    Ok(IndexInfo { indexed, current, stale })
+}
+
+/// Re-embed every chunk in the active vault with the current embedding model
+/// and stamp the vault. Returns the number of chunks re-embedded.
+#[tauri::command]
+async fn reindex(state: tauri::State<'_, AppState>) -> AppResult<usize> {
+    let vault = state.active()?;
+    let cfg = state.config.lock().await.clone();
+    let tag = emb_tag(&cfg);
+    let chunks = state.db.load_chunks(&vault)?;
+    if chunks.is_empty() {
+        state.db.set_indexed_embedding(&vault, &tag)?;
+        return Ok(0);
+    }
+    let texts: Vec<String> = chunks.iter().map(|c| c.text.clone()).collect();
+    let vecs = providers::embed(&state.client, &cfg, &texts).await?;
+    let pairs: Vec<(String, Vec<f32>)> = chunks
+        .into_iter()
+        .zip(vecs)
+        .map(|(c, v)| (c.id, v))
+        .collect();
+    let n = pairs.len();
+    state.db.update_chunk_vectors(&vault, &pairs)?;
+    state.db.set_indexed_embedding(&vault, &tag)?;
+    Ok(n)
 }
 
 #[tauri::command]
@@ -130,11 +224,120 @@ fn remove_document(state: tauri::State<'_, AppState>, id: String) -> AppResult<(
 // ---- Ask ------------------------------------------------------------------
 
 #[tauri::command]
-async fn ask(state: tauri::State<'_, AppState>, question: String) -> AppResult<Answer> {
+async fn ask(
+    state: tauri::State<'_, AppState>,
+    question: String,
+    history: Option<Vec<rag::HistoryTurn>>,
+) -> AppResult<Answer> {
     let vault = state.active()?;
     let cfg = state.config.lock().await.clone();
     let chunks = state.db.load_chunks(&vault)?;
-    rag::ask(&state.client, &cfg, &chunks, question).await
+    rag::ask(&state.client, &cfg, &chunks, question, history.unwrap_or_default()).await
+}
+
+/// Streamed events sent to the frontend during `ask_stream`.
+#[derive(Clone, serde::Serialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+enum StreamEvent {
+    Token { value: String },
+    Done { sources: Vec<rag::Source> },
+    Error { message: String },
+}
+
+/// Streaming chat: emits each generated token as it arrives, then a final
+/// `done` event carrying the sources (or an `error` event on failure).
+#[tauri::command]
+async fn ask_stream(
+    state: tauri::State<'_, AppState>,
+    question: String,
+    history: Option<Vec<rag::HistoryTurn>>,
+    on_event: tauri::ipc::Channel<StreamEvent>,
+) -> AppResult<()> {
+    let vault = state.active()?;
+    let cfg = state.config.lock().await.clone();
+    let chunks = state.db.load_chunks(&vault)?;
+
+    let ch = on_event.clone();
+    let result = rag::ask_stream(
+        &state.client,
+        &cfg,
+        &chunks,
+        question,
+        history.unwrap_or_default(),
+        |tok| {
+            let _ = ch.send(StreamEvent::Token { value: tok.to_string() });
+        },
+    )
+    .await;
+
+    match result {
+        Ok(sources) => {
+            let _ = on_event.send(StreamEvent::Done { sources });
+        }
+        Err(e) => {
+            let _ = on_event.send(StreamEvent::Error { message: e.to_string() });
+        }
+    }
+    Ok(())
+}
+
+// ---- Chat sessions --------------------------------------------------------
+
+#[tauri::command]
+fn list_sessions(state: tauri::State<'_, AppState>) -> AppResult<Vec<ChatSession>> {
+    let vault = state.active()?;
+    state.db.list_sessions(&vault)
+}
+
+#[tauri::command]
+fn create_session(state: tauri::State<'_, AppState>, title: String) -> AppResult<ChatSession> {
+    let vault = state.active()?;
+    state.db.create_session(&vault, &title)
+}
+
+#[tauri::command]
+fn rename_session(state: tauri::State<'_, AppState>, id: String, title: String) -> AppResult<()> {
+    state.db.rename_session(&id, &title)
+}
+
+#[tauri::command]
+fn delete_session(state: tauri::State<'_, AppState>, id: String) -> AppResult<()> {
+    state.db.delete_session(&id)
+}
+
+#[tauri::command]
+fn session_messages(state: tauri::State<'_, AppState>, id: String) -> AppResult<Vec<StoredMessage>> {
+    state.db.session_messages(&id)
+}
+
+/// Summarize the first exchange into a short title and store it on the session.
+/// Returns the generated title.
+#[tauri::command]
+async fn generate_session_title(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    question: String,
+    answer: String,
+) -> AppResult<String> {
+    let cfg = state.config.lock().await.clone();
+    let title = rag::summarize_title(&state.client, &cfg, &question, &answer).await?;
+    if !title.trim().is_empty() {
+        state.db.rename_session(&id, &title)?;
+    }
+    Ok(title)
+}
+
+#[tauri::command]
+fn add_message(
+    state: tauri::State<'_, AppState>,
+    session: String,
+    role: String,
+    text: String,
+    thinking: String,
+    sources: serde_json::Value,
+) -> AppResult<()> {
+    let vault = state.active()?;
+    state.db.add_message(&vault, &session, &role, &text, &thinking, &sources)
 }
 
 // ---- Entities -------------------------------------------------------------
@@ -171,7 +374,6 @@ fn update_place(state: tauri::State<'_, AppState>, place: Place) -> AppResult<()
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             let data_dir = app
                 .path()
@@ -202,8 +404,19 @@ pub fn run() {
             delete_vault,
             list_documents,
             ingest_document,
+            ingest_binary,
             remove_document,
+            index_info,
+            reindex,
             ask,
+            ask_stream,
+            list_sessions,
+            create_session,
+            rename_session,
+            delete_session,
+            session_messages,
+            generate_session_title,
+            add_message,
             get_entities,
             extract_entities,
             update_character,
