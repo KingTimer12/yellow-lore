@@ -309,6 +309,7 @@ pub async fn ask(
 ) -> AppResult<Answer> {
     let (messages, sources) = build_chat(client, cfg, chunks, question, history).await?;
     let text = providers::chat(client, cfg, &messages).await?;
+    let sources = relevant_sources(sources, &strip_think(&text));
     Ok(Answer { text, sources })
 }
 
@@ -324,8 +325,11 @@ pub async fn ask_stream<F: FnMut(&str)>(
     on_token: F,
 ) -> AppResult<Vec<Source>> {
     let (messages, sources) = build_chat(client, cfg, chunks, question, history).await?;
-    providers::chat_stream(client, cfg, &messages, cancel, on_token).await?;
-    Ok(sources)
+    let answer = providers::chat_stream(client, cfg, &messages, cancel, on_token).await?;
+    // Cite only what the answer actually drew on. Broad retrieval feeds the model
+    // (a term can hit 10 chapters), but a source with zero content overlap with
+    // the generated answer wasn't used — don't cite it.
+    Ok(relevant_sources(sources, &strip_think(&answer)))
 }
 
 /// Generate a short session title (≈3–6 words) summarizing the topic, from the
@@ -366,6 +370,43 @@ Não raciocine em voz alta nem inclua qualquer texto além do título. /no_think
     }
     let chars: String = t.chars().take(60).collect();
     Ok(chars)
+}
+
+/// Meaningful lowercased content words (len ≥ 4, minus common PT stop words),
+/// used to measure overlap between the answer and each candidate source.
+fn content_terms(text: &str) -> std::collections::HashSet<String> {
+    const STOP: [&str; 40] = [
+        "para", "pelo", "pela", "pelos", "pelas", "dos", "das", "com", "sem", "que",
+        "uma", "uns", "umas", "essa", "esse", "esses", "essas", "isso", "aquilo",
+        "sobre", "esta", "este", "estes", "estas", "seu", "sua", "seus", "suas",
+        "onde", "qual", "quais", "quem", "como", "quando", "porque", "mas", "por",
+        "nao", "não", "mais",
+    ];
+    text.to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| w.chars().count() >= 4 && !STOP.contains(w))
+        .map(|w| w.to_string())
+        .collect()
+}
+
+/// Keep only the sources the generated answer actually used: those sharing at
+/// least one content word with it. A "não encontrei" answer (no content terms)
+/// cites nothing. Result is ordered by overlap strength (strongest first).
+fn relevant_sources(sources: Vec<Source>, answer: &str) -> Vec<Source> {
+    let terms = content_terms(answer);
+    if terms.is_empty() {
+        return Vec::new();
+    }
+    let mut scored: Vec<(usize, Source)> = sources
+        .into_iter()
+        .map(|s| {
+            let overlap = content_terms(&s.text).intersection(&terms).count();
+            (overlap, s)
+        })
+        .filter(|(overlap, _)| *overlap > 0)
+        .collect();
+    scored.sort_by(|a, b| b.0.cmp(&a.0));
+    scored.into_iter().map(|(_, s)| s).collect()
 }
 
 /// Chapter numbers explicitly named in a phrase ("capítulo 1", "cap. 2", "cap 3").
