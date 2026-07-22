@@ -68,7 +68,12 @@ renomear, excluir). Comandos: `list_sessions`, `create_session`,
   o contexto) e **citações declaradas pelo LLM**: cada trecho vai rotulado
   `[Fonte N]` e o modelo cita `[N]`; `cited_sources` mantém só as fontes marcadas,
   com **fallback** ao filtro de sobreposição (`relevant_sources`) quando o modelo
-  não marca nada. Chunks têm `ordinal` (ordem de leitura, recalculado no load).
+  não marca nada. **RAG corretivo opcional** (`corrective` / CRAG-limitado):
+  rascunha a resposta, `grade_answer` avalia se ela resolve a pergunta; se não,
+  re-busca com rede mais ampla (`widen`: top-k dobrado, capado) e responde uma vez
+  mais. Uma única re-tentativa (sem loop aberto). No streaming: rascunho adequado é
+  entregue direto (um push); só a re-tentativa é transmitida token a token.
+  Chunks têm `ordinal` (ordem de leitura, recalculado no load).
   `extract_entities()` = LLM lê o vault em **janelas de ~12k chars** (até **40**
   janelas), com **concorrência configurável** (`extractionConcurrency`, default 1
   = sequencial; suba só em nuvem), **modelo de extração dedicado opcional**
@@ -110,7 +115,8 @@ incremental por padrão, `true` re-scaneia tudo), `add_character`, `add_place`,
 - **System prompt** editável (esteira o agente).
 - RAG: chunk size, overlap, top-k, **temperatura** (default 0.2), **num_ctx do
   Ollama** (default 8192 — modelo que raciocina muito estourava o contexto e
-  cortava a resposta), mostrar fontes, **reranking** (off).
+  cortava a resposta), mostrar fontes, **reranking** (off), **RAG corretivo /
+  CRAG** (off).
 - Extração: **modelo dedicado** opcional (`extractionModel`), **janelas em
   paralelo** (`extractionConcurrency`, default 1), **dedup via LLM**
   (`dedupEntities`).
@@ -151,10 +157,6 @@ incremental por padrão, `true` re-scaneia tudo), `add_character`, `add_place`,
 
 ## Ideias — precisão da resposta (chat)
 
-- **RAG avançado / CRAG (Corrective RAG)**: após gerar, o modelo se auto-avalia
-  ("isso responde?"); se não, descarta as fontes fracas e re-busca uma vez antes
-  de revisar a resposta. Opcional (custa +1..2 chamadas — pesa em local), bom para
-  o modo precisão. Limitar a 1 re-busca (nada de loop aberto estilo agentic puro).
 - **Fusão de rankings (RRF)**: combinar semântico e lexical por Reciprocal Rank
   Fusion em vez de append+dedup — ordena melhor quando os dois discordam.
 - **Threshold de similaridade**: descartar chunk abaixo de X de cosseno (menos
