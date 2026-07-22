@@ -78,6 +78,8 @@ export const api = {
   addPlace: (place: Place) => tauriInvoke<void>("add_place", { place }),
   updateCharacter: (character: Character) => tauriInvoke<void>("update_character", { character }),
   updatePlace: (place: Place) => tauriInvoke<void>("update_place", { place }),
+  addRelation: (relation: Relation) => tauriInvoke<void>("add_relation", { relation }),
+  removeRelation: (relation: Relation) => tauriInvoke<void>("remove_relation", { relation }),
 };
 
 // Mock RAG used only in browser preview (no Rust backend).

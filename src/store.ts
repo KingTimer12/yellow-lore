@@ -606,6 +606,39 @@ export const actions = {
     setState({ editing: null, editForm: null });
   },
 
+  /// Manually add a graph edge. Skips duplicates and no-op self-links; optimistic.
+  async addRelation(from: string, to: string, label: string) {
+    from = from.trim();
+    to = to.trim();
+    label = label.trim();
+    if (!from || !to || from.toLowerCase() === to.toLowerCase()) return;
+    const dup = state.relations.some(
+      (r) =>
+        r.from.toLowerCase() === from.toLowerCase() &&
+        r.to.toLowerCase() === to.toLowerCase() &&
+        r.label.toLowerCase() === label.toLowerCase(),
+    );
+    if (dup) return;
+    const rel: Relation = { from, to, label };
+    setState("relations", (list) => [...list, rel]);
+    if (isTauri) await api.addRelation({ ...rel }).catch((e) => console.error(e));
+  },
+
+  /// Remove a graph edge by its exact (from, to, label) triple; optimistic.
+  async removeRelation(rel: Relation) {
+    setState("relations", (list) =>
+      list.filter(
+        (r) =>
+          !(
+            r.from.toLowerCase() === rel.from.toLowerCase() &&
+            r.to.toLowerCase() === rel.to.toLowerCase() &&
+            r.label.toLowerCase() === rel.label.toLowerCase()
+          ),
+      ),
+    );
+    if (isTauri) await api.removeRelation({ ...rel }).catch((e) => console.error(e));
+  },
+
   setSetting: <K extends keyof Settings>(key: K, value: Settings[K]) =>
     setState("settings", key, value),
   async saveSettings() {
