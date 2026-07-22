@@ -394,8 +394,15 @@ async fn extract_entities(
         return state.db.entities(&vault);
     }
 
+    // Pass the names already saved so the extractor can fold a name introduced in
+    // this run into a fuller name from a previous run (cross-run dedup).
+    let existing = state.db.entities(&vault)?;
+    let existing_chars: Vec<String> = existing.characters.iter().map(|c| c.name.clone()).collect();
+    let existing_places: Vec<String> = existing.places.iter().map(|p| p.name.clone()).collect();
+
     let (characters, places, relations) =
-        rag::extract_entities(&state.client, &cfg, &target).await?;
+        rag::extract_entities(&state.client, &cfg, &target, &existing_chars, &existing_places)
+            .await?;
     state.db.merge_extracted(&vault, &characters, &places, &relations)?;
 
     // Record the documents we just covered so the next run skips them.
