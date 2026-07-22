@@ -55,7 +55,11 @@ renomear, excluir). Comandos: `list_sessions`, `create_session`,
   híbrida** (semântico + lexical), cobrindo match literal que o embedding perde.
 - `providers.rs` — embedding + chat via **Ollama** (local), **OpenAI** e
   **vLLM** (servidor OpenAI-compatível, key opcional), escolhidos de forma
-  independente.
+  independente. **Thinking só na resposta final**: `chat()` (resposta ao usuário)
+  deixa o raciocínio ligado; `chat_internal()` (rerank, grade do CRAG, dedup,
+  extração, título) desliga — no Ollama envia `think:false`, e os prompts internos
+  ainda carregam o hint `/no_think` p/ modelos OpenAI/vLLM. Corta latência dos
+  passos internos que só devolvem saída curta/estruturada.
 - `rag.rs` — chunking · `build_document()` (chunk→embed) · `ask()` = pipeline
   **RAG-first** · `ask_stream()` = mesmo pipeline, mas emite tokens via callback.
   Recuperação: **híbrida** (semântico + lexical IDF), **direcionada por capítulo**
