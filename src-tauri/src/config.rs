@@ -48,6 +48,23 @@ pub struct RagConfig {
     /// same person/place (nicknames, titles) beyond the name-substring heuristic.
     #[serde(default = "default_true")]
     pub dedup_entities: bool,
+
+    /// Optional model used ONLY for entity extraction. Empty = reuse `llm_model`
+    /// (no second model to download or hold in VRAM — safe for weak GPUs).
+    /// Point it at a smaller/faster model when you have the memory to spare.
+    #[serde(default)]
+    pub extraction_model: String,
+    /// How many extraction windows to run concurrently. 1 = sequential (the safe
+    /// default for a single local GPU — Ollama serializes anyway and concurrent
+    /// requests only thrash VRAM). Raise it for cloud providers (OpenAI/vLLM),
+    /// where parallel calls cut wall-clock time roughly linearly.
+    #[serde(default = "default_extraction_concurrency")]
+    pub extraction_concurrency: usize,
+    /// After hybrid retrieval, run one cheap LLM pass to re-order the retrieved
+    /// chunks by relevance before building the context (trims top-k noise).
+    /// Costs one extra LLM call per question; off by default.
+    #[serde(default)]
+    pub rerank: bool,
 }
 
 fn default_true() -> bool {
@@ -64,6 +81,10 @@ fn default_num_ctx() -> u32 {
 
 fn default_vllm_base_url() -> String {
     "http://localhost:8000/v1".into()
+}
+
+fn default_extraction_concurrency() -> usize {
+    1
 }
 
 pub const DEFAULT_SYSTEM_PROMPT: &str = "Você é o assistente do Yellow Lore. \
@@ -91,6 +112,9 @@ impl Default for RagConfig {
             temperature: default_temperature(),
             show_sources: true,
             dedup_entities: true,
+            extraction_model: String::new(),
+            extraction_concurrency: default_extraction_concurrency(),
+            rerank: false,
         }
     }
 }
