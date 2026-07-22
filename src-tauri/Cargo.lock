@@ -5246,7 +5246,7 @@ dependencies = [
 
 [[package]]
 name = "yellow-lore"
-version = "0.1.0"
+version = "0.1.3"
 dependencies = [
  "base64 0.22.1",
  "blake3",
