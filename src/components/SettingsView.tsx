@@ -109,6 +109,12 @@ export default function SettingsView() {
           label="RAG corretivo — auto-avaliar e re-buscar (CRAG)"
           hint="Após rascunhar a resposta, o modelo avalia se ela resolve a pergunta; se não, refaz a busca com uma rede mais ampla e responde de novo (uma única re-tentativa). Mais preciso, porém mais lento e com chamadas de LLM extras. Bom para o modo precisão."
         />
+        <Toggle
+          on={state.settings.showThinking}
+          onToggle={() => actions.setSetting("showThinking", !state.settings.showThinking)}
+          label="Deixar a resposta final raciocinar (thinking)"
+          hint="Off por padrão: para resumos/consultas o raciocínio é desnecessário e, com modelos que pensam em texto puro, vaza um preâmbulo longo na resposta. Passos internos do RAG nunca raciocinam."
+        />
       </div>
 
       {/* Entity extraction */}

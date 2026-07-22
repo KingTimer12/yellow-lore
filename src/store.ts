@@ -90,6 +90,8 @@ export type Settings = {
   rerank: boolean;
   /// Corrective RAG: draft → auto-avaliação → uma re-busca mais ampla se preciso.
   corrective: boolean;
+  /// Deixar a resposta final "pensar" (bloco de raciocínio). Off por padrão.
+  showThinking: boolean;
 };
 
 // `creating` marks a brand-new entity (manual add) vs editing an existing one.
@@ -187,6 +189,7 @@ export const DEFAULT_SETTINGS: Settings = {
   extractionConcurrency: 1,
   rerank: false,
   corrective: false,
+  showThinking: false,
 };
 
 // ---- Seed data (browser preview only) -------------------------------------
