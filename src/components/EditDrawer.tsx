@@ -90,8 +90,16 @@ export default function EditDrawer() {
 
           <Show when={!isCreating()}>
             <div
+              onClick={() => actions.startLink(form()!.name)}
+              title="Fecha o painel e liga este nó a outro no grafo"
+              class="mt-3 flex items-center justify-center gap-2 py-2.5 rounded-8px border border-border text-12.5px font-semibold cursor-pointer text-fg transition-colors hover:border-accent hover:text-accent"
+            >
+              <div class="i-lucide-spline w-3.5 h-3.5" />
+              Ligar a outro nó
+            </div>
+            <div
               onClick={remove}
-              class="mt-3 flex items-center justify-center gap-2 py-2.5 rounded-8px border border-border text-12.5px font-semibold cursor-pointer text-fg-muted transition-colors hover:border-danger hover:text-danger"
+              class="mt-2 flex items-center justify-center gap-2 py-2.5 rounded-8px border border-border text-12.5px font-semibold cursor-pointer text-fg-muted transition-colors hover:border-danger hover:text-danger"
             >
               <div class="i-lucide-trash-2 w-3.5 h-3.5" />
               Excluir {noun()}

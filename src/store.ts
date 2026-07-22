@@ -142,6 +142,10 @@ export type State = {
   /// Free-text filters for the Places and Abilities grids (name / type).
   placesFilter: string;
   abilitiesFilter: string;
+  /// When set, the graph is in "connect" mode: the next node the user clicks
+  /// becomes the target of a new edge from this source entity (by name). Started
+  /// from the entity drawer; cleared on completion or cancel (Esc / empty click).
+  linkSource: string | null;
   editing: EditTarget;
   editForm: EditForm | null;
   settings: Settings;
@@ -235,6 +239,7 @@ const initial: State = {
   abilities: [],
   placesFilter: "",
   abilitiesFilter: "",
+  linkSource: null,
   editing: null,
   editForm: null,
   settings: DEFAULT_SETTINGS,
@@ -737,6 +742,31 @@ export const actions = {
 
   setPlacesFilter: (v: string) => setState("placesFilter", v),
   setAbilitiesFilter: (v: string) => setState("abilitiesFilter", v),
+
+  /// Begin connecting an edge FROM `name`. Closes the drawer and jumps to the
+  /// graph so the user can click the target node. `cancelLink` aborts.
+  startLink(name: string) {
+    const clean = name.trim();
+    if (!clean) return;
+    setState({
+      linkSource: clean,
+      editing: null,
+      editForm: null,
+      view: "characters",
+      charactersTab: "graph",
+    });
+  },
+  cancelLink: () => setState("linkSource", null),
+
+  /// Edit an existing relation's label: drop the old triple and re-add with the
+  /// new label. The result is a user-owned ("Manual") edge, protected from
+  /// extraction — matching every other manual edit.
+  async editRelationLabel(rel: Relation, label: string) {
+    const next = label.trim();
+    if (next === rel.label.trim()) return;
+    await actions.removeRelation(rel);
+    await actions.addRelation(rel.from, rel.to, next);
+  },
 
   /// Manually add a graph edge. Skips duplicates and no-op self-links; optimistic.
   async addRelation(from: string, to: string, label: string) {

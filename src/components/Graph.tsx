@@ -35,6 +35,10 @@ export default function Graph() {
   const [frame, setFrame] = createSignal(0);
   const [view, setView] = createSignal({ scale: 1, tx: 0, ty: 0 });
   const [hover, setHover] = createSignal<string | null>(null);
+  // Cursor position (graph coords) while in connect mode — the in-progress edge
+  // line follows it from the source node. Connect mode itself lives in the store
+  // (`state.linkSource`), started from the entity drawer.
+  const [linkCursor, setLinkCursor] = createSignal({ x: 0, y: 0 });
 
   // ---- Build graph from entity data (rebuilds when data changes) ----------
   const graph = createMemo(() => {
@@ -182,7 +186,11 @@ export default function Graph() {
     });
     if (svg) ro.observe(svg);
     raf = requestAnimationFrame(tick);
-    onCleanup(() => { cancelAnimationFrame(raf); ro.disconnect(); });
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape" && state.linkSource) actions.cancelLink();
+    };
+    window.addEventListener("keydown", onKey);
+    onCleanup(() => { cancelAnimationFrame(raf); ro.disconnect(); window.removeEventListener("keydown", onKey); });
   });
   onCleanup(() => {
     // Persist final positions for next mount.
@@ -204,15 +212,42 @@ export default function Graph() {
 
   const onNodeDown = (e: PointerEvent, nd: Node) => {
     e.stopPropagation();
+    // Connect mode (started from the drawer): the clicked node is the target.
+    const src = state.linkSource;
+    if (src) {
+      if (nd.name.toLowerCase() !== src.toLowerCase()) {
+        const a = src;
+        const b = nd.name;
+        // Create the edge in the direction chosen (source → clicked), then offer
+        // to label it. Blank keeps an unlabeled edge. Both are "Manual" edges.
+        void actions.addRelation(a, b, "");
+        actions.askPrompt({
+          title: `${a} → ${b}`,
+          message: "Rótulo da relação (opcional).",
+          placeholder: "ex.: mentor de, irmão de",
+          confirmLabel: "Rotular",
+          onSubmit: (label) => {
+            void actions.removeRelation({ from: a, to: b, label: "" });
+            void actions.addRelation(a, b, label);
+          },
+        });
+      }
+      actions.cancelLink();
+      return;
+    }
     (e.target as Element).setPointerCapture?.(e.pointerId);
     drag = { id: nd.id, moved: false };
     reheat();
   };
   const onDown = (e: PointerEvent) => {
+    // Clicking empty canvas while connecting cancels the pending edge.
+    if (state.linkSource) { actions.cancelLink(); return; }
     pan = { x: e.clientX - view().tx, y: e.clientY - view().ty };
   };
   const onMove = (e: PointerEvent) => {
-    if (drag) {
+    if (state.linkSource) {
+      setLinkCursor(toGraph(e.clientX, e.clientY));
+    } else if (drag) {
       const g = toGraph(e.clientX, e.clientY);
       const nd = nodeById().get(drag.id);
       if (nd) { nd.fx = g.x; nd.fy = g.y; drag.moved = true; reheat(); }
@@ -245,6 +280,7 @@ export default function Graph() {
       <svg
         ref={svg}
         class="w-full h-full block touch-none select-none cursor-grab active:cursor-grabbing"
+        style={{ cursor: state.linkSource ? "crosshair" : undefined }}
         onPointerDown={onDown}
         onPointerMove={onMove}
         onPointerUp={onUp}
@@ -298,6 +334,22 @@ export default function Graph() {
             }}
           </For>
 
+          {/* In-progress edge in connect mode: from the source node to the cursor. */}
+          <Show when={state.linkSource ? nodeById().get(state.linkSource.toLowerCase()) : null}>
+            {(from) => (
+              <line
+                x1={(frame(), from().x)}
+                y1={from().y}
+                x2={linkCursor().x}
+                y2={linkCursor().y}
+                stroke="var(--accent)"
+                stroke-width={1.8}
+                stroke-dasharray="5 4"
+                style={{ "pointer-events": "none" }}
+              />
+            )}
+          </Show>
+
           {/* Nodes */}
           <For each={graph().nodes}>
             {(nd) => (
@@ -329,6 +381,23 @@ export default function Graph() {
         </g>
       </svg>
 
+      {/* Connect-mode banner */}
+      <Show when={state.linkSource}>
+        {(src) => (
+          <div class="absolute left-1/2 -translate-x-1/2 top-3 flex items-center gap-3 px-3.5 py-2 rounded-9px bg-accent-soft border border-accent text-12px text-fg anim-pop">
+            <span>
+              Ligando de <b>{src()}</b> — clique no nó de destino
+            </span>
+            <span
+              onClick={() => actions.cancelLink()}
+              class="cursor-pointer text-fg-muted hover:text-fg font-semibold"
+            >
+              Esc · cancelar
+            </span>
+          </div>
+        )}
+      </Show>
+
       {/* Legend */}
       <div class="absolute left-3 bottom-3 flex items-center gap-3.5 px-3 py-2 rounded-9px bg-bg/80 border border-border backdrop-blur text-11.5px">
         <div class="flex items-center gap-1.5"><span class="w-2.5 h-2.5 rounded-full" style={{ background: COLOR.character }} /> Personagem</div>
@@ -336,7 +405,7 @@ export default function Graph() {
         <div class="flex items-center gap-1.5"><span class="w-2.5 h-2.5 rounded-full" style={{ background: COLOR.ability }} /> Habilidade</div>
       </div>
       <div class="absolute right-3 bottom-3 text-10.5px text-fg-muted">
-        arraste para mover · rolar para zoom · clique num nó para editar
+        arraste o nó para mover · rolar para zoom · clique para editar (e ligar no painel)
       </div>
 
       <Show when={graph().nodes.length === 0}>

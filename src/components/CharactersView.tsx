@@ -266,9 +266,23 @@ function RelationsEditor() {
                 <span class="text-fg-muted">—{r.label ? ` ${r.label} ` : " "}→</span>
                 <span class="font-semibold">{r.to}</span>
                 <button
+                  onClick={() =>
+                    actions.askPrompt({
+                      title: "Editar relação",
+                      message: `${r.from} → ${r.to}`,
+                      defaultValue: r.label,
+                      placeholder: "rótulo (ex.: mentor de)",
+                      confirmLabel: "Salvar",
+                      onSubmit: (label) => void actions.editRelationLabel(r, label),
+                    })
+                  }
+                  title="Editar rótulo"
+                  class="ml-auto i-lucide-pencil w-3 h-3 flex-none text-fg-muted opacity-0 group-hover:opacity-100 hover:text-fg cursor-pointer border-none bg-transparent transition-opacity"
+                />
+                <button
                   onClick={() => actions.removeRelation(r)}
                   title="Remover relação"
-                  class="ml-auto w-5 h-5 flex-none rounded-full text-fg-muted text-13px leading-none cursor-pointer border-none bg-transparent hover:text-danger transition-colors"
+                  class="w-5 h-5 flex-none rounded-full text-fg-muted text-13px leading-none cursor-pointer border-none bg-transparent hover:text-danger transition-colors"
                 >
                   ×
                 </button>
