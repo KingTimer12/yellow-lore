@@ -45,22 +45,37 @@ pub async fn embed(
     Ok(out)
 }
 
-/// Generate a chat completion with the configured LLM provider/model.
+/// Generate a chat completion for the FINAL, user-facing answer. Reasoning
+/// ("thinking") is left enabled so reasoning models can deliberate.
 pub async fn chat(
     client: &reqwest::Client,
     cfg: &RagConfig,
     messages: &[ChatMessage],
 ) -> AppResult<String> {
-    chat_as(client, cfg, messages, &cfg.llm_model).await
+    chat_impl(client, cfg, messages, &cfg.llm_model, true).await
 }
 
-/// Like [`chat`] but with an explicit model, so callers (entity extraction) can
-/// use a dedicated smaller model without touching the chat model.
-pub async fn chat_as(
+/// Generate a chat completion for an INTERNAL RAG step (rerank, grading, dedup,
+/// entity extraction, title). Reasoning is DISABLED to cut latency — these steps
+/// return short structured output where deliberation only wastes tokens/time.
+/// `model` allows a dedicated extraction model. On Ollama this sends
+/// `think: false`; OpenAI/vLLM have no standard toggle, so the prompts also carry
+/// a `/no_think` hint for models that honor it.
+pub async fn chat_internal(
     client: &reqwest::Client,
     cfg: &RagConfig,
     messages: &[ChatMessage],
     model: &str,
+) -> AppResult<String> {
+    chat_impl(client, cfg, messages, model, false).await
+}
+
+async fn chat_impl(
+    client: &reqwest::Client,
+    cfg: &RagConfig,
+    messages: &[ChatMessage],
+    model: &str,
+    think: bool,
 ) -> AppResult<String> {
     match cfg.llm_provider.as_str() {
         "openai" => {
@@ -69,7 +84,7 @@ pub async fn chat_as(
         "vllm" => {
             oai_chat(client, &cfg.vllm_base_url, &cfg.vllm_api_key, model, messages, false, cfg.temperature).await
         }
-        "ollama" => ollama_chat(client, cfg, messages, model).await,
+        "ollama" => ollama_chat(client, cfg, messages, model, think).await,
         other => Err(AppError::Provider(format!(
             "provedor de LLM desconhecido: {other}"
         ))),
@@ -169,6 +184,7 @@ async fn ollama_chat(
     cfg: &RagConfig,
     messages: &[ChatMessage],
     model: &str,
+    think: bool,
 ) -> AppResult<String> {
     let base = cfg.ollama_endpoint.trim_end_matches('/');
     let url = format!("{base}/api/chat");
@@ -176,12 +192,18 @@ async fn ollama_chat(
         .iter()
         .map(|m| json!({ "role": m.role, "content": m.content }))
         .collect();
-    let req = client.post(&url).json(&json!({
+    let mut body = json!({
         "model": model,
         "messages": msgs,
         "stream": false,
         "options": ollama_options(cfg),
-    }));
+    });
+    // Only send `think` when disabling it; omit otherwise so non-thinking models
+    // (which reject the field on some Ollama builds) are unaffected.
+    if !think {
+        body["think"] = json!(false);
+    }
+    let req = client.post(&url).json(&body);
     let body: Value = post_json(req).await?;
     let content = body["message"]["content"].as_str().unwrap_or_default();
     let thinking = body["message"]["thinking"].as_str().unwrap_or_default();
