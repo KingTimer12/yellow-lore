@@ -168,6 +168,8 @@ async fn build_chat(
     chunks: &[Chunk],
     question: String,
     history: Vec<HistoryTurn>,
+    entity_names: &[String],
+    relations: &[Relation],
 ) -> AppResult<(Vec<ChatMessage>, Vec<Source>)> {
     let mut sources: Vec<Source> = Vec::new();
     let mut context = String::new();
@@ -285,8 +287,15 @@ async fn build_chat(
     } else {
         context
     };
+
+    // GraphRAG-lite: if the question names known entities, pull their relation
+    // subgraph (edited/added by the user when applicable) and hand the model the
+    // structured facts. Chunk retrieval is cosine-blind to relations — the graph
+    // answers multi-hop questions ("quem é o mestre de Victor?") the prose misses.
+    let graph_block = graph_context(&question, entity_names, relations);
+
     let system = format!(
-        "{}\n\nCada trecho abaixo vem rotulado com [Fonte N] [Documento: nome]. Os trechos de um \
+        "{}\n\n{}Cada trecho abaixo vem rotulado com [Fonte N] [Documento: nome]. Os trechos de um \
 mesmo documento aparecem em ordem de leitura; \"início do documento\" marca a abertura \
 do texto. [Fonte N] é só um identificador para citação — NÃO é seção ou capítulo \
 numerado, então não invente nem cite \"trecho N\". Ao responder sobre um documento \
@@ -297,7 +306,7 @@ daquele documento; se ele não estiver presente, diga que não recuperou a abert
 Ao final de cada afirmação apoiada nos trechos, cite a(s) fonte(s) usada(s) com o marcador \
 correspondente, ex.: [1] ou [2][3]. Cite APENAS as fontes que realmente sustentam a resposta.\n\n\
 Contexto recuperado da base de conhecimento:\n{}",
-        cfg.system_prompt, context_block
+        cfg.system_prompt, graph_block, context_block
     );
     let mut messages = vec![ChatMessage { role: "system", content: system }];
     for turn in history {
@@ -318,8 +327,11 @@ pub async fn ask(
     chunks: &[Chunk],
     question: String,
     history: Vec<HistoryTurn>,
+    entity_names: &[String],
+    relations: &[Relation],
 ) -> AppResult<Answer> {
-    let (messages, sources) = build_chat(client, cfg, chunks, question, history).await?;
+    let (messages, sources) =
+        build_chat(client, cfg, chunks, question, history, entity_names, relations).await?;
     let text = providers::chat(client, cfg, &messages).await?;
     let sources = cited_sources(sources, &strip_think(&text));
     Ok(Answer { text, sources })
@@ -333,10 +345,13 @@ pub async fn ask_stream<F: FnMut(&str)>(
     chunks: &[Chunk],
     question: String,
     history: Vec<HistoryTurn>,
+    entity_names: &[String],
+    relations: &[Relation],
     cancel: &std::sync::atomic::AtomicBool,
     on_token: F,
 ) -> AppResult<Vec<Source>> {
-    let (messages, sources) = build_chat(client, cfg, chunks, question, history).await?;
+    let (messages, sources) =
+        build_chat(client, cfg, chunks, question, history, entity_names, relations).await?;
     let answer = providers::chat_stream(client, cfg, &messages, cancel, on_token).await?;
     // Cite only what the answer actually drew on: prefer the [N] markers the model
     // declared, falling back to content overlap when it emitted none.
@@ -418,6 +433,76 @@ fn relevant_sources(sources: Vec<Source>, answer: &str) -> Vec<Source> {
         .collect();
     scored.sort_by(|a, b| b.0.cmp(&a.0));
     scored.into_iter().map(|(_, s)| s).collect()
+}
+
+/// GraphRAG-lite context. Detects which known entities the question names, then
+/// collects the relation subgraph around them (the seeds' own edges plus one hop
+/// to their neighbors' edges) and renders it as a structured `Fato → Fato` block.
+/// Empty string when the question names no known entity or no relation touches it,
+/// so the caller can inject it unconditionally. Capped so a hub node can't flood
+/// the prompt.
+fn graph_context(question: &str, entity_names: &[String], relations: &[Relation]) -> String {
+    if entity_names.is_empty() || relations.is_empty() {
+        return String::new();
+    }
+    let q = question.to_lowercase();
+
+    // Seeds: known entity names that appear in the question. Longer names first so
+    // "Cesar Magnus" is preferred over "Cesar" when both would match.
+    let mut names: Vec<&String> = entity_names.iter().collect();
+    names.sort_by_key(|n| std::cmp::Reverse(n.len()));
+    let mut seeds: std::collections::HashSet<String> = Default::default();
+    for name in names {
+        let low = name.to_lowercase();
+        if low.chars().count() >= 3 && q.contains(&low) {
+            seeds.insert(low);
+        }
+    }
+    if seeds.is_empty() {
+        return String::new();
+    }
+
+    // Expand one hop: any node directly related to a seed joins the frontier, so
+    // we capture "mentor do mestre de X" style chains without pulling the whole map.
+    let touches = |r: &Relation, set: &std::collections::HashSet<String>| {
+        set.contains(&r.from.to_lowercase()) || set.contains(&r.to.to_lowercase())
+    };
+    let mut frontier = seeds.clone();
+    for r in relations {
+        if touches(r, &seeds) {
+            frontier.insert(r.from.to_lowercase());
+            frontier.insert(r.to.to_lowercase());
+        }
+    }
+
+    // Collect edges among the frontier, deduped, capped.
+    const MAX_EDGES: usize = 40;
+    let mut seen: std::collections::HashSet<(String, String, String)> = Default::default();
+    let mut lines: Vec<String> = Vec::new();
+    for r in relations {
+        if lines.len() >= MAX_EDGES {
+            break;
+        }
+        let fl = r.from.to_lowercase();
+        let tl = r.to.to_lowercase();
+        if !(frontier.contains(&fl) || frontier.contains(&tl)) {
+            continue;
+        }
+        let key = (fl, tl, r.label.to_lowercase());
+        if !seen.insert(key) {
+            continue;
+        }
+        let label = if r.label.trim().is_empty() { "relaciona-se com" } else { r.label.trim() };
+        lines.push(format!("- {} —({})→ {}", r.from, label, r.to));
+    }
+    if lines.is_empty() {
+        return String::new();
+    }
+    format!(
+        "Relações conhecidas do grafo de entidades (fatos estruturados, curados pelo \
+usuário quando aplicável — trate como verdade sobre quem se relaciona com quem):\n{}\n\n",
+        lines.join("\n")
+    )
 }
 
 /// Final citation set for an answer. Prefers the explicit `[N]` markers the model
