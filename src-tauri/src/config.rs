@@ -71,6 +71,12 @@ pub struct RagConfig {
     /// loop). Higher precision at the cost of extra LLM calls; off by default.
     #[serde(default)]
     pub corrective: bool,
+    /// Let the final answer "think" (emit a reasoning block). Off by default:
+    /// reasoning is unnecessary for these summarization/lookup answers and, with
+    /// models that reason in plain text, leaks a long preamble into the reply.
+    /// Internal RAG steps never think regardless of this.
+    #[serde(default)]
+    pub show_thinking: bool,
 }
 
 fn default_true() -> bool {
@@ -122,6 +128,7 @@ impl Default for RagConfig {
             extraction_concurrency: default_extraction_concurrency(),
             rerank: false,
             corrective: false,
+            show_thinking: false,
         }
     }
 }

@@ -45,14 +45,14 @@ pub async fn embed(
     Ok(out)
 }
 
-/// Generate a chat completion for the FINAL, user-facing answer. Reasoning
-/// ("thinking") is left enabled so reasoning models can deliberate.
+/// Generate a chat completion for the FINAL, user-facing answer. Reasoning is
+/// gated by `cfg.show_thinking` (off by default).
 pub async fn chat(
     client: &reqwest::Client,
     cfg: &RagConfig,
     messages: &[ChatMessage],
 ) -> AppResult<String> {
-    chat_impl(client, cfg, messages, &cfg.llm_model, true).await
+    chat_impl(client, cfg, messages, &cfg.llm_model, cfg.show_thinking).await
 }
 
 /// Generate a chat completion for an INTERNAL RAG step (rerank, grading, dedup,
@@ -289,6 +289,7 @@ pub async fn chat_stream<F: FnMut(&str)>(
     client: &reqwest::Client,
     cfg: &RagConfig,
     messages: &[ChatMessage],
+    think: bool,
     cancel: &AtomicBool,
     on_token: F,
 ) -> AppResult<String> {
@@ -299,7 +300,7 @@ pub async fn chat_stream<F: FnMut(&str)>(
         "vllm" => {
             oai_chat_stream(client, &cfg.vllm_base_url, &cfg.vllm_api_key, &cfg.llm_model, messages, false, cfg.temperature, cancel, on_token).await
         }
-        "ollama" => ollama_chat_stream(client, cfg, messages, cancel, on_token).await,
+        "ollama" => ollama_chat_stream(client, cfg, messages, think, cancel, on_token).await,
         other => Err(AppError::Provider(format!(
             "provedor de LLM desconhecido: {other}"
         ))),
@@ -380,6 +381,7 @@ async fn ollama_chat_stream<F: FnMut(&str)>(
     client: &reqwest::Client,
     cfg: &RagConfig,
     messages: &[ChatMessage],
+    think: bool,
     cancel: &AtomicBool,
     mut on_token: F,
 ) -> AppResult<String> {
@@ -389,12 +391,16 @@ async fn ollama_chat_stream<F: FnMut(&str)>(
         .iter()
         .map(|m| json!({ "role": m.role, "content": m.content }))
         .collect();
-    let req = client.post(&url).json(&json!({
+    let mut body = json!({
         "model": cfg.llm_model,
         "messages": msgs,
         "stream": true,
         "options": ollama_options(cfg),
-    }));
+    });
+    if !think {
+        body["think"] = json!(false);
+    }
+    let req = client.post(&url).json(&body);
     let resp = stream_status_guard(req.send().await?).await?;
 
     let mut stream = resp.bytes_stream();

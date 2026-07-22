@@ -304,7 +304,9 @@ corresponde — nunca misture documentos diferentes. Para perguntas sobre a aber
 (\"primeira frase\", \"como começa\"), use o trecho marcado \"início do documento\" \
 daquele documento; se ele não estiver presente, diga que não recuperou a abertura.\n\n\
 Ao final de cada afirmação apoiada nos trechos, cite a(s) fonte(s) usada(s) com o marcador \
-correspondente, ex.: [1] ou [2][3]. Cite APENAS as fontes que realmente sustentam a resposta.\n\n\
+correspondente, ex.: [1] ou [2][3]. Cite APENAS as fontes que realmente sustentam a resposta. \
+Escreva de forma fluida: evite repetir o nome próprio dos personagens a cada frase — use pronomes \
+ou referências quando o sujeito já estiver claro.\n\n\
 Contexto recuperado da base de conhecimento:\n{}",
         cfg.system_prompt, graph_block, context_block
     );
@@ -337,10 +339,11 @@ pub async fn ask(
             client, cfg, chunks, question.clone(), history.clone(), entity_names, relations,
         )
         .await?;
-        let draft = providers::chat(client, cfg, &msgs1).await?;
+        let draft = providers::chat_internal(client, cfg, &msgs1, &cfg.llm_model).await?;
         if grade_answer(client, cfg, &question, &draft).await.unwrap_or(true) {
-            let sources = cited_sources(src1, &strip_think(&draft));
-            return Ok(Answer { text: draft, sources });
+            let text = providers::chat(client, cfg, &msgs1).await?;
+            let sources = cited_sources(src1, &strip_think(&text));
+            return Ok(Answer { text, sources });
         }
         let cfg2 = widen(cfg);
         let (msgs2, src2) =
@@ -368,32 +371,35 @@ pub async fn ask_stream<F: FnMut(&str)>(
     entity_names: &[String],
     relations: &[Relation],
     cancel: &std::sync::atomic::AtomicBool,
-    mut on_token: F,
+    on_token: F,
 ) -> AppResult<Vec<Source>> {
-    // Corrective RAG: a non-streamed draft is graded first; if it resolves the
-    // question it's delivered as-is (one push, no live typing — the text already
-    // exists). Otherwise we re-retrieve wider and stream the second answer live.
-    // Bounded to one retry, no open loop.
+    // Corrective RAG: a cheap non-streamed draft (internal, no thinking) is graded
+    // first to decide whether to widen retrieval. The FINAL answer is ALWAYS
+    // streamed live — the draft is a check, never what the user sees. Bounded to
+    // one retry, no open loop.
     if cfg.corrective {
         let (msgs1, src1) = build_chat(
             client, cfg, chunks, question.clone(), history.clone(), entity_names, relations,
         )
         .await?;
-        let draft = providers::chat(client, cfg, &msgs1).await?;
+        let draft = providers::chat_internal(client, cfg, &msgs1, &cfg.llm_model).await?;
         if grade_answer(client, cfg, &question, &draft).await.unwrap_or(true) {
-            on_token(&draft);
-            return Ok(cited_sources(src1, &strip_think(&draft)));
+            let answer =
+                providers::chat_stream(client, cfg, &msgs1, cfg.show_thinking, cancel, on_token).await?;
+            return Ok(cited_sources(src1, &strip_think(&answer)));
         }
         let cfg2 = widen(cfg);
         let (msgs2, src2) =
             build_chat(client, &cfg2, chunks, question, history, entity_names, relations).await?;
-        let answer = providers::chat_stream(client, &cfg2, &msgs2, cancel, on_token).await?;
+        let answer =
+            providers::chat_stream(client, &cfg2, &msgs2, cfg.show_thinking, cancel, on_token).await?;
         return Ok(cited_sources(src2, &strip_think(&answer)));
     }
 
     let (messages, sources) =
         build_chat(client, cfg, chunks, question, history, entity_names, relations).await?;
-    let answer = providers::chat_stream(client, cfg, &messages, cancel, on_token).await?;
+    let answer =
+        providers::chat_stream(client, cfg, &messages, cfg.show_thinking, cancel, on_token).await?;
     // Cite only what the answer actually drew on: prefer the [N] markers the model
     // declared, falling back to content overlap when it emitted none.
     Ok(cited_sources(sources, &strip_think(&answer)))
