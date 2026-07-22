@@ -330,6 +330,26 @@ pub async fn ask(
     entity_names: &[String],
     relations: &[Relation],
 ) -> AppResult<Answer> {
+    // Corrective RAG: draft, grade, and (if the draft falls short) re-retrieve
+    // wider and answer once more. Bounded to one retry.
+    if cfg.corrective {
+        let (msgs1, src1) = build_chat(
+            client, cfg, chunks, question.clone(), history.clone(), entity_names, relations,
+        )
+        .await?;
+        let draft = providers::chat(client, cfg, &msgs1).await?;
+        if grade_answer(client, cfg, &question, &draft).await.unwrap_or(true) {
+            let sources = cited_sources(src1, &strip_think(&draft));
+            return Ok(Answer { text: draft, sources });
+        }
+        let cfg2 = widen(cfg);
+        let (msgs2, src2) =
+            build_chat(client, &cfg2, chunks, question, history, entity_names, relations).await?;
+        let text = providers::chat(client, &cfg2, &msgs2).await?;
+        let sources = cited_sources(src2, &strip_think(&text));
+        return Ok(Answer { text, sources });
+    }
+
     let (messages, sources) =
         build_chat(client, cfg, chunks, question, history, entity_names, relations).await?;
     let text = providers::chat(client, cfg, &messages).await?;
@@ -348,8 +368,29 @@ pub async fn ask_stream<F: FnMut(&str)>(
     entity_names: &[String],
     relations: &[Relation],
     cancel: &std::sync::atomic::AtomicBool,
-    on_token: F,
+    mut on_token: F,
 ) -> AppResult<Vec<Source>> {
+    // Corrective RAG: a non-streamed draft is graded first; if it resolves the
+    // question it's delivered as-is (one push, no live typing — the text already
+    // exists). Otherwise we re-retrieve wider and stream the second answer live.
+    // Bounded to one retry, no open loop.
+    if cfg.corrective {
+        let (msgs1, src1) = build_chat(
+            client, cfg, chunks, question.clone(), history.clone(), entity_names, relations,
+        )
+        .await?;
+        let draft = providers::chat(client, cfg, &msgs1).await?;
+        if grade_answer(client, cfg, &question, &draft).await.unwrap_or(true) {
+            on_token(&draft);
+            return Ok(cited_sources(src1, &strip_think(&draft)));
+        }
+        let cfg2 = widen(cfg);
+        let (msgs2, src2) =
+            build_chat(client, &cfg2, chunks, question, history, entity_names, relations).await?;
+        let answer = providers::chat_stream(client, &cfg2, &msgs2, cancel, on_token).await?;
+        return Ok(cited_sources(src2, &strip_think(&answer)));
+    }
+
     let (messages, sources) =
         build_chat(client, cfg, chunks, question, history, entity_names, relations).await?;
     let answer = providers::chat_stream(client, cfg, &messages, cancel, on_token).await?;
@@ -523,6 +564,49 @@ fn cited_sources(sources: Vec<Source>, answer: &str) -> Vec<Source> {
         .into_iter()
         .filter(|s| seen.insert((s.doc.clone(), s.quote.clone())))
         .collect()
+}
+
+/// A copy of the config with a wider retrieval net, used for the corrective
+/// retry: more chunks (capped) so the second answer sees context the first missed.
+fn widen(cfg: &RagConfig) -> RagConfig {
+    let mut c = cfg.clone();
+    c.top_k = (cfg.top_k * 2).clamp(cfg.top_k, 12);
+    c
+}
+
+/// Grade whether `answer` actually resolves `question` (Corrective RAG). Returns
+/// true = adequate. The model replies with a tiny JSON verdict; parse/other
+/// failures default to adequate so grading never blocks a usable answer.
+async fn grade_answer(
+    client: &reqwest::Client,
+    cfg: &RagConfig,
+    question: &str,
+    answer: &str,
+) -> AppResult<bool> {
+    // An explicit "não encontrei" is a valid, complete answer — don't force a retry
+    // that would only re-confirm the absence.
+    let system = "Você avalia se uma RESPOSTA resolve de fato a PERGUNTA do usuário, com base \
+em uma base de conhecimento. Responda APENAS com JSON, sem markdown: {\"adequate\":true|false}. \
+adequate=false só quando a resposta é claramente incompleta, evasiva ou não endereça a pergunta. \
+Uma resposta que afirma honestamente não ter encontrado a informação nos documentos é adequate=true. \
+/no_think";
+    let mut ans = strip_think(answer);
+    ans.truncate(2000);
+    let user = format!("PERGUNTA:\n{question}\n\nRESPOSTA:\n{ans}");
+    let messages = vec![
+        ChatMessage { role: "system", content: system.to_string() },
+        ChatMessage { role: "user", content: user },
+    ];
+    let raw = providers::chat(client, cfg, &messages).await?;
+    let raw = strip_think(&raw);
+    let json = extract_json_block(&raw).ok_or_else(|| AppError::Msg("grade: JSON inválido".into()))?;
+    #[derive(Deserialize)]
+    struct Verdict {
+        #[serde(default)]
+        adequate: bool,
+    }
+    let v: Verdict = serde_json::from_str(&json).map_err(|e| AppError::Msg(format!("grade: {e}")))?;
+    Ok(v.adequate)
 }
 
 /// Distinct `[N]` citation markers in first-seen order, keeping only numbers in
