@@ -3,6 +3,7 @@ use crate::db::{Character, Place, Relation};
 use crate::error::{AppError, AppResult};
 use crate::providers::{self, ChatMessage};
 use crate::vector_store::{self, Chunk};
+use futures_util::stream::{self, StreamExt};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -234,17 +235,15 @@ async fn build_chat(
                     .collect();
                 hits.extend(openings);
             }
+
+            // Optional rerank: one cheap LLM pass orders the retrieved chunks by
+            // relevance to the question, trimming top-k noise before we build the
+            // context. Non-fatal — on any failure the hybrid order is kept.
+            if cfg.rerank {
+                hits = rerank_hits(client, cfg, &question, hits).await;
+            }
             hits
         };
-
-        // Sources keep relevance order (best match first) for citations.
-        for hit in &hits {
-            sources.push(Source {
-                doc: hit.chunk.doc_name.clone(),
-                quote: snippet(&hit.chunk.text, &question),
-                text: hit.chunk.text.trim().to_string(),
-            });
-        }
 
         // Context is re-sorted into reading order, grouped by document, and each
         // fragment is labeled with its position — so the model can answer
@@ -257,7 +256,16 @@ async fn build_chat(
                 .cmp(&b.chunk.doc_name)
                 .then(a.chunk.ordinal.cmp(&b.chunk.ordinal))
         });
-        for hit in ordered {
+        // Number each fragment [Fonte N] in the exact order the model reads it, so
+        // the model can declare which it used with matching [N] markers. `sources`
+        // is built in the SAME order → sources[N-1] is fragment N.
+        for (i, hit) in ordered.iter().enumerate() {
+            let n = i + 1;
+            sources.push(Source {
+                doc: hit.chunk.doc_name.clone(),
+                quote: snippet(&hit.chunk.text, &question),
+                text: hit.chunk.text.trim().to_string(),
+            });
             // Only the opening is a meaningful, stable landmark. Do NOT expose the
             // raw chunk index — it's an internal ~200-word slice, not a document
             // section, and leaking the number makes the model (and user) treat
@@ -268,7 +276,7 @@ async fn build_chat(
             } else {
                 hit.chunk.doc_name.clone()
             };
-            context.push_str(&format!("[Documento: {}]\n{}\n\n", label, hit.chunk.text));
+            context.push_str(&format!("[Fonte {}] [Documento: {}]\n{}\n\n", n, label, hit.chunk.text));
         }
     }
 
@@ -278,14 +286,16 @@ async fn build_chat(
         context
     };
     let system = format!(
-        "{}\n\nCada trecho abaixo vem rotulado com [Documento: nome]. Os trechos de um \
+        "{}\n\nCada trecho abaixo vem rotulado com [Fonte N] [Documento: nome]. Os trechos de um \
 mesmo documento aparecem em ordem de leitura; \"início do documento\" marca a abertura \
-do texto. Os trechos são recortes parciais da base — NÃO são seções ou capítulos \
-numerados, então não invente nem cite \"trecho N\". Ao responder sobre um documento \
+do texto. [Fonte N] é só um identificador para citação — NÃO é seção ou capítulo \
+numerado, então não invente nem cite \"trecho N\". Ao responder sobre um documento \
 específico (ex.: \"capítulo 1\"), use SOMENTE os trechos cujo nome de documento \
 corresponde — nunca misture documentos diferentes. Para perguntas sobre a abertura \
 (\"primeira frase\", \"como começa\"), use o trecho marcado \"início do documento\" \
 daquele documento; se ele não estiver presente, diga que não recuperou a abertura.\n\n\
+Ao final de cada afirmação apoiada nos trechos, cite a(s) fonte(s) usada(s) com o marcador \
+correspondente, ex.: [1] ou [2][3]. Cite APENAS as fontes que realmente sustentam a resposta.\n\n\
 Contexto recuperado da base de conhecimento:\n{}",
         cfg.system_prompt, context_block
     );
@@ -296,7 +306,9 @@ Contexto recuperado da base de conhecimento:\n{}",
     }
     messages.push(ChatMessage { role: "user", content: question });
 
-    sources.dedup_by(|a, b| a.doc == b.doc && a.quote == b.quote);
+    // NOTE: sources are returned in [Fonte N] order and NOT deduped here — the
+    // caller filters to what the answer used (declared markers or overlap) and
+    // dedupes afterward, so index N stays aligned with the prompt.
     Ok((messages, sources))
 }
 
@@ -309,7 +321,7 @@ pub async fn ask(
 ) -> AppResult<Answer> {
     let (messages, sources) = build_chat(client, cfg, chunks, question, history).await?;
     let text = providers::chat(client, cfg, &messages).await?;
-    let sources = relevant_sources(sources, &strip_think(&text));
+    let sources = cited_sources(sources, &strip_think(&text));
     Ok(Answer { text, sources })
 }
 
@@ -326,10 +338,9 @@ pub async fn ask_stream<F: FnMut(&str)>(
 ) -> AppResult<Vec<Source>> {
     let (messages, sources) = build_chat(client, cfg, chunks, question, history).await?;
     let answer = providers::chat_stream(client, cfg, &messages, cancel, on_token).await?;
-    // Cite only what the answer actually drew on. Broad retrieval feeds the model
-    // (a term can hit 10 chapters), but a source with zero content overlap with
-    // the generated answer wasn't used — don't cite it.
-    Ok(relevant_sources(sources, &strip_think(&answer)))
+    // Cite only what the answer actually drew on: prefer the [N] markers the model
+    // declared, falling back to content overlap when it emitted none.
+    Ok(cited_sources(sources, &strip_think(&answer)))
 }
 
 /// Generate a short session title (≈3–6 words) summarizing the topic, from the
@@ -407,6 +418,120 @@ fn relevant_sources(sources: Vec<Source>, answer: &str) -> Vec<Source> {
         .collect();
     scored.sort_by(|a, b| b.0.cmp(&a.0));
     scored.into_iter().map(|(_, s)| s).collect()
+}
+
+/// Final citation set for an answer. Prefers the explicit `[N]` markers the model
+/// declared (mapped to the `[Fonte N]` fragments), and only when it declared none
+/// falls back to the content-overlap heuristic. Deduped by document + quote.
+fn cited_sources(sources: Vec<Source>, answer: &str) -> Vec<Source> {
+    let marks = parse_markers(answer, sources.len());
+    let picked: Vec<Source> = if marks.is_empty() {
+        relevant_sources(sources, answer)
+    } else {
+        marks
+            .into_iter()
+            .filter_map(|n| sources.get(n - 1).cloned())
+            .collect()
+    };
+    let mut seen: std::collections::HashSet<(String, String)> = Default::default();
+    picked
+        .into_iter()
+        .filter(|s| seen.insert((s.doc.clone(), s.quote.clone())))
+        .collect()
+}
+
+/// Distinct `[N]` citation markers in first-seen order, keeping only numbers in
+/// `1..=max` so stray brackets in prose (e.g. "[sic]", "[2023]") are ignored.
+fn parse_markers(text: &str, max: usize) -> Vec<usize> {
+    let bytes = text.as_bytes();
+    let mut out: Vec<usize> = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'[' {
+            let mut j = i + 1;
+            let mut num = 0usize;
+            let mut any = false;
+            while j < bytes.len() && bytes[j].is_ascii_digit() {
+                num = num * 10 + (bytes[j] - b'0') as usize;
+                any = true;
+                j += 1;
+            }
+            if any && j < bytes.len() && bytes[j] == b']' && num >= 1 && num <= max {
+                if !out.contains(&num) {
+                    out.push(num);
+                }
+                i = j + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Cheap LLM rerank: ask the model to order the retrieved chunks by relevance to
+/// the question and reorder accordingly. Any index the model omits is appended in
+/// its original position, so no chunk is silently dropped. Non-fatal.
+async fn rerank_hits(
+    client: &reqwest::Client,
+    cfg: &RagConfig,
+    question: &str,
+    hits: Vec<vector_store::ScoredChunk>,
+) -> Vec<vector_store::ScoredChunk> {
+    if hits.len() <= 1 {
+        return hits;
+    }
+    let list = hits
+        .iter()
+        .enumerate()
+        .map(|(i, h)| {
+            let t: String = h.chunk.text.chars().take(400).collect();
+            format!("[{i}] {t}")
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let system = "Você ordena trechos por relevância a uma pergunta. Responda APENAS \
+com JSON, sem markdown: {\"order\":[índices do mais relevante ao menos relevante]}. \
+Use somente os índices fornecidos, sem repetir. /no_think";
+    let user = format!("Pergunta: {question}\n\nTrechos:\n{list}");
+    let messages = vec![
+        ChatMessage { role: "system", content: system.to_string() },
+        ChatMessage { role: "user", content: user },
+    ];
+    let raw = match providers::chat(client, cfg, &messages).await {
+        Ok(r) => r,
+        Err(_) => return hits,
+    };
+    let raw = strip_think(&raw);
+    let json = match extract_json_block(&raw) {
+        Some(j) => j,
+        None => return hits,
+    };
+    #[derive(Deserialize)]
+    struct Order {
+        #[serde(default)]
+        order: Vec<usize>,
+    }
+    let parsed: Order = match serde_json::from_str(&json) {
+        Ok(p) => p,
+        Err(_) => return hits,
+    };
+    if parsed.order.is_empty() {
+        return hits;
+    }
+    let mut slots: Vec<Option<vector_store::ScoredChunk>> = hits.into_iter().map(Some).collect();
+    let mut out = Vec::with_capacity(slots.len());
+    for idx in parsed.order {
+        if let Some(slot) = slots.get_mut(idx) {
+            if let Some(h) = slot.take() {
+                out.push(h);
+            }
+        }
+    }
+    for slot in slots.into_iter().flatten() {
+        out.push(slot);
+    }
+    out
 }
 
 /// Chapter numbers explicitly named in a phrase ("capítulo 1", "cap. 2", "cap 3").
@@ -551,12 +676,22 @@ pub async fn extract_entities(
     client: &reqwest::Client,
     cfg: &RagConfig,
     chunks: &[Chunk],
+    existing_chars: &[String],
+    existing_places: &[String],
 ) -> AppResult<(Vec<Character>, Vec<Place>, Vec<Relation>)> {
     if chunks.is_empty() {
         return Err(AppError::Msg(
             "vault sem documentos indexados — carregue algo primeiro".into(),
         ));
     }
+
+    // Extraction can use a dedicated (usually smaller) model. Empty = reuse the
+    // chat model, so users without the VRAM for a second model pay no penalty.
+    let ex_model = if cfg.extraction_model.trim().is_empty() {
+        cfg.llm_model.as_str()
+    } else {
+        cfg.extraction_model.as_str()
+    };
 
     // Split the whole corpus into ~12k-char windows on chunk boundaries, run the
     // LLM per window, and merge — so large works are covered, not just the head.
@@ -586,11 +721,21 @@ pub async fn extract_entities(
     let mut rel_set: std::collections::HashSet<(String, String, String)> = Default::default();
     let mut relations_out: Vec<ExtractedRel> = Vec::new();
 
-    for window in &windows {
-        let parsed = match extract_window(client, cfg, window).await {
-            Ok(p) => p,
-            Err(_) => continue, // a bad window shouldn't abort the whole run
-        };
+    // Run the windows with the configured concurrency. Default 1 (sequential) is
+    // the safe choice for a single local GPU; cloud providers can raise it to cut
+    // wall-clock time. A bad window is dropped (filter_map), not fatal.
+    let concurrency = cfg.extraction_concurrency.max(1);
+    let futs = windows
+        .iter()
+        .map(|w| extract_window(client, cfg, w, ex_model))
+        .collect::<Vec<_>>();
+    let parsed_windows: Vec<Extraction> = stream::iter(futs)
+        .buffer_unordered(concurrency)
+        .filter_map(|r| async move { r.ok() })
+        .collect()
+        .await;
+
+    for parsed in parsed_windows {
         for c in parsed.characters {
             if c.name.trim().is_empty() {
                 continue;
@@ -623,19 +768,37 @@ pub async fn extract_entities(
     // Coreference: "Cesar" and "Cesar Magnus" are the same character. Canonicalize
     // each partial name to the fullest matching name (within its own type), then
     // re-merge and rewrite relation endpoints so the graph links them as one.
-    let char_names: Vec<String> = chars_map.values().map(|c| c.name.clone()).collect();
-    let place_names: Vec<String> = places_map.values().map(|p| p.name.clone()).collect();
+    // Include already-saved entity names so a name introduced in THIS run
+    // ("Cesar") resolves to a fuller name saved in a PREVIOUS run ("Cesar Magnus"),
+    // fixing the cross-run split. The canonical target may be an existing entity;
+    // merge_extracted then folds the new data into that saved card by name.
+    let mut char_names: Vec<String> = chars_map.values().map(|c| c.name.clone()).collect();
+    let mut place_names: Vec<String> = places_map.values().map(|p| p.name.clone()).collect();
+    for n in existing_chars {
+        if !char_names.iter().any(|e| e.eq_ignore_ascii_case(n)) {
+            char_names.push(n.clone());
+        }
+    }
+    for n in existing_places {
+        if !place_names.iter().any(|e| e.eq_ignore_ascii_case(n)) {
+            place_names.push(n.clone());
+        }
+    }
     let mut char_canon = canonical_map(&char_names);
     let mut place_canon = canonical_map(&place_names);
 
     // Optional LLM dedup: catches aliases the substring heuristic can't (titles,
-    // nicknames like "o Caçador" = "Cesar Magnus"). Failures are non-fatal.
+    // nicknames like "o Caçador" = "Cesar Magnus"). Targeted — only names that
+    // share a token with another are sent (the dubious ones); unambiguous names
+    // are skipped, keeping the payload small. Failures are non-fatal.
     if cfg.dedup_entities {
-        if let Ok(m) = llm_dedup(client, cfg, "personagens", &char_names).await {
+        let char_dubious = dubious_candidates(&char_names);
+        let place_dubious = dubious_candidates(&place_names);
+        if let Ok(m) = llm_dedup(client, cfg, "personagens", &char_dubious, ex_model).await {
             for (k, v) in m { char_canon.insert(k, v); }
             chain_resolve(&mut char_canon);
         }
-        if let Ok(m) = llm_dedup(client, cfg, "lugares", &place_names).await {
+        if let Ok(m) = llm_dedup(client, cfg, "lugares", &place_dubious, ex_model).await {
             for (k, v) in m { place_canon.insert(k, v); }
             chain_resolve(&mut place_canon);
         }
@@ -719,6 +882,7 @@ async fn extract_window(
     client: &reqwest::Client,
     cfg: &RagConfig,
     corpus: &str,
+    model: &str,
 ) -> AppResult<Extraction> {
     let system = "Você extrai entidades de textos de ficção/worldbuilding. \
 Responda APENAS com JSON válido, sem texto extra, sem markdown. Formato:\n\
@@ -735,7 +899,7 @@ Nas relações, use exatamente esses mesmos nomes completos. /no_think";
         ChatMessage { role: "system", content: system.to_string() },
         ChatMessage { role: "user", content: user },
     ];
-    let raw = providers::chat(client, cfg, &messages).await?;
+    let raw = providers::chat_as(client, cfg, &messages, model).await?;
     // Reasoning models (and Ollama's `thinking` field) prepend a <think>…</think>
     // block whose braces would corrupt the JSON span — drop it before parsing.
     let raw = strip_think(&raw);
@@ -788,6 +952,28 @@ fn name_tokens(name: &str) -> Vec<String> {
         .filter(|t| t.chars().count() >= 2)
         .map(|t| t.to_string())
         .collect()
+}
+
+/// Names worth sending to the LLM dedup pass: those sharing at least one token
+/// with another name (the ambiguous ones — "Cesar" ↔ "Cesar Magnus", "Rei
+/// Aldric" ↔ "Aldric"). Names with no token overlap can't be aliases of anything
+/// here, so they're skipped to keep the dedup payload small and targeted.
+fn dubious_candidates(names: &[String]) -> Vec<String> {
+    let toks: Vec<Vec<String>> = names.iter().map(|n| name_tokens(n)).collect();
+    let mut out = Vec::new();
+    for (i, ti) in toks.iter().enumerate() {
+        if ti.is_empty() {
+            continue;
+        }
+        let shares = toks
+            .iter()
+            .enumerate()
+            .any(|(j, tj)| j != i && tj.iter().any(|t| ti.contains(t)));
+        if shares {
+            out.push(names[i].clone());
+        }
+    }
+    out
 }
 
 /// Whether `short`'s tokens appear in `long` in order (a subsequence).
@@ -864,6 +1050,7 @@ async fn llm_dedup(
     cfg: &RagConfig,
     kind: &str,
     names: &[String],
+    model: &str,
 ) -> AppResult<std::collections::HashMap<String, String>> {
     let mut out = std::collections::HashMap::new();
     if names.len() < 2 {
@@ -887,7 +1074,7 @@ Na dúvida, NÃO agrupe."
         ChatMessage { role: "system", content: system },
         ChatMessage { role: "user", content: user },
     ];
-    let raw = providers::chat(client, cfg, &messages).await?;
+    let raw = providers::chat_as(client, cfg, &messages, model).await?;
     let raw = strip_think(&raw);
     let json = extract_json_block(&raw)
         .ok_or_else(|| AppError::Msg("dedup: JSON inválido".into()))?;
