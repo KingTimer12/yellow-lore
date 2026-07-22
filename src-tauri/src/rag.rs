@@ -1191,11 +1191,20 @@ Use o idioma do texto. \
 Use SEMPRE o nome mais completo de cada personagem/lugar (ex.: \"Cesar Magnus\", não só \"Cesar\"); \
 se o texto citar só o primeiro nome ou um apelido, trate como o mesmo personagem e use o nome completo. \
 Nas relações, use exatamente esses mesmos nomes completos.\n\
-IMPORTANTE — personagens são apenas SERES (pessoas, criaturas, entidades vivas ou sencientes). \
-Poderes, habilidades, magias ou técnicas (mesmo escritos com inicial maiúscula como nome próprio, \
-ex.: \"Previsão\", \"Hipótese\", \"Teletransporte\") NÃO são personagens nem lugares: coloque-os em \"abilities\", \
-com \"type\" sendo a categoria (ex.: \"Poder\", \"Magia\", \"Técnica\"). Na dúvida entre personagem e poder, \
-se não for um ser, é ability.\n\
+Extraia TODOS os personagens — SERES (pessoas, criaturas, entidades vivas ou sencientes) — \
+INCLUSIVE os citados por apelido, epíteto, título ou cargo (ex.: \"Salazar Bessa\", \"David Bessa\", \
+\"A Bruxa\", \"Rei Yan Serafine\", \"o Caçador\"): todos são personagens. NUNCA deixe de fora um ser só \
+porque ele é chamado por um título ou epíteto. Não seja conservador com personagens — na dúvida se um \
+NOME próprio se refere a um ser, inclua como personagem.\n\
+\"abilities\" (à parte, opcional) é SOMENTE para poderes/magias/técnicas que um personagem possui ou usa \
+(ex.: \"Previsão\", \"Hipótese\", \"Teletransporte\", ou \"Espadas do Julgamento\" QUANDO o texto a trata como \
+poder/técnica conjurado). \"type\" = categoria (\"Poder\", \"Magia\", \"Técnica\"). Decida pelo CONTEXTO.\n\
+NÃO são habilidades (ignore, a menos que sejam personagens/lugares): objetos, armas ou artefatos, \
+mesmo sagrados ou nomeados (ex.: \"uma espada sagrada\", \"uma espada de brilho roxo\"); \
+organizações, facções, ordens ou eventos históricos (ex.: \"a Inquisição\" = Santa Inquisição). \
+Contexto: \"Espadas do Julgamento\" que alguém CONJURA = ability; \"uma espada sagrada\" empunhada = não.\n\
+Na dúvida sobre HABILIDADE, não inclua; é NORMAL capítulos iniciais não terem nenhuma — deixe \"abilities\" \
+vazio se não houver poder claro. Essa cautela vale só para abilities, JAMAIS para personagens.\n\
 Em \"traits\", liste NO MÁXIMO 6 tags de UMA ÚNICA palavra cada (ex.: \"Leal\", \"Impulsivo\"). \
 NÃO use frases nem expressões de várias palavras em traits — qualquer descrição mais longa vai no \"summary\". /no_think";
 
