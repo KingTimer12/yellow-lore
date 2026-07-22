@@ -84,6 +84,15 @@ textarea:focus {
    No universal `> *` rule — that would clobber fixed-position overlays. */
 .app-pane { position: relative; z-index: 1; }
 
+/* ---- Responsive UI scale -------------------------------------------------
+   On large monitors the fixed px type/spacing reads tiny. Scale the WHOLE
+   interface up in steps by viewport width (Chromium `zoom` grows fonts and
+   spacing together, so the layout keeps its proportions; each pane scrolls
+   internally). Kept modest so nothing overflows off-screen. */
+@media (min-width: 1600px) { .app-shell { zoom: 1.1; } }
+@media (min-width: 2100px) { .app-shell { zoom: 1.2; } }
+@media (min-width: 2800px) { .app-shell { zoom: 1.32; } }
+
 /* Rubricated ornament: a hairline broken by a small fleuron, used to open a
    section the way a manuscript marks a new passage. */
 .ornament { display: flex; align-items: center; gap: 0.75rem; width: 100%; }
