@@ -4,6 +4,20 @@ import { AVATAR_HUES, initials } from "../theme";
 import Graph from "./Graph";
 
 export default function CharactersView() {
+  // Filter the grid by name, role (título) or personality trait — essential once
+  // a large work yields dozens of characters. Summary is matched too as a bonus.
+  const filtered = createMemo(() => {
+    const q = state.charactersFilter.trim().toLowerCase();
+    if (!q) return state.characters;
+    return state.characters.filter(
+      (c) =>
+        c.name.toLowerCase().includes(q) ||
+        c.role.toLowerCase().includes(q) ||
+        c.summary.toLowerCase().includes(q) ||
+        c.traits.some((t) => t.toLowerCase().includes(q)),
+    );
+  });
+
   return (
     <div class="p-8 overflow-y-auto h-full box-border flex flex-col gap-5.5 anim-view">
       <div class="flex items-center justify-between flex-wrap gap-3.5">
@@ -45,7 +59,14 @@ export default function CharactersView() {
             {state.extracting ? "Extraindo..." : "Extrair novos"}
           </button>
           <button
-            onClick={() => { if (confirm("Re-extrair TODOS os documentos? Personagens editados ou adicionados por você são preservados.")) actions.extractEntities(true); }}
+            onClick={() =>
+              actions.askConfirm({
+                title: "Re-extrair tudo?",
+                message: "Re-processa TODOS os documentos deste vault. Personagens editados ou adicionados por você são preservados.",
+                confirmLabel: "Re-extrair",
+                onConfirm: () => actions.extractEntities(true),
+              })
+            }
             disabled={state.extracting}
             title="Re-processa todos os documentos (preserva editados/adicionados)"
             class="px-2.5 py-2 rounded-8px border border-border bg-panel text-fg-muted text-12.5px font-semibold cursor-pointer transition-colors hover:text-fg disabled:opacity-50 disabled:cursor-not-allowed"
@@ -54,6 +75,26 @@ export default function CharactersView() {
           </button>
         </div>
       </div>
+
+      <Show when={state.charactersTab === "grid" && state.characters.length > 0}>
+        <div class="relative">
+          <input
+            value={state.charactersFilter}
+            onInput={(e) => actions.setCharactersFilter(e.currentTarget.value)}
+            placeholder="Buscar por nome, título ou traço de personalidade…"
+            class="w-full px-3.5 py-2.5 pr-9 rounded-9px border border-border bg-panel text-fg text-13.5px box-border outline-none transition-colors focus:border-accent"
+          />
+          <Show when={state.charactersFilter}>
+            <div
+              onClick={() => actions.setCharactersFilter("")}
+              title="Limpar"
+              class="absolute right-2.5 top-1/2 -translate-y-1/2 w-6 h-6 flex items-center justify-center rounded-6px text-fg-muted text-15px cursor-pointer hover:bg-hover hover:text-fg"
+            >
+              ×
+            </div>
+          </Show>
+        </div>
+      </Show>
 
       <Show when={state.charactersTab === "grid" && state.characters.length === 0}>
         <div class="border-1.5 border-dashed border-border rounded-14px p-10 flex flex-col items-center gap-2.5 text-fg-muted text-center">
@@ -64,9 +105,16 @@ export default function CharactersView() {
         </div>
       </Show>
 
-      <Show when={state.charactersTab === "grid" && state.characters.length > 0}>
+      <Show when={state.charactersTab === "grid" && state.characters.length > 0 && filtered().length === 0}>
+        <div class="border-1.5 border-dashed border-border rounded-14px p-8 flex flex-col items-center gap-1.5 text-fg-muted text-center">
+          <div class="text-13.5px font-semibold">Nenhum resultado</div>
+          <div class="text-12px">Nada corresponde a “{state.charactersFilter}”.</div>
+        </div>
+      </Show>
+
+      <Show when={state.charactersTab === "grid" && filtered().length > 0}>
         <div class="grid grid-cols-[repeat(auto-fill,minmax(280px,1fr))] gap-4">
-          <For each={state.characters}>
+          <For each={filtered()}>
             {(c, i) => (
               <div
                 onClick={() => actions.openEdit("character", c.id)}

@@ -19,7 +19,13 @@ function renameSession(e: MouseEvent, id: string, current: string) {
 }
 function removeSession(e: MouseEvent, id: string, title: string) {
   e.stopPropagation();
-  if (window.confirm(`Excluir a conversa "${title}"?`)) actions.deleteSession(id);
+  actions.askConfirm({
+    title: "Excluir conversa?",
+    message: `Excluir a conversa "${title}"? O histórico dela será perdido.`,
+    confirmLabel: "Excluir",
+    danger: true,
+    onConfirm: () => void actions.deleteSession(id),
+  });
 }
 
 type NavDef = { id: View; label: string; icon: string };

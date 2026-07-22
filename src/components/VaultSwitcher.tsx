@@ -14,10 +14,14 @@ export default function VaultSwitcher() {
     const name = window.prompt("Renomear vault:", current);
     if (name) await actions.renameVault(id, name);
   }
-  async function remove(id: string, name: string) {
-    if (window.confirm(`Excluir o vault "${name}" e todo o seu conhecimento?`)) {
-      await actions.deleteVault(id);
-    }
+  function remove(id: string, name: string) {
+    actions.askConfirm({
+      title: "Excluir vault?",
+      message: `Excluir o vault "${name}" e todo o seu conhecimento? Esta ação não pode ser desfeita.`,
+      confirmLabel: "Excluir",
+      danger: true,
+      onConfirm: () => void actions.deleteVault(id),
+    });
   }
 
   return (

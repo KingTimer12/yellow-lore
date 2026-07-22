@@ -27,7 +27,14 @@ export default function PlacesView() {
             {state.extracting ? "Extraindo..." : "Extrair novos"}
           </button>
           <button
-            onClick={() => { if (confirm("Re-extrair TODOS os documentos? Lugares editados ou adicionados por você são preservados.")) actions.extractEntities(true); }}
+            onClick={() =>
+              actions.askConfirm({
+                title: "Re-extrair tudo?",
+                message: "Re-processa TODOS os documentos deste vault. Lugares editados ou adicionados por você são preservados.",
+                confirmLabel: "Re-extrair",
+                onConfirm: () => actions.extractEntities(true),
+              })
+            }
             disabled={state.extracting}
             title="Re-processa todos os documentos (preserva editados/adicionados)"
             class="px-2.5 py-2 rounded-8px border border-border bg-panel text-fg-muted text-12.5px font-semibold cursor-pointer transition-colors hover:text-fg disabled:opacity-50 disabled:cursor-not-allowed"
