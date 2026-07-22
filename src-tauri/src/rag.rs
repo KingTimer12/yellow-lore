@@ -839,6 +839,17 @@ struct Extraction {
     relations: Vec<ExtractedRel>,
 }
 
+/// Result of an extraction run: the fresh entities/relations, plus the alias
+/// maps (alias-lowercased → canonical display name) so the caller can fold
+/// already-saved rows that turned out to be the same entity across runs.
+pub struct ExtractResult {
+    pub characters: Vec<Character>,
+    pub places: Vec<Place>,
+    pub relations: Vec<Relation>,
+    pub char_aliases: std::collections::HashMap<String, String>,
+    pub place_aliases: std::collections::HashMap<String, String>,
+}
+
 /// Ask the LLM to read the vault's knowledge and extract characters, places and
 /// relations as structured JSON.
 pub async fn extract_entities(
@@ -847,7 +858,7 @@ pub async fn extract_entities(
     chunks: &[Chunk],
     existing_chars: &[String],
     existing_places: &[String],
-) -> AppResult<(Vec<Character>, Vec<Place>, Vec<Relation>)> {
+) -> AppResult<ExtractResult> {
     if chunks.is_empty() {
         return Err(AppError::Msg(
             "vault sem documentos indexados — carregue algo primeiro".into(),
@@ -1043,7 +1054,18 @@ pub async fn extract_entities(
         .map(|r| Relation { from: r.from, to: r.to, label: r.label })
         .collect();
 
-    Ok((characters, places, relations))
+    // Keep only aliases that actually point elsewhere — the caller uses these to
+    // merge previously-saved rows into their canonical name.
+    char_canon.retain(|k, v| *k != v.to_lowercase());
+    place_canon.retain(|k, v| *k != v.to_lowercase());
+
+    Ok(ExtractResult {
+        characters,
+        places,
+        relations,
+        char_aliases: char_canon,
+        place_aliases: place_canon,
+    })
 }
 
 /// Run extraction over a single corpus window.

@@ -1,6 +1,6 @@
 use crate::error::{AppError, AppResult};
 use crate::vector_store::Chunk;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Mutex;
@@ -453,6 +453,148 @@ impl Db {
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
+    /// Fold already-saved entity rows into their canonical name, resolving dupes
+    /// that only appear ACROSS separate extraction runs (e.g. "Sophia" saved
+    /// earlier vs "Sophia, Flor do Abismo" from a later chapter). `char_aliases`
+    /// / `place_aliases` map an alias (lowercased) → canonical display name.
+    /// Only auto-extracted rows are merged — entities the user edited/added are
+    /// left untouched. Relation endpoints are rewritten and de-duplicated too.
+    pub fn apply_aliases(
+        &self,
+        vault: &str,
+        char_aliases: &std::collections::HashMap<String, String>,
+        place_aliases: &std::collections::HashMap<String, String>,
+    ) -> AppResult<()> {
+        if char_aliases.is_empty() && place_aliases.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(sql)?;
+
+        for (alias, canon) in char_aliases {
+            if *alias == canon.to_lowercase() {
+                continue;
+            }
+            // Alias row — skip if missing or user-curated.
+            let row: Option<(String, String, String, String, String)> = tx
+                .query_row(
+                    "SELECT id, role, summary, traits, status FROM characters \
+                     WHERE vault_id = ?1 AND lower(name) = ?2",
+                    params![vault, alias],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                )
+                .optional()
+                .map_err(sql)?;
+            let Some((aid, arole, asum, atraits, astatus)) = row else { continue };
+            if is_protected(&astatus) {
+                continue;
+            }
+            let canon_row: Option<(String, String, String, String)> = tx
+                .query_row(
+                    "SELECT id, role, summary, traits FROM characters \
+                     WHERE vault_id = ?1 AND lower(name) = ?2",
+                    params![vault, canon.to_lowercase()],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )
+                .optional()
+                .map_err(sql)?;
+            match canon_row {
+                Some((cid, crole, csum, ctraits)) => {
+                    let role = if crole.trim().is_empty() { arole } else { crole };
+                    let summary = if csum.len() >= asum.len() { csum } else { asum };
+                    let traits = merge_traits_json(&ctraits, &atraits);
+                    tx.execute(
+                        "UPDATE characters SET role=?2, summary=?3, traits=?4 WHERE id=?1",
+                        params![cid, role, summary, traits],
+                    )
+                    .map_err(sql)?;
+                    tx.execute("DELETE FROM characters WHERE id=?1", params![aid]).map_err(sql)?;
+                }
+                None => {
+                    tx.execute("UPDATE characters SET name=?2 WHERE id=?1", params![aid, canon])
+                        .map_err(sql)?;
+                }
+            }
+        }
+
+        for (alias, canon) in place_aliases {
+            if *alias == canon.to_lowercase() {
+                continue;
+            }
+            let row: Option<(String, String, String, String)> = tx
+                .query_row(
+                    "SELECT id, kind, summary, status FROM places \
+                     WHERE vault_id = ?1 AND lower(name) = ?2",
+                    params![vault, alias],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )
+                .optional()
+                .map_err(sql)?;
+            let Some((aid, akind, asum, astatus)) = row else { continue };
+            if is_protected(&astatus) {
+                continue;
+            }
+            let canon_row: Option<(String, String, String)> = tx
+                .query_row(
+                    "SELECT id, kind, summary FROM places \
+                     WHERE vault_id = ?1 AND lower(name) = ?2",
+                    params![vault, canon.to_lowercase()],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .optional()
+                .map_err(sql)?;
+            match canon_row {
+                Some((cid, ckind, csum)) => {
+                    let kind = if ckind.trim().is_empty() { akind } else { ckind };
+                    let summary = if csum.len() >= asum.len() { csum } else { asum };
+                    tx.execute(
+                        "UPDATE places SET kind=?2, summary=?3 WHERE id=?1",
+                        params![cid, kind, summary],
+                    )
+                    .map_err(sql)?;
+                    tx.execute("DELETE FROM places WHERE id=?1", params![aid]).map_err(sql)?;
+                }
+                None => {
+                    tx.execute("UPDATE places SET name=?2 WHERE id=?1", params![aid, canon])
+                        .map_err(sql)?;
+                }
+            }
+        }
+
+        // Rewrite relation endpoints for every alias (either type), then drop
+        // self-loops and duplicate triples the rewrite may have produced.
+        for (alias, canon) in char_aliases.iter().chain(place_aliases.iter()) {
+            if *alias == canon.to_lowercase() {
+                continue;
+            }
+            tx.execute(
+                "UPDATE relations SET from_name=?3 WHERE vault_id=?1 AND lower(from_name)=?2",
+                params![vault, alias, canon],
+            )
+            .map_err(sql)?;
+            tx.execute(
+                "UPDATE relations SET to_name=?3 WHERE vault_id=?1 AND lower(to_name)=?2",
+                params![vault, alias, canon],
+            )
+            .map_err(sql)?;
+        }
+        tx.execute(
+            "DELETE FROM relations WHERE vault_id=?1 AND lower(from_name)=lower(to_name)",
+            params![vault],
+        )
+        .map_err(sql)?;
+        tx.execute(
+            "DELETE FROM relations WHERE vault_id=?1 AND id NOT IN \
+             (SELECT min(id) FROM relations WHERE vault_id=?1 \
+              GROUP BY lower(from_name), lower(to_name), lower(label))",
+            params![vault],
+        )
+        .map_err(sql)?;
+
+        tx.commit().map_err(sql)?;
+        Ok(())
+    }
+
     /// Add a manual relation (edge) between two entities by name. No-op if the
     /// exact (from, to, label) triple already exists, so it composes with the
     /// dedup used by extraction. Names reference characters/places by display name.
@@ -844,6 +986,19 @@ fn sql(e: rusqlite::Error) -> AppError {
 /// or added by hand.
 fn is_protected(status: &str) -> bool {
     status == "Editado" || status == "Adicionado"
+}
+
+/// Union two JSON string-arrays of traits (case-insensitive), keeping order:
+/// canonical's traits first, then any new ones from the alias.
+fn merge_traits_json(canon: &str, alias: &str) -> String {
+    let mut out: Vec<String> = serde_json::from_str(canon).unwrap_or_default();
+    let extra: Vec<String> = serde_json::from_str(alias).unwrap_or_default();
+    for t in extra {
+        if !out.iter().any(|e| e.eq_ignore_ascii_case(&t)) {
+            out.push(t);
+        }
+    }
+    serde_json::to_string(&out).unwrap_or_else(|_| "[]".into())
 }
 
 /// Vectors are stored as a compact little-endian f32 BLOB (4 bytes/dim) instead

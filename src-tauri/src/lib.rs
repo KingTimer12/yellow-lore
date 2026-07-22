@@ -414,10 +414,13 @@ async fn extract_entities(
     let existing_chars: Vec<String> = existing.characters.iter().map(|c| c.name.clone()).collect();
     let existing_places: Vec<String> = existing.places.iter().map(|p| p.name.clone()).collect();
 
-    let (characters, places, relations) =
+    let res =
         rag::extract_entities(&state.client, &cfg, &target, &existing_chars, &existing_places)
             .await?;
-    state.db.merge_extracted(&vault, &characters, &places, &relations)?;
+    state.db.merge_extracted(&vault, &res.characters, &res.places, &res.relations)?;
+    // Fold previously-saved rows that this run revealed to be the same entity
+    // (cross-run dupes like "Sophia" vs "Sophia, Flor do Abismo").
+    state.db.apply_aliases(&vault, &res.char_aliases, &res.place_aliases)?;
 
     // Record the documents we just covered so the next run skips them.
     let mut ids: Vec<String> = target.iter().map(|c| c.doc_id.clone()).collect();
