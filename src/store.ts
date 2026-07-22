@@ -141,12 +141,15 @@ export type State = {
   /// "alert" = single OK; "confirm" = confirm/cancel. The confirm callback lives
   /// outside the store (see `pendingConfirm`) — stores hold only serializable data.
   dialog: {
-    mode: "alert" | "confirm";
+    mode: "alert" | "confirm" | "prompt";
     title: string;
     message: string;
     confirmLabel: string;
     cancelLabel: string;
     danger: boolean;
+    /// Prompt only: current text-input value + placeholder.
+    value: string;
+    placeholder: string;
   } | null;
 };
 
@@ -213,9 +216,10 @@ const initial: State = {
 
 const [state, setState] = createStore<State>(structuredClone(initial));
 
-// Pending confirm callback for the centralized dialog. Kept out of the store so
-// only serializable data lives there; resolved by `resolveDialog`.
-let pendingConfirm: (() => void) | null = null;
+// Pending callback for the centralized dialog. Kept out of the store so only
+// serializable data lives there; resolved by `resolveDialog`. Receives the
+// prompt's input value (ignored by alert/confirm).
+let pendingConfirm: ((value: string) => void) | null = null;
 export { state };
 
 let toastTimer: ReturnType<typeof setTimeout> | undefined;
@@ -673,8 +677,38 @@ export const actions = {
       confirmLabel: "Entendi",
       cancelLabel: "",
       danger: false,
+      value: "",
+      placeholder: "",
     });
   },
+
+  /// Ask for a single line of text (replaces native `prompt`). `onSubmit` runs
+  /// with the trimmed value only if it's non-empty and the user confirms.
+  askPrompt(opts: {
+    title: string;
+    message?: string;
+    defaultValue?: string;
+    placeholder?: string;
+    confirmLabel?: string;
+    onSubmit: (value: string) => void;
+  }) {
+    pendingConfirm = (v: string) => {
+      const t = v.trim();
+      if (t) opts.onSubmit(t);
+    };
+    setState("dialog", {
+      mode: "prompt",
+      title: opts.title,
+      message: opts.message ?? "",
+      confirmLabel: opts.confirmLabel ?? "Salvar",
+      cancelLabel: "Cancelar",
+      danger: false,
+      value: opts.defaultValue ?? "",
+      placeholder: opts.placeholder ?? "",
+    });
+  },
+
+  setDialogValue: (v: string) => setState("dialog", (d) => (d ? { ...d, value: v } : d)),
 
   /// Ask for confirmation (replaces native `confirm`). `onConfirm` runs only if
   /// the user confirms.
@@ -685,7 +719,7 @@ export const actions = {
     danger?: boolean;
     onConfirm: () => void;
   }) {
-    pendingConfirm = opts.onConfirm;
+    pendingConfirm = () => opts.onConfirm();
     setState("dialog", {
       mode: "confirm",
       title: opts.title,
@@ -693,15 +727,19 @@ export const actions = {
       confirmLabel: opts.confirmLabel ?? "Confirmar",
       cancelLabel: "Cancelar",
       danger: opts.danger ?? false,
+      value: "",
+      placeholder: "",
     });
   },
 
-  /// Resolve the open dialog. Runs the pending confirm callback when `ok`.
+  /// Resolve the open dialog. Runs the pending callback when `ok`, passing the
+  /// prompt input value (empty for alert/confirm).
   resolveDialog(ok: boolean) {
     const cb = pendingConfirm;
+    const val = state.dialog?.value ?? "";
     pendingConfirm = null;
     setState("dialog", null);
-    if (ok && cb) cb();
+    if (ok && cb) cb(val);
   },
 
   setSetting: <K extends keyof Settings>(key: K, value: Settings[K]) =>

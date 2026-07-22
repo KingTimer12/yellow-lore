@@ -6,7 +6,8 @@ import { state, actions } from "../store";
 /// look and stay theme-aware. Driven by `state.dialog`.
 export default function Dialog() {
   const d = () => state.dialog;
-  const isConfirm = () => d()!.mode === "confirm";
+  const hasCancel = () => d()!.mode !== "alert";
+  const isPrompt = () => d()!.mode === "prompt";
 
   return (
     <Show when={d()}>
@@ -20,12 +21,28 @@ export default function Dialog() {
           class="w-420px max-w-full bg-panel border border-border rounded-16px p-6 box-border anim-pop"
         >
           <div class="font-serif text-18px font-600 mb-1.5">{d()!.title}</div>
-          <div class="font-reading text-14.5px text-fg-muted leading-[1.55] whitespace-pre-wrap">
-            {d()!.message}
-          </div>
+          <Show when={d()!.message}>
+            <div class="font-reading text-14.5px text-fg-muted leading-[1.55] whitespace-pre-wrap">
+              {d()!.message}
+            </div>
+          </Show>
+
+          <Show when={isPrompt()}>
+            <input
+              autofocus
+              value={d()!.value}
+              placeholder={d()!.placeholder}
+              onInput={(e) => actions.setDialogValue(e.currentTarget.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") actions.resolveDialog(true);
+                if (e.key === "Escape") actions.resolveDialog(false);
+              }}
+              class="w-full mt-4 px-3.5 py-2.5 rounded-8px border border-border bg-bg text-fg text-14px box-border outline-none transition-colors focus:border-accent"
+            />
+          </Show>
 
           <div class="flex items-center justify-end gap-2.5 mt-6">
-            <Show when={isConfirm()}>
+            <Show when={hasCancel()}>
               <button
                 onClick={() => actions.resolveDialog(false)}
                 class="px-4 py-2 rounded-8px border border-border bg-panel text-fg text-13px font-semibold cursor-pointer transition-colors hover:bg-hover"

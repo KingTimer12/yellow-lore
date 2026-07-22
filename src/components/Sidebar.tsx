@@ -14,8 +14,12 @@ function newChat() {
 }
 function renameSession(e: MouseEvent, id: string, current: string) {
   e.stopPropagation();
-  const t = window.prompt("Renomear conversa:", current);
-  if (t) actions.renameSession(id, t);
+  actions.askPrompt({
+    title: "Renomear conversa",
+    defaultValue: current,
+    placeholder: "Título da conversa",
+    onSubmit: (t) => actions.renameSession(id, t),
+  });
 }
 function removeSession(e: MouseEvent, id: string, title: string) {
   e.stopPropagation();

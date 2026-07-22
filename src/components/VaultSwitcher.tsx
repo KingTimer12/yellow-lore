@@ -10,9 +10,13 @@ export default function VaultSwitcher() {
     actions.openVaultModal();
     setOpen(false);
   }
-  async function rename(id: string, current: string) {
-    const name = window.prompt("Renomear vault:", current);
-    if (name) await actions.renameVault(id, name);
+  function rename(id: string, current: string) {
+    actions.askPrompt({
+      title: "Renomear vault",
+      defaultValue: current,
+      placeholder: "Nome do vault",
+      onSubmit: (name) => void actions.renameVault(id, name),
+    });
   }
   function remove(id: string, name: string) {
     actions.askConfirm({
