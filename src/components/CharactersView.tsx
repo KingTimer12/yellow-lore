@@ -144,10 +144,10 @@ export default function CharactersView() {
                   </div>
                 </div>
                 <div class="text-13px text-fg-muted leading-[1.5]">{c.summary}</div>
-                <div class="flex gap-1.5 flex-wrap">
+                <div class="flex gap-1.5 flex-wrap content-start mt-auto min-h-72px">
                   <For each={c.traits}>
                     {(trait) => (
-                      <div class="px-2.25 py-0.75 rounded-20px bg-hover text-11px text-fg-muted">
+                      <div class="px-2.25 py-0.75 rounded-20px bg-hover text-11px text-fg-muted h-fit">
                         {trait}
                       </div>
                     )}
