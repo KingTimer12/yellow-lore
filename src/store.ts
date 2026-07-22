@@ -88,6 +88,8 @@ export type Settings = {
   extractionConcurrency: number;
   /// Extra LLM pass that re-orders retrieved chunks by relevance before answering.
   rerank: boolean;
+  /// Corrective RAG: draft → auto-avaliação → uma re-busca mais ampla se preciso.
+  corrective: boolean;
 };
 
 // `creating` marks a brand-new entity (manual add) vs editing an existing one.
@@ -157,6 +159,7 @@ export const DEFAULT_SETTINGS: Settings = {
   extractionModel: "",
   extractionConcurrency: 1,
   rerank: false,
+  corrective: false,
 };
 
 // ---- Seed data (browser preview only) -------------------------------------

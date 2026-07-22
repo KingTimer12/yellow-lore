@@ -103,6 +103,12 @@ export default function SettingsView() {
           label="Reranking de trechos por relevância (LLM)"
           hint="Após a busca híbrida, uma chamada de LLM reordena os trechos recuperados por relevância antes de responder — corta ruído do top-k. Custa uma chamada a mais por pergunta."
         />
+        <Toggle
+          on={state.settings.corrective}
+          onToggle={() => actions.setSetting("corrective", !state.settings.corrective)}
+          label="RAG corretivo — auto-avaliar e re-buscar (CRAG)"
+          hint="Após rascunhar a resposta, o modelo avalia se ela resolve a pergunta; se não, refaz a busca com uma rede mais ampla e responde de novo (uma única re-tentativa). Mais preciso, porém mais lento e com chamadas de LLM extras. Bom para o modo precisão."
+        />
       </div>
 
       {/* Entity extraction */}
