@@ -65,6 +65,12 @@ pub struct RagConfig {
     /// Costs one extra LLM call per question; off by default.
     #[serde(default)]
     pub rerank: bool,
+    /// Corrective RAG (CRAG-limited): after drafting an answer, the model grades
+    /// whether it actually resolves the question; if not, it re-retrieves with a
+    /// wider net and answers once more. Bounded to a single retry (no open agent
+    /// loop). Higher precision at the cost of extra LLM calls; off by default.
+    #[serde(default)]
+    pub corrective: bool,
 }
 
 fn default_true() -> bool {
@@ -115,6 +121,7 @@ impl Default for RagConfig {
             extraction_model: String::new(),
             extraction_concurrency: default_extraction_concurrency(),
             rerank: false,
+            corrective: false,
         }
     }
 }
