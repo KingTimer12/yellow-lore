@@ -343,7 +343,7 @@ pub async fn ask(
             client, cfg, chunks, question.clone(), history.clone(), entity_names, relations,
         )
         .await?;
-        let draft = providers::chat_internal(client, cfg, &msgs1, &cfg.llm_model, false).await?;
+        let draft = providers::chat_internal(client, cfg, &msgs1, &cfg.llm_model).await?;
         if grade_answer(client, cfg, &question, &draft).await.unwrap_or(true) {
             let text = providers::chat(client, cfg, &msgs1).await?;
             let sources = cited_sources(src1, &strip_think(&text));
@@ -386,7 +386,7 @@ pub async fn ask_stream<F: FnMut(&str)>(
             client, cfg, chunks, question.clone(), history.clone(), entity_names, relations,
         )
         .await?;
-        let draft = providers::chat_internal(client, cfg, &msgs1, &cfg.llm_model, false).await?;
+        let draft = providers::chat_internal(client, cfg, &msgs1, &cfg.llm_model).await?;
         if grade_answer(client, cfg, &question, &draft).await.unwrap_or(true) {
             let answer =
                 providers::chat_stream(client, cfg, &msgs1, cfg.show_thinking, cancel, on_token).await?;
@@ -428,7 +428,7 @@ Não raciocine em voz alta nem inclua qualquer texto além do título. /no_think
         ChatMessage { role: "system", content: system.to_string() },
         ChatMessage { role: "user", content: user },
     ];
-    let raw = providers::chat_internal(client, cfg, &messages, &cfg.llm_model, false).await?;
+    let raw = providers::chat_internal(client, cfg, &messages, &cfg.llm_model).await?;
     // Reasoning models emit a <think>…</think> block first — drop it so the
     // title isn't literally "<think>".
     let raw = strip_think(&raw);
@@ -607,7 +607,7 @@ Uma resposta que afirma honestamente não ter encontrado a informação nos docu
         ChatMessage { role: "system", content: system.to_string() },
         ChatMessage { role: "user", content: user },
     ];
-    let raw = providers::chat_internal(client, cfg, &messages, &cfg.llm_model, true).await?;
+    let raw = providers::chat_internal(client, cfg, &messages, &cfg.llm_model).await?;
     let raw = strip_think(&raw);
     let json = extract_json_block(&raw).ok_or_else(|| AppError::Msg("grade: JSON inválido".into()))?;
     #[derive(Deserialize)]
@@ -677,7 +677,7 @@ Use somente os índices fornecidos, sem repetir. /no_think";
         ChatMessage { role: "system", content: system.to_string() },
         ChatMessage { role: "user", content: user },
     ];
-    let raw = match providers::chat_internal(client, cfg, &messages, &cfg.llm_model, true).await {
+    let raw = match providers::chat_internal(client, cfg, &messages, &cfg.llm_model).await {
         Ok(r) => r,
         Err(_) => return hits,
     };
@@ -1204,7 +1204,7 @@ NÃO use frases nem expressões de várias palavras em traits — qualquer descr
         ChatMessage { role: "system", content: system.to_string() },
         ChatMessage { role: "user", content: user },
     ];
-    let raw = providers::chat_internal(client, cfg, &messages, model, true).await?;
+    let raw = providers::chat_internal(client, cfg, &messages, model).await?;
     // Reasoning models (and Ollama's `thinking` field) prepend a <think>…</think>
     // block whose braces would corrupt the JSON span — drop it before parsing.
     let raw = strip_think(&raw);
@@ -1379,7 +1379,7 @@ Na dúvida, NÃO agrupe."
         ChatMessage { role: "system", content: system },
         ChatMessage { role: "user", content: user },
     ];
-    let raw = providers::chat_internal(client, cfg, &messages, model, true).await?;
+    let raw = providers::chat_internal(client, cfg, &messages, model).await?;
     let raw = strip_think(&raw);
     let json = extract_json_block(&raw)
         .ok_or_else(|| AppError::Msg("dedup: JSON inválido".into()))?;
