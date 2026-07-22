@@ -14,6 +14,9 @@ pub struct Source {
     pub quote: String,
     /// The full retrieved passage, shown in the citation modal.
     pub text: String,
+    /// The `[Fonte N]` number this passage was given in the prompt, so the UI can
+    /// map an inline `[N]` marker in the answer back to its source.
+    pub mark: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -267,6 +270,7 @@ async fn build_chat(
                 doc: hit.chunk.doc_name.clone(),
                 quote: snippet(&hit.chunk.text, &question),
                 text: hit.chunk.text.trim().to_string(),
+                mark: n,
             });
             // Only the opening is a meaningful, stable landmark. Do NOT expose the
             // raw chunk index — it's an internal ~200-word slice, not a document
