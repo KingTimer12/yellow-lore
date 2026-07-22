@@ -26,6 +26,20 @@ function buildIndex(): { map: Map<string, EntIndex[number]>; re: RegExp } | null
   if (idx.length === 0) return null;
   const map = new Map<string, EntIndex[number]>();
   for (const e of idx) if (!map.has(e.lower)) map.set(e.lower, e);
+
+  // Also match the FIRST name of multi-word entities ("Cesar" → "Cesar Magnus"),
+  // since chapters often use only the given name. Skip any first name shared by
+  // two entities (ambiguous) or that collides with a full entity name.
+  const first = new Map<string, EntIndex[number] | null>();
+  for (const e of idx) {
+    const toks = e.lower.split(/[^\p{L}\p{N}]+/u).filter(Boolean);
+    if (toks.length < 2) continue;
+    const t = toks[0];
+    if (t.length < 3 || map.has(t)) continue;
+    first.set(t, first.has(t) ? null : e);
+  }
+  for (const [t, e] of first) if (e && !map.has(t)) map.set(t, e);
+
   const names = [...map.keys()].sort((a, b) => b.length - a.length).map(escapeRe);
   // Unicode-aware "word" boundaries via lookarounds so accented names match.
   const re = new RegExp(`(?<!\\p{L})(${names.join("|")})(?!\\p{L})`, "giu");
