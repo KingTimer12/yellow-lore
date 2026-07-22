@@ -60,16 +60,24 @@ renomear, excluir). Comandos: `list_sessions`, `create_session`,
   **RAG-first** · `ask_stream()` = mesmo pipeline, mas emite tokens via callback.
   Recuperação: **híbrida** (semântico + lexical IDF), **direcionada por capítulo**
   (pergunta "capítulo 1" puxa só aquele doc em ordem de leitura), **injeção da
-  abertura** (`ordinal 0`) para perguntas posicionais, e **filtro de citações**
-  (`relevant_sources`) que só cita fontes com sobreposição de conteúdo com a
-  resposta gerada. Chunks têm `ordinal` (ordem de leitura, recalculado no load).
+  abertura** (`ordinal 0`) para perguntas posicionais, **reranking opcional**
+  (`rerank`: uma chamada de LLM reordena os trechos por relevância antes de montar
+  o contexto) e **citações declaradas pelo LLM**: cada trecho vai rotulado
+  `[Fonte N]` e o modelo cita `[N]`; `cited_sources` mantém só as fontes marcadas,
+  com **fallback** ao filtro de sobreposição (`relevant_sources`) quando o modelo
+  não marca nada. Chunks têm `ordinal` (ordem de leitura, recalculado no load).
   `extract_entities()` = LLM lê o vault em **janelas de ~12k chars** (até **40**
-  janelas) e **mescla** as entidades por nome (case-insensitive; traits unidos,
-  relações dedup). **Incremental**: só documentos ainda não extraídos (set em
+  janelas), com **concorrência configurável** (`extractionConcurrency`, default 1
+  = sequencial; suba só em nuvem), **modelo de extração dedicado opcional**
+  (`extractionModel`; vazio = reutiliza o de chat), e **mescla** as entidades por
+  nome (case-insensitive; traits unidos, relações dedup). **Incremental**: só
+  documentos ainda não extraídos (set em
   `meta`); entidades **Editado/Adicionado nunca são sobrescritas** (`is_protected`).
   Extração de JSON tolerante a `<think>` (strip antes de parsear). Coreferência:
   alias por subsequência de tokens ("Cesar" → "Cesar Magnus") + **dedup opcional
-  via LLM** (`dedupEntities`). Nomes canônicos reescrevem também as relações.
+  via LLM** (`dedupEntities`) **direcionado** (só nomes ambíguos, que compartilham
+  algum token) e **contra entidades já salvas** (funde "Cesar" de um run novo na
+  "Cesar Magnus" de um run anterior). Nomes canônicos reescrevem também as relações.
 - `config.rs` — `RagConfig` (`config.json`, global).
 - `lib.rs` — estado + comandos Tauri.
 
@@ -92,7 +100,10 @@ incremental por padrão, `true` re-scaneia tudo), `add_character`, `add_place`,
 - **System prompt** editável (esteira o agente).
 - RAG: chunk size, overlap, top-k, **temperatura** (default 0.2), **num_ctx do
   Ollama** (default 8192 — modelo que raciocina muito estourava o contexto e
-  cortava a resposta), mostrar fontes, dedup de entidades.
+  cortava a resposta), mostrar fontes, **reranking** (off).
+- Extração: **modelo dedicado** opcional (`extractionModel`), **janelas em
+  paralelo** (`extractionConcurrency`, default 1), **dedup via LLM**
+  (`dedupEntities`).
 
 ## Rodar
 
@@ -113,30 +124,23 @@ incremental por padrão, `true` re-scaneia tudo), `add_character`, `add_place`,
 
 ## Limitações conhecidas (levantadas em uso real)
 
-- **Dedup de entidades entre extrações**: o merge incremental casa por nome
-  exato (case-insensitive). "Cesar" (extração nova) vs "Cesar Magnus" (já
-  existente) **não fundem** entre runs separados → viram dois cards. A
-  coreferência/dedup-LLM só roda dentro de um mesmo run. Resolver = rodar o dedup
-  contra as entidades já salvas a cada extração (mais lento).
-- **Filtro de citações é heurístico**: `relevant_sources` mede sobreposição de
-  palavras (≥4 letras) entre a resposta e cada fonte. Se o modelo parafraseia
-  demais com palavras curtas, uma fonte real pode cair. Mais preciso seria o LLM
-  declarar as fontes usadas (ver ideias abaixo).
 - **Truncamento de raciocínio**: mesmo com `num_ctx` maior, modelo muito
   verboso ainda pode estourar. Modelo não-reasoning ou `num_ctx` maior ajuda.
 - **macOS**: sem Apple Developer ID, o auto-update funciona mas o SO alerta app
-  não-notarizado.
-- **Primeira extração de obra grande é lenta** (modelo local, N janelas
-  sequenciais). Incremental resolve o custo recorrente, não o primeiro passe.
+  não-notarizado. (Sem solução do meu lado — exige conta paga da Apple.)
+
+### Resolvidas
+
+- ~~Dedup de entidades entre extrações~~: o dedup-LLM agora roda **contra as
+  entidades já salvas** ("Cesar" de um run novo funde na "Cesar Magnus" salva).
+- ~~Filtro de citações heurístico~~: substituído por **citações declaradas pelo
+  LLM** (`[N]` → `[Fonte N]`), com fallback ao filtro de sobreposição.
+- ~~Primeira extração de obra grande é lenta~~: janelas agora rodam com
+  **concorrência configurável** (para nuvem). Local segue sequencial de propósito
+  (paralelizar numa GPU só estoura a VRAM).
 
 ## Ideias — precisão da resposta (chat)
 
-- **Citações declaradas pelo LLM**: pedir marcadores `[1] [2]` no texto e mapear
-  para as fontes, em vez do filtro por sobreposição. Precisão real do que foi
-  usado.
-- **Reranking**: após o híbrido (semântico + lexical), um passo de rerank
-  (cross-encoder leve ou LLM barato) ordena por relevância antes de montar o
-  contexto — corta ruído dos top-k.
 - **Fusão de rankings (RRF)**: combinar semântico e lexical por Reciprocal Rank
   Fusion em vez de append+dedup — ordena melhor quando os dois discordam.
 - **Threshold de similaridade**: descartar chunk abaixo de X de cosseno (menos
@@ -163,20 +167,17 @@ incremental por padrão, `true` re-scaneia tudo), `add_character`, `add_place`,
 
 ## Ideias — precisão da extração
 
-- **Dedup contra entidades existentes** (resolve a limitação acima): passar a
-  lista já salva ao dedup-LLM a cada run.
 - **Saída estruturada garantida**: Ollama `format: "json"` / grammar GBNF ou
   JSON schema → elimina falha de "JSON inválido" de modelos pequenos.
 - **Few-shot com personagens conhecidos**: injetar nomes canônicos já extraídos
   no prompt → consistência de nomeação entre janelas/runs.
-- **Passo de verificação**: segundo LLM confere/mescla entidades duvidosas.
+- Feito: **dedup contra entidades existentes** e **verificação direcionada de
+  entidades duvidosas** (só nomes ambíguos vão ao dedup-LLM).
 
 ## Ideias — tempo de extração
 
-- **Paralelizar as janelas**: hoje as N janelas rodam em sequência; disparar
-  várias chamadas concorrentes (Ollama/OpenAI) corta o tempo linearmente.
-- **Modelo dedicado à extração**: separar do modelo de chat — um menor/rápido só
-  para extrair (extração não precisa da mesma qualidade de prosa).
+- Feito: **paralelizar as janelas** (`extractionConcurrency`, só nuvem por
+  padrão) e **modelo dedicado à extração** (`extractionModel`).
 - **Pular dedup-LLM** quando há poucas entidades (já é barato, mas evita 1 call).
 - **Cache por `doc_id` (BLAKE3)**: reingestão idêntica não re-extrai (o id já é
   content-addressed; falta ligar isso ao set de extraídos).
