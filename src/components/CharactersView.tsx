@@ -1,4 +1,4 @@
-import { For, Show } from "solid-js";
+import { For, Show, createMemo, createSignal } from "solid-js";
 import { state, actions } from "../store";
 import { AVATAR_HUES, initials } from "../theme";
 import Graph from "./Graph";
@@ -114,6 +114,99 @@ export default function CharactersView() {
       <Show when={state.charactersTab === "graph"}>
         <div class="flex-1 min-h-460px">
           <Graph />
+        </div>
+        <RelationsEditor />
+      </Show>
+    </div>
+  );
+}
+
+// ---- Manual relation editing ----------------------------------------------
+//
+// Auto-extraction gets sloppier as more chapters pile up; curating edges by hand
+// keeps the graph (and GraphRAG retrieval) accurate. Edges are keyed by their
+// (from, to, label) triple — editing a label = delete + re-add.
+function RelationsEditor() {
+  const names = createMemo(() => {
+    const set = new Set<string>();
+    for (const c of state.characters) set.add(c.name);
+    for (const p of state.places) set.add(p.name);
+    return [...set].sort((a, b) => a.localeCompare(b));
+  });
+
+  const [from, setFrom] = createSignal("");
+  const [to, setTo] = createSignal("");
+  const [label, setLabel] = createSignal("");
+
+  const canAdd = () =>
+    from().trim() && to().trim() && from().toLowerCase() !== to().toLowerCase();
+
+  const add = () => {
+    if (!canAdd()) return;
+    actions.addRelation(from(), to(), label());
+    setLabel("");
+  };
+
+  const selectClass =
+    "px-2.5 py-2 rounded-8px border border-border bg-panel text-fg text-12.5px outline-none min-w-0";
+
+  return (
+    <div class="border border-border rounded-14px bg-panel p-4 flex flex-col gap-3">
+      <div class="text-12px font-bold text-fg-muted uppercase tracking-[0.04em]">
+        Relações do grafo
+      </div>
+      <div class="text-11.5px text-fg-muted -mt-1.5 leading-[1.45]">
+        Adicione ou remova ligações manualmente. Quanto mais capítulos, mais a extração automática erra — relações curadas por você melhoram a precisão do GraphRAG.
+      </div>
+
+      {/* Add form */}
+      <div class="flex items-center gap-2 flex-wrap">
+        <select class={selectClass} value={from()} onChange={(e) => setFrom(e.currentTarget.value)}>
+          <option value="">De…</option>
+          <For each={names()}>{(n) => <option value={n}>{n}</option>}</For>
+        </select>
+        <input
+          class={selectClass + " flex-1"}
+          placeholder="relação (ex.: mentor de, irmão de)"
+          value={label()}
+          onInput={(e) => setLabel(e.currentTarget.value)}
+          onKeyDown={(e) => e.key === "Enter" && add()}
+        />
+        <select class={selectClass} value={to()} onChange={(e) => setTo(e.currentTarget.value)}>
+          <option value="">Para…</option>
+          <For each={names()}>{(n) => <option value={n}>{n}</option>}</For>
+        </select>
+        <button
+          onClick={add}
+          disabled={!canAdd()}
+          class="px-3.5 py-2 rounded-8px bg-accent text-accent-fg text-12.5px font-bold cursor-pointer border-none transition-transform active:scale-95 disabled:opacity-40 disabled:cursor-not-allowed"
+        >
+          Adicionar
+        </button>
+      </div>
+
+      {/* Existing relations */}
+      <Show
+        when={state.relations.length > 0}
+        fallback={<div class="text-12px text-fg-muted">Nenhuma relação ainda.</div>}
+      >
+        <div class="flex flex-col gap-1.5 max-h-220px overflow-y-auto">
+          <For each={state.relations}>
+            {(r) => (
+              <div class="flex items-center gap-2 text-12.5px py-1 px-2 rounded-7px hover:bg-hover group">
+                <span class="font-semibold">{r.from}</span>
+                <span class="text-fg-muted">—{r.label ? ` ${r.label} ` : " "}→</span>
+                <span class="font-semibold">{r.to}</span>
+                <button
+                  onClick={() => actions.removeRelation(r)}
+                  title="Remover relação"
+                  class="ml-auto w-5 h-5 flex-none rounded-full text-fg-muted text-13px leading-none cursor-pointer border-none bg-transparent hover:text-danger transition-colors"
+                >
+                  ×
+                </button>
+              </div>
+            )}
+          </For>
         </div>
       </Show>
     </div>
