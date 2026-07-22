@@ -16,6 +16,7 @@ import EditDrawer from "./components/EditDrawer";
 import CreateVaultModal from "./components/CreateVaultModal";
 import InformationModal from "./components/InformationModal";
 import CitationModal from "./components/CitationModal";
+import Dialog from "./components/Dialog";
 import Ornament from "./components/Ornament";
 
 /// Shown when there is no active vault (fresh install / all vaults deleted).
@@ -113,6 +114,7 @@ export default function App() {
         <CreateVaultModal />
         <InformationModal />
         <CitationModal />
+        <Dialog />
       </div>
     </div>
   );
