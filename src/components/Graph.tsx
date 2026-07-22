@@ -85,6 +85,28 @@ export default function Graph() {
     return m;
   });
 
+  // Multiple relations between the SAME pair of nodes would draw on top of each
+  // other (lines and labels overlapping). Fan them out: each parallel edge gets a
+  // perpendicular curvature offset so every relation is a distinct, readable arc.
+  const edgesGeo = createMemo(() => {
+    const groups = new Map<string, Edge[]>();
+    for (const e of graph().edges) {
+      const key = e.a < e.b ? `${e.a}${e.b}` : `${e.b}${e.a}`;
+      const list = groups.get(key);
+      if (list) list.push(e);
+      else groups.set(key, [e]);
+    }
+    const out: (Edge & { curv: number })[] = [];
+    for (const list of groups.values()) {
+      const n = list.length;
+      list.forEach((e, i) => {
+        // n === 1 → straight (curv 0). Otherwise symmetric spread around center.
+        out.push({ ...e, curv: n === 1 ? 0 : (i - (n - 1) / 2) * 34 });
+      });
+    }
+    return out;
+  });
+
   // Neighbors of the hovered node (for highlight / dimming).
   const neighbors = createMemo(() => {
     const h = hover();
@@ -228,28 +250,43 @@ export default function Graph() {
         onWheel={onWheel}
       >
         <g transform={`translate(${(frame(), cx())} ${cy()}) scale(${view().scale})`}>
-          {/* Edges */}
-          <For each={graph().edges}>
+          {/* Edges (parallel relations fan out into distinct arcs) */}
+          <For each={edgesGeo()}>
             {(e) => {
               const a = () => nodeById().get(e.a)!;
               const b = () => nodeById().get(e.b)!;
               const active = () => hover() === e.a || hover() === e.b;
+              // Perpendicular unit vector → control point offset by the curvature.
+              const geo = () => {
+                frame();
+                const na = a(), nb = b();
+                const mx = (na.x + nb.x) / 2, my = (na.y + nb.y) / 2;
+                const dx = nb.x - na.x, dy = nb.y - na.y;
+                const len = Math.hypot(dx, dy) || 1;
+                const px = -dy / len, py = dx / len;
+                const cx2 = mx + px * e.curv, cy2 = my + py * e.curv;
+                return {
+                  d: `M ${na.x} ${na.y} Q ${cx2} ${cy2} ${nb.x} ${nb.y}`,
+                  // Label sits on the arc apex (bezier midpoint = halfway to control).
+                  lx: mx + px * e.curv * 0.5,
+                  ly: my + py * e.curv * 0.5,
+                };
+              };
               return (
                 <>
-                  <line
-                    x1={(frame(), a().x)} y1={a().y}
-                    x2={(frame(), b().x)} y2={b().y}
-                    stroke="var(--border)"
+                  <path
+                    d={geo().d}
+                    fill="none"
                     stroke-width={active() ? 1.8 : 1}
                     style={{ stroke: active() ? "var(--accent)" : "var(--border)", opacity: hover() && !active() ? 0.25 : 0.7 }}
                   />
                   <Show when={active() && e.label}>
                     <text
-                      x={(frame(), (a().x + b().x) / 2)}
-                      y={(a().y + b().y) / 2 - 3}
+                      x={geo().lx}
+                      y={geo().ly - 3}
                       text-anchor="middle"
                       class="font-sans"
-                      style={{ "font-size": "9px", fill: "var(--fg-muted)" }}
+                      style={{ "font-size": "9px", fill: "var(--fg-muted)", "paint-order": "stroke", stroke: "var(--panel)", "stroke-width": "3px" }}
                     >
                       {e.label}
                     </text>
