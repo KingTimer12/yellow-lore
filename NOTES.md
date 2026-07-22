@@ -59,7 +59,10 @@ renomear, excluir). Comandos: `list_sessions`, `create_session`,
 - `rag.rs` — chunking · `build_document()` (chunk→embed) · `ask()` = pipeline
   **RAG-first** · `ask_stream()` = mesmo pipeline, mas emite tokens via callback.
   Recuperação: **híbrida** (semântico + lexical IDF), **direcionada por capítulo**
-  (pergunta "capítulo 1" puxa só aquele doc em ordem de leitura), **injeção da
+  (pergunta "capítulo 1" puxa só aquele doc em ordem de leitura), **GraphRAG-lite**
+  (`graph_context`: detecta entidades citadas na pergunta e injeta o subgrafo de
+  relações ao redor — seeds + 1 hop — como fatos estruturados; resolve perguntas
+  multi-hop "quem é o mestre de X" que o cosseno erra), **injeção da
   abertura** (`ordinal 0`) para perguntas posicionais, **reranking opcional**
   (`rerank`: uma chamada de LLM reordena os trechos por relevância antes de montar
   o contexto) e **citações declaradas pelo LLM**: cada trecho vai rotulado
@@ -80,6 +83,13 @@ renomear, excluir). Comandos: `list_sessions`, `create_session`,
   "Cesar Magnus" de um run anterior). Nomes canônicos reescrevem também as relações.
 - `config.rs` — `RagConfig` (`config.json`, global).
 - `lib.rs` — estado + comandos Tauri.
+
+**Relações manuais (curadoria do grafo)**: o usuário adiciona/remove arestas na
+aba Grafo (`RelationsEditor` em `CharactersView`). Comandos `add_relation` /
+`remove_relation` (chave natural `from,to,label`, case-insensitive; `reset_extracted`
+nunca apaga relações). Isso alimenta o GraphRAG — como a extração automática fica
+mais imprecisa a cada capítulo novo, ligações curadas à mão mantêm a recuperação
+correta.
 
 ### Comandos Tauri
 
@@ -141,6 +151,10 @@ incremental por padrão, `true` re-scaneia tudo), `add_character`, `add_place`,
 
 ## Ideias — precisão da resposta (chat)
 
+- **RAG avançado / CRAG (Corrective RAG)**: após gerar, o modelo se auto-avalia
+  ("isso responde?"); se não, descarta as fontes fracas e re-busca uma vez antes
+  de revisar a resposta. Opcional (custa +1..2 chamadas — pesa em local), bom para
+  o modo precisão. Limitar a 1 re-busca (nada de loop aberto estilo agentic puro).
 - **Fusão de rankings (RRF)**: combinar semântico e lexical por Reciprocal Rank
   Fusion em vez de append+dedup — ordena melhor quando os dois discordam.
 - **Threshold de similaridade**: descartar chunk abaixo de X de cosseno (menos
