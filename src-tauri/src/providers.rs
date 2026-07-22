@@ -51,14 +51,25 @@ pub async fn chat(
     cfg: &RagConfig,
     messages: &[ChatMessage],
 ) -> AppResult<String> {
+    chat_as(client, cfg, messages, &cfg.llm_model).await
+}
+
+/// Like [`chat`] but with an explicit model, so callers (entity extraction) can
+/// use a dedicated smaller model without touching the chat model.
+pub async fn chat_as(
+    client: &reqwest::Client,
+    cfg: &RagConfig,
+    messages: &[ChatMessage],
+    model: &str,
+) -> AppResult<String> {
     match cfg.llm_provider.as_str() {
         "openai" => {
-            oai_chat(client, &cfg.openai_base_url, &cfg.openai_api_key, &cfg.llm_model, messages, true, cfg.temperature).await
+            oai_chat(client, &cfg.openai_base_url, &cfg.openai_api_key, model, messages, true, cfg.temperature).await
         }
         "vllm" => {
-            oai_chat(client, &cfg.vllm_base_url, &cfg.vllm_api_key, &cfg.llm_model, messages, false, cfg.temperature).await
+            oai_chat(client, &cfg.vllm_base_url, &cfg.vllm_api_key, model, messages, false, cfg.temperature).await
         }
-        "ollama" => ollama_chat(client, cfg, messages).await,
+        "ollama" => ollama_chat(client, cfg, messages, model).await,
         other => Err(AppError::Provider(format!(
             "provedor de LLM desconhecido: {other}"
         ))),
@@ -157,6 +168,7 @@ async fn ollama_chat(
     client: &reqwest::Client,
     cfg: &RagConfig,
     messages: &[ChatMessage],
+    model: &str,
 ) -> AppResult<String> {
     let base = cfg.ollama_endpoint.trim_end_matches('/');
     let url = format!("{base}/api/chat");
@@ -165,7 +177,7 @@ async fn ollama_chat(
         .map(|m| json!({ "role": m.role, "content": m.content }))
         .collect();
     let req = client.post(&url).json(&json!({
-        "model": cfg.llm_model,
+        "model": model,
         "messages": msgs,
         "stream": false,
         "options": ollama_options(cfg),
