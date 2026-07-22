@@ -235,7 +235,18 @@ async fn ask(
     let vault = state.active()?;
     let cfg = state.config.lock().await.clone();
     let chunks = state.db.load_chunks(&vault)?;
-    rag::ask(&state.client, &cfg, &chunks, question, history.unwrap_or_default()).await
+    let (names, relations) = graph_inputs(&state, &vault)?;
+    rag::ask(&state.client, &cfg, &chunks, question, history.unwrap_or_default(), &names, &relations).await
+}
+
+/// Entity names + relations for the active vault, fed to GraphRAG-lite so the
+/// retriever can inject the relation subgraph around entities the question names.
+fn graph_inputs(state: &tauri::State<'_, AppState>, vault: &str) -> AppResult<(Vec<String>, Vec<db::Relation>)> {
+    let ents = state.db.entities(vault)?;
+    let mut names: Vec<String> = Vec::with_capacity(ents.characters.len() + ents.places.len());
+    names.extend(ents.characters.iter().map(|c| c.name.clone()));
+    names.extend(ents.places.iter().map(|p| p.name.clone()));
+    Ok((names, ents.relations))
 }
 
 /// Streamed events sent to the frontend during `ask_stream`.
@@ -259,6 +270,7 @@ async fn ask_stream(
     let vault = state.active()?;
     let cfg = state.config.lock().await.clone();
     let chunks = state.db.load_chunks(&vault)?;
+    let (names, relations) = graph_inputs(&state, &vault)?;
 
     // Fresh generation — clear any leftover cancel request.
     state.cancel.store(false, Ordering::Relaxed);
@@ -270,6 +282,8 @@ async fn ask_stream(
         &chunks,
         question,
         history.unwrap_or_default(),
+        &names,
+        &relations,
         &state.cancel,
         |tok| {
             let _ = ch.send(StreamEvent::Token { value: tok.to_string() });
@@ -438,6 +452,21 @@ fn update_place(state: tauri::State<'_, AppState>, place: Place) -> AppResult<()
     state.db.update_place(&vault, &place)
 }
 
+/// Manually add a relation (graph edge) between two entities. Feeds GraphRAG so
+/// user-curated links improve retrieval as more chapters make auto-extraction noisier.
+#[tauri::command]
+fn add_relation(state: tauri::State<'_, AppState>, relation: db::Relation) -> AppResult<()> {
+    let vault = state.active()?;
+    state.db.add_relation(&vault, &relation)
+}
+
+/// Delete a relation by its (from, to, label) triple.
+#[tauri::command]
+fn remove_relation(state: tauri::State<'_, AppState>, relation: db::Relation) -> AppResult<()> {
+    let vault = state.active()?;
+    state.db.remove_relation(&vault, &relation)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let builder = tauri::Builder::default();
@@ -500,7 +529,9 @@ pub fn run() {
             add_character,
             add_place,
             update_character,
-            update_place
+            update_place,
+            add_relation,
+            remove_relation
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
