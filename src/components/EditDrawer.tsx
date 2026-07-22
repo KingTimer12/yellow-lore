@@ -4,7 +4,9 @@ import { state, actions } from "../store";
 export default function EditDrawer() {
   const form = () => state.editForm;
   const isCharacter = () => state.editing?.kind === "character";
-  const title = () => (isCharacter() ? "Editar personagem" : "Editar lugar");
+  const isCreating = () => !!state.editing?.creating;
+  const noun = () => (isCharacter() ? "personagem" : "lugar");
+  const title = () => (isCreating() ? `Adicionar ${noun()}` : `Editar ${noun()}`);
   const secondaryLabel = () => (isCharacter() ? "Papel" : "Tipo");
 
   return (
@@ -49,11 +51,13 @@ export default function EditDrawer() {
               />
             </Show>
 
-            <div class="bg-hover rounded-10px p-3.5 flex flex-col gap-1.5">
-              <div class="text-11px font-bold text-fg-muted uppercase tracking-[0.04em]">Fonte original</div>
-              <div class="text-12.5px font-semibold">{form()!.sourceDoc}</div>
-              <div class="text-12.5px text-fg-muted italic leading-[1.5]">{form()!.sourceQuote}</div>
-            </div>
+            <Show when={!isCreating() && form()!.sourceDoc}>
+              <div class="bg-hover rounded-10px p-3.5 flex flex-col gap-1.5">
+                <div class="text-11px font-bold text-fg-muted uppercase tracking-[0.04em]">Fonte original</div>
+                <div class="text-12.5px font-semibold">{form()!.sourceDoc}</div>
+                <div class="text-12.5px text-fg-muted italic leading-[1.5]">{form()!.sourceQuote}</div>
+              </div>
+            </Show>
           </div>
 
           <div class="flex gap-2.5 mt-6.5">
@@ -67,7 +71,7 @@ export default function EditDrawer() {
               onClick={actions.saveEdit}
               class="flex-1 text-center py-3 rounded-8px bg-accent text-accent-fg text-13.5px font-bold cursor-pointer transition-transform active:scale-95"
             >
-              Salvar
+              {isCreating() ? "Adicionar" : "Salvar"}
             </div>
           </div>
         </div>

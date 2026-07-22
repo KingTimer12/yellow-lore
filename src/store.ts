@@ -84,7 +84,8 @@ export type Settings = {
   dedupEntities: boolean;
 };
 
-export type EditTarget = { kind: "character" | "place"; id: string } | null;
+// `creating` marks a brand-new entity (manual add) vs editing an existing one.
+export type EditTarget = { kind: "character" | "place"; id: string; creating?: boolean } | null;
 
 export type EditForm = {
   name: string;
@@ -481,12 +482,14 @@ export const actions = {
   setCharactersTab: (charactersTab: "grid" | "graph") => setState({ charactersTab }),
 
   /// Run LLM extraction over the active vault's knowledge → characters/places/relations.
-  async extractEntities() {
+  /// Incremental by default (only new documents); `force` re-scans everything.
+  /// Entities the user edited or added are never overwritten either way.
+  async extractEntities(force = false) {
     if (state.extracting) return;
     if (!isTauri) return;
     setState("extracting", true);
     try {
-      const entities = await api.extractEntities();
+      const entities = await api.extractEntities(force);
       setState({
         characters: entities.characters,
         places: entities.places,
@@ -498,6 +501,14 @@ export const actions = {
     } finally {
       setState("extracting", false);
     }
+  },
+
+  /// Open the drawer to create a new entity by hand (status "Adicionado").
+  openCreate: (kind: "character" | "place") => {
+    setState({
+      editing: { kind, id: crypto.randomUUID(), creating: true },
+      editForm: { name: "", role: "", summary: "", traitsText: "", sourceDoc: "", sourceQuote: "" },
+    });
   },
 
   openEdit: (kind: "character" | "place", id: string) => {
@@ -525,28 +536,62 @@ export const actions = {
     const editing = state.editing;
     const form = state.editForm;
     if (!editing || !form) return;
+    if (!form.name.trim()) return; // a name is the one required field
+    const creating = !!editing.creating;
+    // Manual adds are "Adicionado"; edits become "Editado". Both are protected
+    // from being overwritten by future extraction runs.
+    const status = creating ? "Adicionado" : "Editado";
     if (editing.kind === "character") {
-      setState("characters", (c) => c.id === editing.id, produce((c: Character) => {
-        c.name = form.name;
-        c.role = form.role;
-        c.summary = form.summary;
-        c.traits = form.traitsText.split(",").map((t) => t.trim()).filter(Boolean);
-        c.status = "Editado";
-      }));
-      if (isTauri) {
-        const c = state.characters.find((x) => x.id === editing.id);
-        if (c) await api.updateCharacter({ ...c }).catch((e) => console.error(e));
+      if (creating) {
+        const c: Character = {
+          id: editing.id,
+          name: form.name,
+          role: form.role,
+          summary: form.summary,
+          traits: form.traitsText.split(",").map((t) => t.trim()).filter(Boolean),
+          status,
+          sourceDoc: "",
+          sourceQuote: "",
+        };
+        setState("characters", (list) => [c, ...list]);
+        if (isTauri) await api.addCharacter({ ...c }).catch((e) => console.error(e));
+      } else {
+        setState("characters", (c) => c.id === editing.id, produce((c: Character) => {
+          c.name = form.name;
+          c.role = form.role;
+          c.summary = form.summary;
+          c.traits = form.traitsText.split(",").map((t) => t.trim()).filter(Boolean);
+          c.status = status;
+        }));
+        if (isTauri) {
+          const c = state.characters.find((x) => x.id === editing.id);
+          if (c) await api.updateCharacter({ ...c }).catch((e) => console.error(e));
+        }
       }
     } else {
-      setState("places", (p) => p.id === editing.id, produce((p: Place) => {
-        p.name = form.name;
-        p.type = form.role;
-        p.summary = form.summary;
-        p.status = "Editado";
-      }));
-      if (isTauri) {
-        const p = state.places.find((x) => x.id === editing.id);
-        if (p) await api.updatePlace({ ...p }).catch((e) => console.error(e));
+      if (creating) {
+        const p: Place = {
+          id: editing.id,
+          name: form.name,
+          type: form.role,
+          summary: form.summary,
+          status,
+          sourceDoc: "",
+          sourceQuote: "",
+        };
+        setState("places", (list) => [p, ...list]);
+        if (isTauri) await api.addPlace({ ...p }).catch((e) => console.error(e));
+      } else {
+        setState("places", (p) => p.id === editing.id, produce((p: Place) => {
+          p.name = form.name;
+          p.type = form.role;
+          p.summary = form.summary;
+          p.status = status;
+        }));
+        if (isTauri) {
+          const p = state.places.find((x) => x.id === editing.id);
+          if (p) await api.updatePlace({ ...p }).catch((e) => console.error(e));
+        }
       }
     }
     setState({ editing: null, editForm: null });

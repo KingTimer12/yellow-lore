@@ -11,13 +11,30 @@ export default function PlacesView() {
             Locais e resumos de lore extraídos da base — edite para corrigir
           </div>
         </div>
-        <button
-          onClick={() => actions.extractEntities()}
-          disabled={state.extracting}
-          class="px-3.5 py-2 rounded-8px bg-accent text-accent-fg text-12.5px font-bold cursor-pointer border-none transition-transform active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed"
-        >
-          {state.extracting ? "Extraindo..." : "Extrair da base"}
-        </button>
+        <div class="flex items-center gap-2.5">
+          <button
+            onClick={() => actions.openCreate("place")}
+            class="px-3.5 py-2 rounded-8px border border-border bg-panel text-fg text-12.5px font-bold cursor-pointer transition-transform active:scale-95 hover:border-accent"
+          >
+            + Adicionar
+          </button>
+          <button
+            onClick={() => actions.extractEntities(false)}
+            disabled={state.extracting}
+            title="Extrai apenas dos documentos novos"
+            class="px-3.5 py-2 rounded-8px bg-accent text-accent-fg text-12.5px font-bold cursor-pointer border-none transition-transform active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            {state.extracting ? "Extraindo..." : "Extrair novos"}
+          </button>
+          <button
+            onClick={() => { if (confirm("Re-extrair TODOS os documentos? Lugares editados ou adicionados por você são preservados.")) actions.extractEntities(true); }}
+            disabled={state.extracting}
+            title="Re-processa todos os documentos (preserva editados/adicionados)"
+            class="px-2.5 py-2 rounded-8px border border-border bg-panel text-fg-muted text-12.5px font-semibold cursor-pointer transition-colors hover:text-fg disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            Tudo
+          </button>
+        </div>
       </div>
 
       <Show when={state.places.length === 0}>
@@ -48,6 +65,7 @@ export default function PlacesView() {
                   classList={{
                     "bg-accent-soft text-accent": p.status === "Extraído",
                     "bg-success-soft text-success": p.status === "Editado",
+                    "bg-hover text-fg": p.status === "Adicionado",
                   }}
                 >
                   {p.status}

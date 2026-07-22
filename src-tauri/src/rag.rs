@@ -561,7 +561,10 @@ pub async fn extract_entities(
     // Split the whole corpus into ~12k-char windows on chunk boundaries, run the
     // LLM per window, and merge — so large works are covered, not just the head.
     const WINDOW_CHARS: usize = 12_000;
-    const MAX_WINDOWS: usize = 12; // cost/time guard for very large vaults
+    // Cost/time guard. Raised from 12 — a 12-chapter work overflowed the old cap
+    // and silently dropped later chapters (missing their characters). Incremental
+    // extraction keeps each run small, so a higher ceiling rarely bites.
+    const MAX_WINDOWS: usize = 40;
     let mut windows: Vec<String> = Vec::new();
     let mut cur = String::new();
     for c in chunks {

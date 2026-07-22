@@ -453,8 +453,90 @@ impl Db {
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
-    /// Replace all extracted entities for a vault (extraction is a full refresh).
-    pub fn replace_entities(
+    /// Insert one manually-created character (status typically "Adicionado").
+    pub fn add_character(&self, vault: &str, c: &Character) -> AppResult<()> {
+        let traits = serde_json::to_string(&c.traits)?;
+        self.lock().execute(
+            "INSERT INTO characters (id, vault_id, name, role, summary, traits, status, source_doc, source_quote)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            params![c.id, vault, c.name, c.role, c.summary, traits, c.status, c.source_doc, c.source_quote],
+        ).map_err(sql)?;
+        Ok(())
+    }
+
+    /// Insert one manually-created place (status typically "Adicionado").
+    pub fn add_place(&self, vault: &str, p: &Place) -> AppResult<()> {
+        self.lock().execute(
+            "INSERT INTO places (id, vault_id, name, kind, summary, status, source_doc, source_quote)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![p.id, vault, p.name, p.kind, p.summary, p.status, p.source_doc, p.source_quote],
+        ).map_err(sql)?;
+        Ok(())
+    }
+
+    /// Doc ids already covered by a previous extraction (meta table, per vault).
+    pub fn extracted_docs(&self, vault: &str) -> AppResult<std::collections::HashSet<String>> {
+        let conn = self.lock();
+        let raw: Option<String> = conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = ?1",
+                params![format!("extracted:{vault}")],
+                |r| r.get::<_, String>(0),
+            )
+            .ok();
+        Ok(raw
+            .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
+            .unwrap_or_default()
+            .into_iter()
+            .collect())
+    }
+
+    /// Add doc ids to the extracted set (union with what's already recorded).
+    pub fn mark_extracted(&self, vault: &str, ids: &[String]) -> AppResult<()> {
+        let mut set = self.extracted_docs(vault)?;
+        for id in ids {
+            set.insert(id.clone());
+        }
+        let list: Vec<String> = set.into_iter().collect();
+        let json = serde_json::to_string(&list)?;
+        self.lock()
+            .execute(
+                "INSERT INTO meta (key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = ?2",
+                params![format!("extracted:{vault}"), json],
+            )
+            .map_err(sql)?;
+        Ok(())
+    }
+
+    /// Full re-extraction reset: drop only auto-extracted entities (status
+    /// "Extraído") and clear the extracted-docs set, so a forced re-run rebuilds
+    /// them from scratch. Edited/added entities are left completely untouched.
+    pub fn reset_extracted(&self, vault: &str) -> AppResult<()> {
+        let conn = self.lock();
+        conn.execute(
+            "DELETE FROM characters WHERE vault_id = ?1 AND status = 'Extraído'",
+            params![vault],
+        )
+        .map_err(sql)?;
+        conn.execute(
+            "DELETE FROM places WHERE vault_id = ?1 AND status = 'Extraído'",
+            params![vault],
+        )
+        .map_err(sql)?;
+        conn.execute(
+            "DELETE FROM meta WHERE key = ?1",
+            params![format!("extracted:{vault}")],
+        )
+        .map_err(sql)?;
+        Ok(())
+    }
+
+    /// Merge freshly extracted entities into the vault WITHOUT deleting anything.
+    /// Entities the user edited or added (status "Editado"/"Adicionado") are never
+    /// modified. Existing auto-extracted entities with the same name are enriched
+    /// (longer summary wins, traits unioned); genuinely new names are inserted.
+    pub fn merge_extracted(
         &self,
         vault: &str,
         characters: &[Character],
@@ -463,30 +545,138 @@ impl Db {
     ) -> AppResult<()> {
         let mut conn = self.lock();
         let tx = conn.transaction().map_err(sql)?;
-        for t in ["characters", "places", "relations"] {
-            tx.execute(&format!("DELETE FROM {t} WHERE vault_id = ?1"), params![vault]).map_err(sql)?;
+
+        // Existing characters by lowercased name → (id, status, summary, traits_json, role).
+        let mut existing_chars: std::collections::HashMap<String, (String, String, String, String, String)> =
+            Default::default();
+        {
+            let mut stmt = tx
+                .prepare("SELECT id, name, status, summary, traits, role FROM characters WHERE vault_id = ?1")
+                .map_err(sql)?;
+            let rows = stmt
+                .query_map(params![vault], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, String>(4)?,
+                        r.get::<_, String>(5)?,
+                    ))
+                })
+                .map_err(sql)?;
+            for row in rows.filter_map(|r| r.ok()) {
+                let (id, name, status, summary, traits, role) = row;
+                existing_chars.insert(name.to_lowercase(), (id, status, summary, traits, role));
+            }
         }
+
         for c in characters {
-            let traits = serde_json::to_string(&c.traits)?;
-            tx.execute(
-                "INSERT INTO characters (id, vault_id, name, role, summary, traits, status, source_doc, source_quote)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
-                params![c.id, vault, c.name, c.role, c.summary, traits, c.status, c.source_doc, c.source_quote],
-            ).map_err(sql)?;
+            let key = c.name.to_lowercase();
+            match existing_chars.get(&key) {
+                Some((_, status, _, _, _)) if is_protected(status) => {
+                    // User-owned — never touch.
+                }
+                Some((id, _, summary, traits, role)) => {
+                    // Enrich the existing auto-extracted row.
+                    let new_summary = if c.summary.len() > summary.len() { &c.summary } else { summary };
+                    let mut merged: Vec<String> =
+                        serde_json::from_str(traits).unwrap_or_default();
+                    for t in &c.traits {
+                        if !merged.iter().any(|e| e.eq_ignore_ascii_case(t)) {
+                            merged.push(t.clone());
+                        }
+                    }
+                    let merged_json = serde_json::to_string(&merged)?;
+                    let new_role = if role.trim().is_empty() { &c.role } else { role };
+                    tx.execute(
+                        "UPDATE characters SET summary=?2, traits=?3, role=?4 WHERE id=?1",
+                        params![id, new_summary, merged_json, new_role],
+                    )
+                    .map_err(sql)?;
+                }
+                None => {
+                    let traits = serde_json::to_string(&c.traits)?;
+                    tx.execute(
+                        "INSERT INTO characters (id, vault_id, name, role, summary, traits, status, source_doc, source_quote)
+                         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                        params![c.id, vault, c.name, c.role, c.summary, traits, c.status, c.source_doc, c.source_quote],
+                    ).map_err(sql)?;
+                }
+            }
         }
+
+        // Existing places by lowercased name → (id, status, summary).
+        let mut existing_places: std::collections::HashMap<String, (String, String, String)> =
+            Default::default();
+        {
+            let mut stmt = tx
+                .prepare("SELECT id, name, status, summary FROM places WHERE vault_id = ?1")
+                .map_err(sql)?;
+            let rows = stmt
+                .query_map(params![vault], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                    ))
+                })
+                .map_err(sql)?;
+            for row in rows.filter_map(|r| r.ok()) {
+                let (id, name, status, summary) = row;
+                existing_places.insert(name.to_lowercase(), (id, status, summary));
+            }
+        }
+
         for p in places {
-            tx.execute(
-                "INSERT INTO places (id, vault_id, name, kind, summary, status, source_doc, source_quote)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
-                params![p.id, vault, p.name, p.kind, p.summary, p.status, p.source_doc, p.source_quote],
-            ).map_err(sql)?;
+            let key = p.name.to_lowercase();
+            match existing_places.get(&key) {
+                Some((_, status, _)) if is_protected(status) => {}
+                Some((id, _, summary)) => {
+                    let new_summary = if p.summary.len() > summary.len() { &p.summary } else { summary };
+                    tx.execute(
+                        "UPDATE places SET summary=?2 WHERE id=?1",
+                        params![id, new_summary],
+                    )
+                    .map_err(sql)?;
+                }
+                None => {
+                    tx.execute(
+                        "INSERT INTO places (id, vault_id, name, kind, summary, status, source_doc, source_quote)
+                         VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+                        params![p.id, vault, p.name, p.kind, p.summary, p.status, p.source_doc, p.source_quote],
+                    ).map_err(sql)?;
+                }
+            }
+        }
+
+        // Relations: add only genuinely new (from, to, label) triples.
+        let mut existing_rel: std::collections::HashSet<(String, String, String)> = Default::default();
+        {
+            let mut stmt = tx
+                .prepare("SELECT from_name, to_name, label FROM relations WHERE vault_id = ?1")
+                .map_err(sql)?;
+            let rows = stmt
+                .query_map(params![vault], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+                })
+                .map_err(sql)?;
+            for row in rows.filter_map(|r| r.ok()) {
+                let (f, t, l) = row;
+                existing_rel.insert((f.to_lowercase(), t.to_lowercase(), l.to_lowercase()));
+            }
         }
         for r in relations {
-            tx.execute(
-                "INSERT INTO relations (id, vault_id, from_name, to_name, label) VALUES (?1,?2,?3,?4,?5)",
-                params![Uuid::new_v4().to_string(), vault, r.from, r.to, r.label],
-            ).map_err(sql)?;
+            let key = (r.from.to_lowercase(), r.to.to_lowercase(), r.label.to_lowercase());
+            if existing_rel.insert(key) {
+                tx.execute(
+                    "INSERT INTO relations (id, vault_id, from_name, to_name, label) VALUES (?1,?2,?3,?4,?5)",
+                    params![Uuid::new_v4().to_string(), vault, r.from, r.to, r.label],
+                ).map_err(sql)?;
+            }
         }
+
         tx.commit().map_err(sql)?;
         Ok(())
     }
@@ -610,6 +800,12 @@ impl Db {
 
 fn sql(e: rusqlite::Error) -> AppError {
     AppError::Msg(format!("erro no banco: {e}"))
+}
+
+/// A user-owned entity that extraction must never overwrite: one the user edited
+/// or added by hand.
+fn is_protected(status: &str) -> bool {
+    status == "Editado" || status == "Adicionado"
 }
 
 /// Vectors are stored as a compact little-endian f32 BLOB (4 bytes/dim) instead

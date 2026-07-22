@@ -71,7 +71,11 @@ export const api = {
 
   // entities
   getEntities: () => tauriInvoke<Entities>("get_entities"),
-  extractEntities: () => tauriInvoke<Entities>("extract_entities"),
+  // Incremental by default; `force` re-scans every document (still preserving
+  // edited/added entities).
+  extractEntities: (force = false) => tauriInvoke<Entities>("extract_entities", { force }),
+  addCharacter: (character: Character) => tauriInvoke<void>("add_character", { character }),
+  addPlace: (place: Place) => tauriInvoke<void>("add_place", { place }),
   updateCharacter: (character: Character) => tauriInvoke<void>("update_character", { character }),
   updatePlace: (place: Place) => tauriInvoke<void>("update_place", { place }),
 };

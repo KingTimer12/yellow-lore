@@ -362,15 +362,61 @@ fn get_entities(state: tauri::State<'_, AppState>) -> AppResult<Entities> {
     state.db.entities(&vault)
 }
 
+/// Extract entities from the vault. Incremental by default: only documents not
+/// covered by a previous run are scanned, and results are MERGED — entities the
+/// user edited or added are never overwritten. `force = true` re-scans every
+/// document (still preserving edited/added entities).
 #[tauri::command]
-async fn extract_entities(state: tauri::State<'_, AppState>) -> AppResult<Entities> {
+async fn extract_entities(
+    state: tauri::State<'_, AppState>,
+    force: Option<bool>,
+) -> AppResult<Entities> {
     let vault = state.active()?;
     let cfg = state.config.lock().await.clone();
     let chunks = state.db.load_chunks(&vault)?;
+    let force = force.unwrap_or(false);
+
+    if force {
+        state.db.reset_extracted(&vault)?;
+    }
+
+    // Pick the chunks to scan: everything on a forced run, otherwise only chunks
+    // from documents not yet extracted.
+    let done = state.db.extracted_docs(&vault)?;
+    let target: Vec<_> = if force {
+        chunks.clone()
+    } else {
+        chunks.iter().filter(|c| !done.contains(&c.doc_id)).cloned().collect()
+    };
+
+    // Nothing new to do — return the current entities untouched.
+    if target.is_empty() {
+        return state.db.entities(&vault);
+    }
+
     let (characters, places, relations) =
-        rag::extract_entities(&state.client, &cfg, &chunks).await?;
-    state.db.replace_entities(&vault, &characters, &places, &relations)?;
+        rag::extract_entities(&state.client, &cfg, &target).await?;
+    state.db.merge_extracted(&vault, &characters, &places, &relations)?;
+
+    // Record the documents we just covered so the next run skips them.
+    let mut ids: Vec<String> = target.iter().map(|c| c.doc_id.clone()).collect();
+    ids.sort();
+    ids.dedup();
+    state.db.mark_extracted(&vault, &ids)?;
+
     state.db.entities(&vault)
+}
+
+#[tauri::command]
+fn add_character(state: tauri::State<'_, AppState>, character: Character) -> AppResult<()> {
+    let vault = state.active()?;
+    state.db.add_character(&vault, &character)
+}
+
+#[tauri::command]
+fn add_place(state: tauri::State<'_, AppState>, place: Place) -> AppResult<()> {
+    let vault = state.active()?;
+    state.db.add_place(&vault, &place)
 }
 
 #[tauri::command]
@@ -444,6 +490,8 @@ pub fn run() {
             add_message,
             get_entities,
             extract_entities,
+            add_character,
+            add_place,
             update_character,
             update_place
         ])
