@@ -146,7 +146,8 @@ impl Db {
                 summary TEXT, status TEXT, source_doc TEXT, source_quote TEXT
             );
             CREATE TABLE IF NOT EXISTS relations (
-                id TEXT PRIMARY KEY, vault_id TEXT NOT NULL, from_name TEXT, to_name TEXT, label TEXT
+                id TEXT PRIMARY KEY, vault_id TEXT NOT NULL, from_name TEXT, to_name TEXT, label TEXT,
+                status TEXT NOT NULL DEFAULT 'Extraído'
             );
             CREATE TABLE IF NOT EXISTS sessions (
                 id TEXT PRIMARY KEY, vault_id TEXT NOT NULL, title TEXT,
@@ -164,6 +165,24 @@ impl Db {
             ",
         )
         .map_err(sql)?;
+        // Migration: `relations.status` was added later. Backfill databases created
+        // before it — existing rows default to 'Extraído' (they predate manual
+        // editing); the UI creates new ones as 'Manual', which extraction protects.
+        let has_status = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('relations') WHERE name = 'status'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|c| c > 0)
+            .unwrap_or(false);
+        if !has_status {
+            conn.execute(
+                "ALTER TABLE relations ADD COLUMN status TEXT NOT NULL DEFAULT 'Extraído'",
+                [],
+            )
+            .ok();
+        }
         Ok(Db { conn: Mutex::new(conn) })
     }
 
@@ -611,24 +630,27 @@ impl Db {
             if *alias == canon.to_lowercase() {
                 continue;
             }
+            // User-created/edited relations (status 'Manual') are never rewritten —
+            // only auto-extracted endpoints are folded onto the canonical name.
             tx.execute(
-                "UPDATE relations SET from_name=?3 WHERE vault_id=?1 AND lower(from_name)=?2",
+                "UPDATE relations SET from_name=?3 WHERE vault_id=?1 AND lower(from_name)=?2 AND status<>'Manual'",
                 params![vault, alias, canon],
             )
             .map_err(sql)?;
             tx.execute(
-                "UPDATE relations SET to_name=?3 WHERE vault_id=?1 AND lower(to_name)=?2",
+                "UPDATE relations SET to_name=?3 WHERE vault_id=?1 AND lower(to_name)=?2 AND status<>'Manual'",
                 params![vault, alias, canon],
             )
             .map_err(sql)?;
         }
         tx.execute(
-            "DELETE FROM relations WHERE vault_id=?1 AND lower(from_name)=lower(to_name)",
+            "DELETE FROM relations WHERE vault_id=?1 AND status<>'Manual' AND lower(from_name)=lower(to_name)",
             params![vault],
         )
         .map_err(sql)?;
+        // Dedup extracted duplicates only; Manual edges are protected.
         tx.execute(
-            "DELETE FROM relations WHERE vault_id=?1 AND id NOT IN \
+            "DELETE FROM relations WHERE vault_id=?1 AND status<>'Manual' AND id NOT IN \
              (SELECT min(id) FROM relations WHERE vault_id=?1 \
               GROUP BY lower(from_name), lower(to_name), lower(label))",
             params![vault],
@@ -657,7 +679,8 @@ impl Db {
             return Ok(());
         }
         conn.execute(
-            "INSERT INTO relations (id, vault_id, from_name, to_name, label) VALUES (?1,?2,?3,?4,?5)",
+            "INSERT INTO relations (id, vault_id, from_name, to_name, label, status)
+             VALUES (?1,?2,?3,?4,?5,'Manual')",
             params![Uuid::new_v4().to_string(), vault, r.from, r.to, r.label],
         )
         .map_err(sql)?;
@@ -1006,7 +1029,8 @@ impl Db {
             let key = (r.from.to_lowercase(), r.to.to_lowercase(), r.label.to_lowercase());
             if existing_rel.insert(key) {
                 tx.execute(
-                    "INSERT INTO relations (id, vault_id, from_name, to_name, label) VALUES (?1,?2,?3,?4,?5)",
+                    "INSERT INTO relations (id, vault_id, from_name, to_name, label, status)
+                     VALUES (?1,?2,?3,?4,?5,'Extraído')",
                     params![Uuid::new_v4().to_string(), vault, r.from, r.to, r.label],
                 ).map_err(sql)?;
             }
