@@ -8,13 +8,13 @@ export type StoredMessage = { id: string; role: "user" | "assistant"; text: stri
 export const isTauri =
   typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
-export type Answer = { text: string; sources: { doc: string; quote: string; text: string }[] };
+export type Answer = { text: string; sources: Source[] };
 export type Entities = { characters: Character[]; places: Place[]; relations: Relation[] };
 
 // Streaming events emitted by the `ask_stream` command.
 export type StreamEvent =
   | { type: "token"; value: string }
-  | { type: "done"; sources: { doc: string; quote: string; text: string }[] }
+  | { type: "done"; sources: Source[] }
   | { type: "error"; message: string };
 
 export const api = {
@@ -86,10 +86,10 @@ export const api = {
 export function mockAnswer(question: string): Message {
   const q = question.toLowerCase();
   if (q.includes("kaelen"))
-    return { role: "assistant", text: "Kaelen Thorne é um mercenário contratado para escoltar Elandra Voss através da Floresta de Vharren. Inicialmente motivado apenas pelo pagamento, desenvolve lealdade genuína a ela ao longo da jornada.", sources: [{ doc: "Crônicas de Vharren - Cap. 1-5.pdf", quote: '"Kaelen aceitou o contrato…"', text: "Kaelen aceitou o contrato sem saber que a exilada guardava mais segredos do que moedas para pagá-lo. A jornada pela Floresta de Vharren mudaria isso." }] };
+    return { role: "assistant", text: "Kaelen Thorne é um mercenário contratado para escoltar Elandra Voss através da Floresta de Vharren. Inicialmente motivado apenas pelo pagamento, desenvolve lealdade genuína a ela ao longo da jornada.", sources: [{ doc: "Crônicas de Vharren - Cap. 1-5.pdf", quote: '"Kaelen aceitou o contrato…"', text: "Kaelen aceitou o contrato sem saber que a exilada guardava mais segredos do que moedas para pagá-lo. A jornada pela Floresta de Vharren mudaria isso.", mark: 1 }] };
   if (q.includes("elandra"))
-    return { role: "assistant", text: "Elandra Voss é a protagonista: ex-arquivista da corte, exilada de Nym após ser acusada de traição. Busca provar sua inocência com a ajuda de Kaelen Thorne.", sources: [{ doc: "Crônicas de Vharren - Cap. 1-5.pdf", quote: '"Elandra jamais esqueceria…"', text: "Elandra jamais esqueceria o dia em que a guarda a arrastou da Biblioteca Real, acusada de uma traição que não cometeu." }] };
+    return { role: "assistant", text: "Elandra Voss é a protagonista: ex-arquivista da corte, exilada de Nym após ser acusada de traição. Busca provar sua inocência com a ajuda de Kaelen Thorne.", sources: [{ doc: "Crônicas de Vharren - Cap. 1-5.pdf", quote: '"Elandra jamais esqueceria…"', text: "Elandra jamais esqueceria o dia em que a guarda a arrastou da Biblioteca Real, acusada de uma traição que não cometeu.", mark: 1 }] };
   if (q.includes("nym") || q.includes("conselho"))
-    return { role: "assistant", text: "Nym é a capital do reino, sede do Conselho e da Biblioteca Real de onde Elandra foi expulsa.", sources: [{ doc: "Notas de worldbuilding.txt", quote: '"Nym se ergue sobre sete pontes…"', text: "Nym se ergue sobre sete pontes, cada uma vigiada por um dos sete conselheiros. É a sede do Conselho e da Biblioteca Real." }] };
+    return { role: "assistant", text: "Nym é a capital do reino, sede do Conselho e da Biblioteca Real de onde Elandra foi expulsa.", sources: [{ doc: "Notas de worldbuilding.txt", quote: '"Nym se ergue sobre sete pontes…"', text: "Nym se ergue sobre sete pontes, cada uma vigiada por um dos sete conselheiros. É a sede do Conselho e da Biblioteca Real.", mark: 1 }] };
   return { role: "assistant", text: "(preview no navegador) Não encontrei um trecho direto sobre isso. Rode via `bun run tauri dev` para usar o RAG real. Tente Elandra, Kaelen ou Nym.", sources: [] };
 }

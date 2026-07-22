@@ -5,7 +5,7 @@ import { api, isTauri, mockAnswer } from "./api";
 
 export type View = "chat" | "knowledge" | "characters" | "places" | "settings";
 
-export type Source = { doc: string; quote: string; text: string };
+export type Source = { doc: string; quote: string; text: string; mark: number };
 
 export type Message = {
   role: "user" | "assistant";
@@ -139,6 +139,8 @@ export type State = {
   citation: { doc: string; passages: { quote: string; text: string }[] } | null;
   /// Free-text filter for the Characters grid (name / role / trait).
   charactersFilter: string;
+  /// Hover-card for an inline `[N]` citation marker in a reply (null = hidden).
+  sourcePop: { doc: string; text: string; x: number; y: number } | null;
   /// Hover-card for an entity mentioned in a chat reply (null = hidden). `x`/`y`
   /// are viewport coords of the mention; the popover anchors there.
   mention: {
@@ -223,6 +225,7 @@ const initial: State = {
   reindexing: false,
   citation: null,
   charactersFilter: "",
+  sourcePop: null,
   mention: null,
   dialog: null,
 };
@@ -684,6 +687,9 @@ export const actions = {
 
   showMention: (m: NonNullable<State["mention"]>) => setState("mention", m),
   hideMention: () => setState("mention", null),
+
+  showSourcePop: (s: NonNullable<State["sourcePop"]>) => setState("sourcePop", s),
+  hideSourcePop: () => setState("sourcePop", null),
 
   /// Show an informational dialog (replaces native `alert`).
   notify(message: string, title = "Aviso") {
