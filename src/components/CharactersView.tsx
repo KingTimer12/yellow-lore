@@ -8,15 +8,29 @@ export default function CharactersView() {
   // a large work yields dozens of characters. Summary is matched too as a bonus.
   const filtered = createMemo(() => {
     const q = state.charactersFilter.trim().toLowerCase();
-    if (!q) return state.characters;
-    return state.characters.filter(
-      (c) =>
-        c.name.toLowerCase().includes(q) ||
-        c.role.toLowerCase().includes(q) ||
-        c.summary.toLowerCase().includes(q) ||
-        c.traits.some((t) => t.toLowerCase().includes(q)),
-    );
+    const list = !q
+      ? state.characters
+      : state.characters.filter(
+          (c) =>
+            c.name.toLowerCase().includes(q) ||
+            c.role.toLowerCase().includes(q) ||
+            c.summary.toLowerCase().includes(q) ||
+            c.traits.some((t) => t.toLowerCase().includes(q)),
+        );
+    // Alphabetical by name — a large cast stays easy to scan.
+    return [...list].sort((a, b) => a.name.localeCompare(b.name, "pt"));
   });
+
+  function remove(e: MouseEvent, id: string, name: string) {
+    e.stopPropagation();
+    actions.askConfirm({
+      title: "Excluir personagem?",
+      message: `Excluir "${name}"? Também remove as relações dele no grafo. Esta ação não pode ser desfeita.`,
+      confirmLabel: "Excluir",
+      danger: true,
+      onConfirm: () => void actions.deleteEntity("character", id),
+    });
+  }
 
   return (
     <div class="p-8 overflow-y-auto h-full box-border flex flex-col gap-5.5 anim-view">
@@ -118,7 +132,7 @@ export default function CharactersView() {
             {(c, i) => (
               <div
                 onClick={() => actions.openEdit("character", c.id)}
-                class="bg-panel border border-border rounded-14px p-5 cursor-pointer flex flex-col gap-3 anim-stagger transition-all duration-150 hover:border-accent hover:-translate-y-0.5"
+                class="group bg-panel border border-border rounded-14px p-5 cursor-pointer flex flex-col gap-3 anim-stagger transition-all duration-150 hover:border-accent hover:-translate-y-0.5"
                 style={{ "animation-delay": `${i() * 45}ms` }}
               >
                 <div class="flex items-center gap-3">
@@ -142,6 +156,11 @@ export default function CharactersView() {
                   >
                     {c.status}
                   </div>
+                  <div
+                    onClick={(e) => remove(e, c.id, c.name)}
+                    title="Excluir personagem"
+                    class="i-lucide-trash-2 w-4 h-4 flex-none text-fg-muted opacity-0 group-hover:opacity-100 hover:text-danger transition-opacity"
+                  />
                 </div>
                 <div class="text-13px text-fg-muted leading-[1.5]">{c.summary}</div>
                 <div class="flex gap-1.5 flex-wrap content-start mt-auto min-h-72px">
@@ -179,6 +198,7 @@ function RelationsEditor() {
     const set = new Set<string>();
     for (const c of state.characters) set.add(c.name);
     for (const p of state.places) set.add(p.name);
+    for (const a of state.abilities) set.add(a.name);
     return [...set].sort((a, b) => a.localeCompare(b));
   });
 

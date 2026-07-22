@@ -3,7 +3,7 @@ import { api, isTauri, mockAnswer } from "./api";
 
 // ---- Domain types ---------------------------------------------------------
 
-export type View = "chat" | "knowledge" | "characters" | "places" | "settings";
+export type View = "chat" | "knowledge" | "characters" | "places" | "abilities" | "settings";
 
 export type Source = { doc: string; quote: string; text: string; mark: number };
 
@@ -57,6 +57,17 @@ export type Place = {
   sourceQuote: string;
 };
 
+/// A power/skill (e.g. "Previsão"). Same shape as Place; own tab + graph colour.
+export type Ability = {
+  id: string;
+  name: string;
+  type: string;
+  summary: string;
+  status: string;
+  sourceDoc: string;
+  sourceQuote: string;
+};
+
 export type Relation = { from: string; to: string; label: string };
 
 export type Vault = { id: string; name: string; createdAt: string };
@@ -94,8 +105,10 @@ export type Settings = {
   showThinking: boolean;
 };
 
+export type EntityKind = "character" | "place" | "ability";
+
 // `creating` marks a brand-new entity (manual add) vs editing an existing one.
-export type EditTarget = { kind: "character" | "place"; id: string; creating?: boolean } | null;
+export type EditTarget = { kind: EntityKind; id: string; creating?: boolean } | null;
 
 export type EditForm = {
   name: string;
@@ -125,6 +138,10 @@ export type State = {
   characters: Character[];
   relations: Relation[];
   places: Place[];
+  abilities: Ability[];
+  /// Free-text filters for the Places and Abilities grids (name / type).
+  placesFilter: string;
+  abilitiesFilter: string;
   editing: EditTarget;
   editForm: EditForm | null;
   settings: Settings;
@@ -215,6 +232,9 @@ const initial: State = {
   characters: [],
   relations: [],
   places: [],
+  abilities: [],
+  placesFilter: "",
+  abilitiesFilter: "",
   editing: null,
   editForm: null,
   settings: DEFAULT_SETTINGS,
@@ -255,6 +275,7 @@ async function loadActiveVault() {
     docs,
     characters: entities.characters,
     places: entities.places,
+    abilities: entities.abilities,
     relations: entities.relations,
     indexStale: index.stale,
     sessions,
@@ -322,7 +343,7 @@ export const actions = {
         s.vaults.push(vault);
         s.activeVaultId = vault.id;
         s.messages = [];
-        s.docs = []; s.characters = []; s.places = []; s.relations = [];
+        s.docs = []; s.characters = []; s.places = []; s.abilities = []; s.relations = [];
       }));
     }
   },
@@ -341,7 +362,7 @@ export const actions = {
         await actions.selectVault(remaining[0].id);
       } else {
         // No vaults left → back to the empty state.
-        setState({ activeVaultId: "", messages: [], docs: [], characters: [], places: [], relations: [], sessions: [], currentSessionId: "" });
+        setState({ activeVaultId: "", messages: [], docs: [], characters: [], places: [], abilities: [], relations: [], sessions: [], currentSessionId: "" });
       }
     }
   },
@@ -546,6 +567,7 @@ export const actions = {
       setState({
         characters: entities.characters,
         places: entities.places,
+        abilities: entities.abilities,
         relations: entities.relations,
       });
     } catch (e) {
@@ -557,24 +579,31 @@ export const actions = {
   },
 
   /// Open the drawer to create a new entity by hand (status "Adicionado").
-  openCreate: (kind: "character" | "place") => {
+  openCreate: (kind: EntityKind) => {
     setState({
       editing: { kind, id: crypto.randomUUID(), creating: true },
       editForm: { name: "", role: "", summary: "", traitsText: "", sourceDoc: "", sourceQuote: "" },
     });
   },
 
-  openEdit: (kind: "character" | "place", id: string) => {
+  openEdit: (kind: EntityKind, id: string) => {
     const entity =
       kind === "character"
         ? state.characters.find((c) => c.id === id)
-        : state.places.find((p) => p.id === id);
+        : kind === "place"
+          ? state.places.find((p) => p.id === id)
+          : state.abilities.find((a) => a.id === id);
     if (!entity) return;
     setState({
       editing: { kind, id },
       editForm: {
         name: entity.name,
-        role: kind === "character" ? (entity as Character).role : (entity as Place).type,
+        role:
+          kind === "character"
+            ? (entity as Character).role
+            : kind === "place"
+              ? (entity as Place).type
+              : (entity as Ability).type,
         summary: entity.summary,
         traitsText: kind === "character" ? (entity as Character).traits.join(", ") : "",
         sourceDoc: entity.sourceDoc,
@@ -621,7 +650,7 @@ export const actions = {
           if (c) await api.updateCharacter({ ...c }).catch((e) => console.error(e));
         }
       }
-    } else {
+    } else if (editing.kind === "place") {
       if (creating) {
         const p: Place = {
           id: editing.id,
@@ -646,9 +675,68 @@ export const actions = {
           if (p) await api.updatePlace({ ...p }).catch((e) => console.error(e));
         }
       }
+    } else {
+      if (creating) {
+        const a: Ability = {
+          id: editing.id,
+          name: form.name,
+          type: form.role,
+          summary: form.summary,
+          status,
+          sourceDoc: "",
+          sourceQuote: "",
+        };
+        setState("abilities", (list) => [a, ...list]);
+        if (isTauri) await api.addAbility({ ...a }).catch((e) => console.error(e));
+      } else {
+        setState("abilities", (a) => a.id === editing.id, produce((a: Ability) => {
+          a.name = form.name;
+          a.type = form.role;
+          a.summary = form.summary;
+          a.status = status;
+        }));
+        if (isTauri) {
+          const a = state.abilities.find((x) => x.id === editing.id);
+          if (a) await api.updateAbility({ ...a }).catch((e) => console.error(e));
+        }
+      }
     }
     setState({ editing: null, editForm: null });
   },
+
+  /// Delete an entity (character/place/ability). Optimistic; the backend also
+  /// removes any graph relations that referenced it.
+  async deleteEntity(kind: EntityKind, id: string) {
+    // Capture the display name first so we can drop its graph edges locally to
+    // match the server (which removes relations referencing the name on delete).
+    const name =
+      kind === "character"
+        ? state.characters.find((c) => c.id === id)?.name
+        : kind === "place"
+          ? state.places.find((p) => p.id === id)?.name
+          : state.abilities.find((a) => a.id === id)?.name;
+
+    if (kind === "character") {
+      setState("characters", (list) => list.filter((c) => c.id !== id));
+      if (isTauri) await api.deleteCharacter(id).catch((e) => console.error(e));
+    } else if (kind === "place") {
+      setState("places", (list) => list.filter((p) => p.id !== id));
+      if (isTauri) await api.deletePlace(id).catch((e) => console.error(e));
+    } else {
+      setState("abilities", (list) => list.filter((a) => a.id !== id));
+      if (isTauri) await api.deleteAbility(id).catch((e) => console.error(e));
+    }
+    if (name) {
+      const low = name.toLowerCase();
+      setState("relations", (list) =>
+        list.filter((r) => r.from.toLowerCase() !== low && r.to.toLowerCase() !== low),
+      );
+    }
+    if (state.editing?.id === id) setState({ editing: null, editForm: null });
+  },
+
+  setPlacesFilter: (v: string) => setState("placesFilter", v),
+  setAbilitiesFilter: (v: string) => setState("abilitiesFilter", v),
 
   /// Manually add a graph edge. Skips duplicates and no-op self-links; optimistic.
   async addRelation(from: string, to: string, label: string) {

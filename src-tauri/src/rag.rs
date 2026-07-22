@@ -1,5 +1,5 @@
 use crate::config::RagConfig;
-use crate::db::{Character, Place, Relation};
+use crate::db::{Ability, Character, Place, Relation};
 use crate::error::{AppError, AppResult};
 use crate::providers::{self, ChatMessage};
 use crate::vector_store::{self, Chunk};
@@ -832,6 +832,19 @@ struct ExtractedPlace {
 }
 
 #[derive(Debug, Deserialize)]
+struct ExtractedAbility {
+    name: String,
+    #[serde(default, alias = "type")]
+    kind: String,
+    #[serde(default)]
+    summary: String,
+    #[serde(default, alias = "sourceDoc")]
+    source_doc: String,
+    #[serde(default, alias = "sourceQuote")]
+    source_quote: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct ExtractedRel {
     from: String,
     to: String,
@@ -846,6 +859,8 @@ struct Extraction {
     #[serde(default)]
     places: Vec<ExtractedPlace>,
     #[serde(default)]
+    abilities: Vec<ExtractedAbility>,
+    #[serde(default)]
     relations: Vec<ExtractedRel>,
 }
 
@@ -855,6 +870,7 @@ struct Extraction {
 pub struct ExtractResult {
     pub characters: Vec<Character>,
     pub places: Vec<Place>,
+    pub abilities: Vec<Ability>,
     pub relations: Vec<Relation>,
     pub char_aliases: std::collections::HashMap<String, String>,
     pub place_aliases: std::collections::HashMap<String, String>,
@@ -908,6 +924,7 @@ pub async fn extract_entities(
     // Accumulate + merge across windows.
     let mut chars_map: std::collections::HashMap<String, ExtractedChar> = Default::default();
     let mut places_map: std::collections::HashMap<String, ExtractedPlace> = Default::default();
+    let mut abilities_map: std::collections::HashMap<String, ExtractedAbility> = Default::default();
     let mut rel_set: std::collections::HashSet<(String, String, String)> = Default::default();
     let mut relations_out: Vec<ExtractedRel> = Vec::new();
 
@@ -938,6 +955,12 @@ pub async fn extract_entities(
             }
             merge_place(&mut places_map, p);
         }
+        for a in parsed.abilities {
+            if a.name.trim().is_empty() {
+                continue;
+            }
+            merge_ability(&mut abilities_map, a);
+        }
         for r in parsed.relations {
             if r.from.trim().is_empty() || r.to.trim().is_empty() {
                 continue;
@@ -949,7 +972,7 @@ pub async fn extract_entities(
         }
     }
 
-    if chars_map.is_empty() && places_map.is_empty() {
+    if chars_map.is_empty() && places_map.is_empty() && abilities_map.is_empty() {
         return Err(AppError::Msg(
             "o modelo não retornou entidades válidas — tente outro modelo de LLM".into(),
         ));
@@ -1034,15 +1057,34 @@ pub async fn extract_entities(
 
     let characters = chars_map
         .into_values()
-        .map(|c| Character {
+        .map(|c| {
+            // Keep traits as a short set of ONE-WORD tags (≤ 6). Anything longer is
+            // really a description, not a tag — fold it into the summary so the card
+            // stays scannable instead of a wall of phrases.
+            let (traits, summary) = normalize_traits(c.traits, c.summary);
+            Character {
+                id: Uuid::new_v4().to_string(),
+                name: c.name,
+                role: c.role,
+                summary,
+                traits,
+                status: "Extraído".into(),
+                source_doc: c.source_doc,
+                source_quote: c.source_quote,
+            }
+        })
+        .collect();
+
+    let abilities = abilities_map
+        .into_values()
+        .map(|a| Ability {
             id: Uuid::new_v4().to_string(),
-            name: c.name,
-            role: c.role,
-            summary: c.summary,
-            traits: c.traits,
+            name: a.name,
+            kind: if a.kind.trim().is_empty() { "Poder".into() } else { a.kind },
+            summary: a.summary,
             status: "Extraído".into(),
-            source_doc: c.source_doc,
-            source_quote: c.source_quote,
+            source_doc: a.source_doc,
+            source_quote: a.source_quote,
         })
         .collect();
 
@@ -1072,10 +1114,62 @@ pub async fn extract_entities(
     Ok(ExtractResult {
         characters,
         places,
+        abilities,
         relations,
         char_aliases: char_canon,
         place_aliases: place_canon,
     })
+}
+
+/// Split raw extracted traits into (single-word tags, extra prose). Keeps up to 6
+/// one-word tags; any multi-word "trait" is really a description and is appended
+/// to the summary instead. De-dupes tags case-insensitively.
+fn normalize_traits(traits: Vec<String>, summary: String) -> (Vec<String>, String) {
+    const MAX_TRAITS: usize = 6;
+    let mut tags: Vec<String> = Vec::new();
+    let mut extra: Vec<String> = Vec::new();
+    for t in traits {
+        let t = t.trim().trim_matches(|c: char| c == '.' || c == ',' || c == ';').trim();
+        if t.is_empty() {
+            continue;
+        }
+        // One "word": no internal whitespace and no hyphen-joined compound.
+        let is_single = !t.chars().any(|c| c.is_whitespace()) && !t.contains('-');
+        if is_single {
+            if tags.len() < MAX_TRAITS && !tags.iter().any(|e| e.eq_ignore_ascii_case(t)) {
+                tags.push(t.to_string());
+            }
+        } else {
+            extra.push(t.to_string());
+        }
+    }
+    let summary = if extra.is_empty() {
+        summary
+    } else {
+        let joined = extra.join("; ");
+        if summary.trim().is_empty() {
+            joined
+        } else {
+            format!("{} {}.", summary.trim_end_matches('.'), joined)
+        }
+    };
+    (tags, summary)
+}
+
+/// Merge an ability into the map: first non-empty text wins, longest summary kept.
+fn merge_ability(map: &mut std::collections::HashMap<String, ExtractedAbility>, a: ExtractedAbility) {
+    let key = a.name.to_lowercase();
+    match map.get_mut(&key) {
+        None => {
+            map.insert(key, a);
+        }
+        Some(existing) => {
+            if existing.kind.is_empty() { existing.kind = a.kind; }
+            if existing.summary.len() < a.summary.len() { existing.summary = a.summary; }
+            if existing.source_doc.is_empty() { existing.source_doc = a.source_doc; }
+            if existing.source_quote.is_empty() { existing.source_quote = a.source_quote; }
+        }
+    }
 }
 
 /// Run extraction over a single corpus window.
@@ -1089,11 +1183,19 @@ async fn extract_window(
 Responda APENAS com JSON válido, sem texto extra, sem markdown. Formato:\n\
 {\"characters\":[{\"name\":\"\",\"role\":\"\",\"summary\":\"\",\"traits\":[\"\"],\"sourceDoc\":\"\",\"sourceQuote\":\"\"}],\
 \"places\":[{\"name\":\"\",\"type\":\"\",\"summary\":\"\",\"sourceDoc\":\"\",\"sourceQuote\":\"\"}],\
+\"abilities\":[{\"name\":\"\",\"type\":\"\",\"summary\":\"\",\"sourceDoc\":\"\",\"sourceQuote\":\"\"}],\
 \"relations\":[{\"from\":\"\",\"to\":\"\",\"label\":\"\"}]}\n\
 sourceQuote deve ser uma citação curta e literal do texto. Use o idioma do texto. \
 Use SEMPRE o nome mais completo de cada personagem/lugar (ex.: \"Cesar Magnus\", não só \"Cesar\"); \
 se o texto citar só o primeiro nome ou um apelido, trate como o mesmo personagem e use o nome completo. \
-Nas relações, use exatamente esses mesmos nomes completos. /no_think";
+Nas relações, use exatamente esses mesmos nomes completos.\n\
+IMPORTANTE — personagens são apenas SERES (pessoas, criaturas, entidades vivas ou sencientes). \
+Poderes, habilidades, magias ou técnicas (mesmo escritos com inicial maiúscula como nome próprio, \
+ex.: \"Previsão\", \"Hipótese\", \"Teletransporte\") NÃO são personagens nem lugares: coloque-os em \"abilities\", \
+com \"type\" sendo a categoria (ex.: \"Poder\", \"Magia\", \"Técnica\"). Na dúvida entre personagem e poder, \
+se não for um ser, é ability.\n\
+Em \"traits\", liste NO MÁXIMO 6 tags de UMA ÚNICA palavra cada (ex.: \"Leal\", \"Impulsivo\"). \
+NÃO use frases nem expressões de várias palavras em traits — qualquer descrição mais longa vai no \"summary\". /no_think";
 
     let user = format!("Extraia personagens, lugares e relações do conhecimento abaixo:\n\n{corpus}");
     let messages = vec![

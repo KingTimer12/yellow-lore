@@ -9,7 +9,7 @@ mod vector_store;
 use base64::Engine;
 
 use config::RagConfig;
-use db::{Character, ChatSession, Db, DocMeta, Entities, Place, StoredMessage, Vault};
+use db::{Ability, Character, ChatSession, Db, DocMeta, Entities, Place, StoredMessage, Vault};
 use error::{AppError, AppResult};
 use rag::Answer;
 use std::path::PathBuf;
@@ -417,7 +417,7 @@ async fn extract_entities(
     let res =
         rag::extract_entities(&state.client, &cfg, &target, &existing_chars, &existing_places)
             .await?;
-    state.db.merge_extracted(&vault, &res.characters, &res.places, &res.relations)?;
+    state.db.merge_extracted(&vault, &res.characters, &res.places, &res.abilities, &res.relations)?;
     // Fold previously-saved rows that this run revealed to be the same entity
     // (cross-run dupes like "Sophia" vs "Sophia, Flor do Abismo").
     state.db.apply_aliases(&vault, &res.char_aliases, &res.place_aliases)?;
@@ -444,6 +444,12 @@ fn add_place(state: tauri::State<'_, AppState>, place: Place) -> AppResult<()> {
 }
 
 #[tauri::command]
+fn add_ability(state: tauri::State<'_, AppState>, ability: Ability) -> AppResult<()> {
+    let vault = state.active()?;
+    state.db.add_ability(&vault, &ability)
+}
+
+#[tauri::command]
 fn update_character(state: tauri::State<'_, AppState>, character: Character) -> AppResult<()> {
     let vault = state.active()?;
     state.db.update_character(&vault, &character)
@@ -453,6 +459,32 @@ fn update_character(state: tauri::State<'_, AppState>, character: Character) -> 
 fn update_place(state: tauri::State<'_, AppState>, place: Place) -> AppResult<()> {
     let vault = state.active()?;
     state.db.update_place(&vault, &place)
+}
+
+#[tauri::command]
+fn update_ability(state: tauri::State<'_, AppState>, ability: Ability) -> AppResult<()> {
+    let vault = state.active()?;
+    state.db.update_ability(&vault, &ability)
+}
+
+/// Delete an entity by id. Also purges relations that referenced it, so the
+/// graph doesn't keep a dangling/duplicate node the user meant to remove.
+#[tauri::command]
+fn delete_character(state: tauri::State<'_, AppState>, id: String) -> AppResult<()> {
+    let vault = state.active()?;
+    state.db.delete_character(&vault, &id)
+}
+
+#[tauri::command]
+fn delete_place(state: tauri::State<'_, AppState>, id: String) -> AppResult<()> {
+    let vault = state.active()?;
+    state.db.delete_place(&vault, &id)
+}
+
+#[tauri::command]
+fn delete_ability(state: tauri::State<'_, AppState>, id: String) -> AppResult<()> {
+    let vault = state.active()?;
+    state.db.delete_ability(&vault, &id)
 }
 
 /// Manually add a relation (graph edge) between two entities. Feeds GraphRAG so
@@ -531,8 +563,13 @@ pub fn run() {
             extract_entities,
             add_character,
             add_place,
+            add_ability,
             update_character,
             update_place,
+            update_ability,
+            delete_character,
+            delete_place,
+            delete_ability,
             add_relation,
             remove_relation
         ])

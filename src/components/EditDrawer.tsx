@@ -3,11 +3,24 @@ import { state, actions } from "../store";
 
 export default function EditDrawer() {
   const form = () => state.editForm;
-  const isCharacter = () => state.editing?.kind === "character";
+  const kind = () => state.editing?.kind ?? "character";
+  const isCharacter = () => kind() === "character";
   const isCreating = () => !!state.editing?.creating;
-  const noun = () => (isCharacter() ? "personagem" : "lugar");
+  const noun = () => (kind() === "character" ? "personagem" : kind() === "place" ? "lugar" : "habilidade");
   const title = () => (isCreating() ? `Adicionar ${noun()}` : `Editar ${noun()}`);
   const secondaryLabel = () => (isCharacter() ? "Papel" : "Tipo");
+
+  function remove() {
+    const editing = state.editing;
+    if (!editing) return;
+    actions.askConfirm({
+      title: `Excluir ${noun()}?`,
+      message: `Excluir "${form()!.name || "sem nome"}"? Também remove as relações dele no grafo. Esta ação não pode ser desfeita.`,
+      confirmLabel: "Excluir",
+      danger: true,
+      onConfirm: () => void actions.deleteEntity(editing.kind, editing.id),
+    });
+  }
 
   return (
     <Show when={state.editing && form()}>
@@ -74,6 +87,16 @@ export default function EditDrawer() {
               {isCreating() ? "Adicionar" : "Salvar"}
             </div>
           </div>
+
+          <Show when={!isCreating()}>
+            <div
+              onClick={remove}
+              class="mt-3 flex items-center justify-center gap-2 py-2.5 rounded-8px border border-border text-12.5px font-semibold cursor-pointer text-fg-muted transition-colors hover:border-danger hover:text-danger"
+            >
+              <div class="i-lucide-trash-2 w-3.5 h-3.5" />
+              Excluir {noun()}
+            </div>
+          </Show>
         </div>
       </div>
     </Show>

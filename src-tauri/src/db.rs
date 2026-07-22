@@ -54,6 +54,23 @@ pub struct Place {
     pub source_quote: String,
 }
 
+/// A power/skill/ability (e.g. "Previsão", "Hipótese"). Same shape as Place —
+/// a named entity with a kind, a summary and provenance — but kept in its own
+/// table so it gets its own canon tab and its own graph colour, and so proper
+/// nouns that are really powers stop being mislabelled as characters.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Ability {
+    pub id: String,
+    pub name: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub summary: String,
+    pub status: String,
+    pub source_doc: String,
+    pub source_quote: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Relation {
@@ -88,6 +105,7 @@ pub struct StoredMessage {
 pub struct Entities {
     pub characters: Vec<Character>,
     pub places: Vec<Place>,
+    pub abilities: Vec<Ability>,
     pub relations: Vec<Relation>,
 }
 
@@ -120,6 +138,10 @@ impl Db {
                 summary TEXT, traits TEXT, status TEXT, source_doc TEXT, source_quote TEXT
             );
             CREATE TABLE IF NOT EXISTS places (
+                id TEXT PRIMARY KEY, vault_id TEXT NOT NULL, name TEXT, kind TEXT,
+                summary TEXT, status TEXT, source_doc TEXT, source_quote TEXT
+            );
+            CREATE TABLE IF NOT EXISTS abilities (
                 id TEXT PRIMARY KEY, vault_id TEXT NOT NULL, name TEXT, kind TEXT,
                 summary TEXT, status TEXT, source_doc TEXT, source_quote TEXT
             );
@@ -195,7 +217,7 @@ impl Db {
     pub fn delete_vault(&self, id: &str) -> AppResult<()> {
         {
             let conn = self.lock();
-            for t in ["documents", "chunks", "characters", "places", "relations", "sessions", "messages"] {
+            for t in ["documents", "chunks", "characters", "places", "abilities", "relations", "sessions", "messages"] {
                 conn.execute(&format!("DELETE FROM {t} WHERE vault_id = ?1"), params![id])
                     .map_err(sql)?;
             }
@@ -392,6 +414,7 @@ impl Db {
         Ok(Entities {
             characters: self.list_characters(vault)?,
             places: self.list_places(vault)?,
+            abilities: self.list_abilities(vault)?,
             relations: self.list_relations(vault)?,
         })
     }
@@ -427,6 +450,27 @@ impl Db {
         let rows = stmt
             .query_map(params![vault], |r| {
                 Ok(Place {
+                    id: r.get(0)?,
+                    name: r.get(1)?,
+                    kind: r.get(2)?,
+                    summary: r.get(3)?,
+                    status: r.get(4)?,
+                    source_doc: r.get(5)?,
+                    source_quote: r.get(6)?,
+                })
+            })
+            .map_err(sql)?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    pub fn list_abilities(&self, vault: &str) -> AppResult<Vec<Ability>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare("SELECT id, name, kind, summary, status, source_doc, source_quote FROM abilities WHERE vault_id = ?1")
+            .map_err(sql)?;
+        let rows = stmt
+            .query_map(params![vault], |r| {
+                Ok(Ability {
                     id: r.get(0)?,
                     name: r.get(1)?,
                     kind: r.get(2)?,
@@ -654,6 +698,66 @@ impl Db {
         Ok(())
     }
 
+    /// Insert one manually-created ability (status typically "Adicionado").
+    pub fn add_ability(&self, vault: &str, a: &Ability) -> AppResult<()> {
+        self.lock().execute(
+            "INSERT INTO abilities (id, vault_id, name, kind, summary, status, source_doc, source_quote)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![a.id, vault, a.name, a.kind, a.summary, a.status, a.source_doc, a.source_quote],
+        ).map_err(sql)?;
+        Ok(())
+    }
+
+    pub fn update_ability(&self, vault: &str, a: &Ability) -> AppResult<()> {
+        self.lock().execute(
+            "UPDATE abilities SET name=?3, kind=?4, summary=?5, status=?6 WHERE id=?1 AND vault_id=?2",
+            params![a.id, vault, a.name, a.kind, a.summary, a.status],
+        ).map_err(sql)?;
+        Ok(())
+    }
+
+    /// Delete one entity by id and, in the same transaction, drop every relation
+    /// that referenced its display name. A duplicate/mislabelled node ("Lô" vs
+    /// "Charlotte", the protagonist split in two) leaves dangling edges that show
+    /// up in the graph as orphan vertices; removing them here keeps the graph
+    /// honest instead of leaving a "dead" node behind.
+    fn delete_entity(&self, vault: &str, table: &str, id: &str) -> AppResult<()> {
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(sql)?;
+        let name: Option<String> = tx
+            .query_row(
+                &format!("SELECT name FROM {table} WHERE id = ?1 AND vault_id = ?2"),
+                params![id, vault],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(sql)?;
+        tx.execute(&format!("DELETE FROM {table} WHERE id = ?1 AND vault_id = ?2"), params![id, vault])
+            .map_err(sql)?;
+        if let Some(name) = name {
+            tx.execute(
+                "DELETE FROM relations WHERE vault_id = ?1 \
+                 AND (lower(from_name) = lower(?2) OR lower(to_name) = lower(?2))",
+                params![vault, name],
+            )
+            .map_err(sql)?;
+        }
+        tx.commit().map_err(sql)?;
+        Ok(())
+    }
+
+    pub fn delete_character(&self, vault: &str, id: &str) -> AppResult<()> {
+        self.delete_entity(vault, "characters", id)
+    }
+
+    pub fn delete_place(&self, vault: &str, id: &str) -> AppResult<()> {
+        self.delete_entity(vault, "places", id)
+    }
+
+    pub fn delete_ability(&self, vault: &str, id: &str) -> AppResult<()> {
+        self.delete_entity(vault, "abilities", id)
+    }
+
     /// Doc ids already covered by a previous extraction (meta table, per vault).
     pub fn extracted_docs(&self, vault: &str) -> AppResult<std::collections::HashSet<String>> {
         let conn = self.lock();
@@ -705,6 +809,11 @@ impl Db {
         )
         .map_err(sql)?;
         conn.execute(
+            "DELETE FROM abilities WHERE vault_id = ?1 AND status = 'Extraído'",
+            params![vault],
+        )
+        .map_err(sql)?;
+        conn.execute(
             "DELETE FROM meta WHERE key = ?1",
             params![format!("extracted:{vault}")],
         )
@@ -721,6 +830,7 @@ impl Db {
         vault: &str,
         characters: &[Character],
         places: &[Place],
+        abilities: &[Ability],
         relations: &[Relation],
     ) -> AppResult<()> {
         let mut conn = self.lock();
@@ -826,6 +936,51 @@ impl Db {
                         "INSERT INTO places (id, vault_id, name, kind, summary, status, source_doc, source_quote)
                          VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
                         params![p.id, vault, p.name, p.kind, p.summary, p.status, p.source_doc, p.source_quote],
+                    ).map_err(sql)?;
+                }
+            }
+        }
+
+        // Abilities: same protected/enrich/insert rules as places.
+        let mut existing_abilities: std::collections::HashMap<String, (String, String, String)> =
+            Default::default();
+        {
+            let mut stmt = tx
+                .prepare("SELECT id, name, status, summary FROM abilities WHERE vault_id = ?1")
+                .map_err(sql)?;
+            let rows = stmt
+                .query_map(params![vault], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                    ))
+                })
+                .map_err(sql)?;
+            for row in rows.filter_map(|r| r.ok()) {
+                let (id, name, status, summary) = row;
+                existing_abilities.insert(name.to_lowercase(), (id, status, summary));
+            }
+        }
+
+        for a in abilities {
+            let key = a.name.to_lowercase();
+            match existing_abilities.get(&key) {
+                Some((_, status, _)) if is_protected(status) => {}
+                Some((id, _, summary)) => {
+                    let new_summary = if a.summary.len() > summary.len() { &a.summary } else { summary };
+                    tx.execute(
+                        "UPDATE abilities SET summary=?2 WHERE id=?1",
+                        params![id, new_summary],
+                    )
+                    .map_err(sql)?;
+                }
+                None => {
+                    tx.execute(
+                        "INSERT INTO abilities (id, vault_id, name, kind, summary, status, source_doc, source_quote)
+                         VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+                        params![a.id, vault, a.name, a.kind, a.summary, a.status, a.source_doc, a.source_quote],
                     ).map_err(sql)?;
                 }
             }

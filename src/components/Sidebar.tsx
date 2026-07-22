@@ -38,6 +38,7 @@ const NAV: NavDef[] = [
   { id: "knowledge", label: "Conhecimento", icon: "i-lucide-library" },
   { id: "characters", label: "Personagens", icon: "i-lucide-users-round" },
   { id: "places", label: "Lugares", icon: "i-lucide-map" },
+  { id: "abilities", label: "Habilidades", icon: "i-lucide-sparkles" },
   { id: "settings", label: "Configurações", icon: "i-lucide-settings" },
 ];
 

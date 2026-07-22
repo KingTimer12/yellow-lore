@@ -3,7 +3,7 @@ import { state, actions } from "../store";
 
 // A node in the lore graph. Characters and places share one canvas — the world
 // is one web of relationships, not two separate lists.
-type Kind = "character" | "place" | "unknown";
+type Kind = "character" | "place" | "ability" | "unknown";
 type Node = {
   id: string; // lowercased name (relations reference names)
   name: string;
@@ -22,6 +22,7 @@ type Edge = { a: string; b: string; label: string };
 const COLOR: Record<Kind, string> = {
   character: "var(--accent)",
   place: "oklch(0.68 0.11 195)",
+  ability: "oklch(0.66 0.15 300)",
   unknown: "var(--fg-muted)",
 };
 
@@ -64,6 +65,7 @@ export default function Graph() {
     };
     for (const c of state.characters) add(c.name, "character", c.id);
     for (const p of state.places) add(p.name, "place", p.id);
+    for (const a of state.abilities) add(a.name, "ability", a.id);
     const edges: Edge[] = [];
     for (const r of state.relations) {
       add(r.from, "unknown");
@@ -223,7 +225,7 @@ export default function Graph() {
       const nd = nodeById().get(drag.id);
       if (nd) { nd.fx = undefined; nd.fy = undefined; }
       if (nd && !drag.moved && nd.refId && nd.kind !== "unknown") {
-        actions.openEdit(nd.kind as "character" | "place", nd.refId);
+        actions.openEdit(nd.kind as "character" | "place" | "ability", nd.refId);
       }
       drag = null;
     }
@@ -331,6 +333,7 @@ export default function Graph() {
       <div class="absolute left-3 bottom-3 flex items-center gap-3.5 px-3 py-2 rounded-9px bg-bg/80 border border-border backdrop-blur text-11.5px">
         <div class="flex items-center gap-1.5"><span class="w-2.5 h-2.5 rounded-full" style={{ background: COLOR.character }} /> Personagem</div>
         <div class="flex items-center gap-1.5"><span class="w-2.5 h-2.5 rounded-full" style={{ background: COLOR.place }} /> Lugar</div>
+        <div class="flex items-center gap-1.5"><span class="w-2.5 h-2.5 rounded-full" style={{ background: COLOR.ability }} /> Habilidade</div>
       </div>
       <div class="absolute right-3 bottom-3 text-10.5px text-fg-muted">
         arraste para mover · rolar para zoom · clique num nó para editar

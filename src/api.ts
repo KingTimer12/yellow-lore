@@ -1,5 +1,5 @@
 import { invoke as tauriInvoke, Channel } from "@tauri-apps/api/core";
-import type { Character, Doc, Message, Place, Relation, Session, Settings, Source, Vault } from "./store";
+import type { Ability, Character, Doc, Message, Place, Relation, Session, Settings, Source, Vault } from "./store";
 
 export type StoredMessage = { id: string; role: "user" | "assistant"; text: string; thinking: string; sources: Source[] };
 
@@ -9,7 +9,7 @@ export const isTauri =
   typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
 export type Answer = { text: string; sources: Source[] };
-export type Entities = { characters: Character[]; places: Place[]; relations: Relation[] };
+export type Entities = { characters: Character[]; places: Place[]; abilities: Ability[]; relations: Relation[] };
 
 // Streaming events emitted by the `ask_stream` command.
 export type StreamEvent =
@@ -76,8 +76,13 @@ export const api = {
   extractEntities: (force = false) => tauriInvoke<Entities>("extract_entities", { force }),
   addCharacter: (character: Character) => tauriInvoke<void>("add_character", { character }),
   addPlace: (place: Place) => tauriInvoke<void>("add_place", { place }),
+  addAbility: (ability: Ability) => tauriInvoke<void>("add_ability", { ability }),
   updateCharacter: (character: Character) => tauriInvoke<void>("update_character", { character }),
   updatePlace: (place: Place) => tauriInvoke<void>("update_place", { place }),
+  updateAbility: (ability: Ability) => tauriInvoke<void>("update_ability", { ability }),
+  deleteCharacter: (id: string) => tauriInvoke<void>("delete_character", { id }),
+  deletePlace: (id: string) => tauriInvoke<void>("delete_place", { id }),
+  deleteAbility: (id: string) => tauriInvoke<void>("delete_ability", { id }),
   addRelation: (relation: Relation) => tauriInvoke<void>("add_relation", { relation }),
   removeRelation: (relation: Relation) => tauriInvoke<void>("remove_relation", { relation }),
 };

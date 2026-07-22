@@ -11,6 +11,7 @@ import ChatView from "./components/ChatView";
 import KnowledgeView from "./components/KnowledgeView";
 import CharactersView from "./components/CharactersView";
 import PlacesView from "./components/PlacesView";
+import AbilitiesView from "./components/AbilitiesView";
 import SettingsView from "./components/SettingsView";
 import EditDrawer from "./components/EditDrawer";
 import CreateVaultModal from "./components/CreateVaultModal";
@@ -104,6 +105,9 @@ export default function App() {
                 </Match>
                 <Match when={state.view === "places"}>
                   <PlacesView />
+                </Match>
+                <Match when={state.view === "abilities"}>
+                  <AbilitiesView />
                 </Match>
                 <Match when={state.view === "settings"}>
                   <SettingsView />
