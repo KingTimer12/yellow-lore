@@ -161,6 +161,14 @@ textarea:focus {
 .md ul, .md ol { margin: 0.5em 0; padding-left: 1.4em; }
 .md li { margin: 0.2em 0; }
 .md a { color: var(--accent); text-decoration: underline; }
+/* Known character/place names mentioned in a reply — hoverable for their notes. */
+.entity-mention {
+  color: var(--accent);
+  text-decoration: underline dotted;
+  text-underline-offset: 2px;
+  cursor: help;
+}
+.entity-mention:hover { background: var(--accent-soft); border-radius: 3px; }
 .md strong { font-weight: 700; }
 .md em { font-style: italic; }
 .md code {

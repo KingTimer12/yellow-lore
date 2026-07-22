@@ -137,6 +137,17 @@ export type State = {
   citation: { doc: string; passages: { quote: string; text: string }[] } | null;
   /// Free-text filter for the Characters grid (name / role / trait).
   charactersFilter: string;
+  /// Hover-card for an entity mentioned in a chat reply (null = hidden). `x`/`y`
+  /// are viewport coords of the mention; the popover anchors there.
+  mention: {
+    name: string;
+    role: string;
+    summary: string;
+    traits: string[];
+    kind: "character" | "place";
+    x: number;
+    y: number;
+  } | null;
   /// Centralized dialog (replaces native alert/confirm). `mode` picks the shape:
   /// "alert" = single OK; "confirm" = confirm/cancel. The confirm callback lives
   /// outside the store (see `pendingConfirm`) — stores hold only serializable data.
@@ -209,6 +220,7 @@ const initial: State = {
   reindexing: false,
   citation: null,
   charactersFilter: "",
+  mention: null,
   dialog: null,
 };
 
@@ -666,6 +678,9 @@ export const actions = {
   },
 
   setCharactersFilter: (v: string) => setState("charactersFilter", v),
+
+  showMention: (m: NonNullable<State["mention"]>) => setState("mention", m),
+  hideMention: () => setState("mention", null),
 
   /// Show an informational dialog (replaces native `alert`).
   notify(message: string, title = "Aviso") {

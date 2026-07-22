@@ -82,7 +82,7 @@ export default function ChatView() {
                           </div>
                         }
                       >
-                        <Markdown source={m.text} />
+                        <Markdown source={m.text} mentions />
                       </Show>
                     }
                   >
