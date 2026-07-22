@@ -47,7 +47,7 @@ export default function KnowledgeView() {
   }
 
   return (
-    <div class="p-8 overflow-y-auto h-full box-border flex flex-col gap-5.5 anim-view">
+    <div class="p-8 overflow-hidden h-full box-border flex flex-col gap-5.5 anim-view">
       <div class="flex items-center justify-between flex-wrap gap-3.5">
         <div>
           <div class="font-serif text-24px font-600 tracking-[0.01em]">Base de conhecimento</div>
@@ -115,7 +115,7 @@ export default function KnowledgeView() {
         <div class="text-12.5px text-danger">{err()}</div>
       </Show>
 
-      <div class="flex flex-col border border-border rounded-12px overflow-hidden">
+      <div class="flex flex-col border border-border rounded-12px overflow-y-auto flex-1 min-h-0">
         <For each={filtered()}>
           {(doc, i) => (
             <div
