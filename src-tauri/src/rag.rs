@@ -343,7 +343,7 @@ pub async fn ask(
             client, cfg, chunks, question.clone(), history.clone(), entity_names, relations,
         )
         .await?;
-        let draft = providers::chat_internal(client, cfg, &msgs1, &cfg.llm_model).await?;
+        let draft = providers::chat_internal(client, cfg, &msgs1, &cfg.llm_model, false).await?;
         if grade_answer(client, cfg, &question, &draft).await.unwrap_or(true) {
             let text = providers::chat(client, cfg, &msgs1).await?;
             let sources = cited_sources(src1, &strip_think(&text));
@@ -386,7 +386,7 @@ pub async fn ask_stream<F: FnMut(&str)>(
             client, cfg, chunks, question.clone(), history.clone(), entity_names, relations,
         )
         .await?;
-        let draft = providers::chat_internal(client, cfg, &msgs1, &cfg.llm_model).await?;
+        let draft = providers::chat_internal(client, cfg, &msgs1, &cfg.llm_model, false).await?;
         if grade_answer(client, cfg, &question, &draft).await.unwrap_or(true) {
             let answer =
                 providers::chat_stream(client, cfg, &msgs1, cfg.show_thinking, cancel, on_token).await?;
@@ -428,7 +428,7 @@ Não raciocine em voz alta nem inclua qualquer texto além do título. /no_think
         ChatMessage { role: "system", content: system.to_string() },
         ChatMessage { role: "user", content: user },
     ];
-    let raw = providers::chat_internal(client, cfg, &messages, &cfg.llm_model).await?;
+    let raw = providers::chat_internal(client, cfg, &messages, &cfg.llm_model, false).await?;
     // Reasoning models emit a <think>…</think> block first — drop it so the
     // title isn't literally "<think>".
     let raw = strip_think(&raw);
@@ -607,7 +607,7 @@ Uma resposta que afirma honestamente não ter encontrado a informação nos docu
         ChatMessage { role: "system", content: system.to_string() },
         ChatMessage { role: "user", content: user },
     ];
-    let raw = providers::chat_internal(client, cfg, &messages, &cfg.llm_model).await?;
+    let raw = providers::chat_internal(client, cfg, &messages, &cfg.llm_model, true).await?;
     let raw = strip_think(&raw);
     let json = extract_json_block(&raw).ok_or_else(|| AppError::Msg("grade: JSON inválido".into()))?;
     #[derive(Deserialize)]
@@ -677,7 +677,7 @@ Use somente os índices fornecidos, sem repetir. /no_think";
         ChatMessage { role: "system", content: system.to_string() },
         ChatMessage { role: "user", content: user },
     ];
-    let raw = match providers::chat_internal(client, cfg, &messages, &cfg.llm_model).await {
+    let raw = match providers::chat_internal(client, cfg, &messages, &cfg.llm_model, true).await {
         Ok(r) => r,
         Err(_) => return hits,
     };
@@ -1185,7 +1185,9 @@ Responda APENAS com JSON válido, sem texto extra, sem markdown. Formato:\n\
 \"places\":[{\"name\":\"\",\"type\":\"\",\"summary\":\"\",\"sourceDoc\":\"\",\"sourceQuote\":\"\"}],\
 \"abilities\":[{\"name\":\"\",\"type\":\"\",\"summary\":\"\",\"sourceDoc\":\"\",\"sourceQuote\":\"\"}],\
 \"relations\":[{\"from\":\"\",\"to\":\"\",\"label\":\"\"}]}\n\
-sourceQuote deve ser uma citação curta e literal do texto. Use o idioma do texto. \
+Seja CONCISO para responder rápido: \"summary\" com 1 a 2 frases curtas; \"sourceQuote\" \
+uma citação literal de no máximo ~100 caracteres. Não repita informação nem escreva prosa fora do JSON. \
+Use o idioma do texto. \
 Use SEMPRE o nome mais completo de cada personagem/lugar (ex.: \"Cesar Magnus\", não só \"Cesar\"); \
 se o texto citar só o primeiro nome ou um apelido, trate como o mesmo personagem e use o nome completo. \
 Nas relações, use exatamente esses mesmos nomes completos.\n\
@@ -1202,7 +1204,7 @@ NÃO use frases nem expressões de várias palavras em traits — qualquer descr
         ChatMessage { role: "system", content: system.to_string() },
         ChatMessage { role: "user", content: user },
     ];
-    let raw = providers::chat_internal(client, cfg, &messages, model).await?;
+    let raw = providers::chat_internal(client, cfg, &messages, model, true).await?;
     // Reasoning models (and Ollama's `thinking` field) prepend a <think>…</think>
     // block whose braces would corrupt the JSON span — drop it before parsing.
     let raw = strip_think(&raw);
@@ -1377,7 +1379,7 @@ Na dúvida, NÃO agrupe."
         ChatMessage { role: "system", content: system },
         ChatMessage { role: "user", content: user },
     ];
-    let raw = providers::chat_internal(client, cfg, &messages, model).await?;
+    let raw = providers::chat_internal(client, cfg, &messages, model, true).await?;
     let raw = strip_think(&raw);
     let json = extract_json_block(&raw)
         .ok_or_else(|| AppError::Msg("dedup: JSON inválido".into()))?;

@@ -52,7 +52,7 @@ pub async fn chat(
     cfg: &RagConfig,
     messages: &[ChatMessage],
 ) -> AppResult<String> {
-    chat_impl(client, cfg, messages, &cfg.llm_model, cfg.show_thinking).await
+    chat_impl(client, cfg, messages, &cfg.llm_model, cfg.show_thinking, false).await
 }
 
 /// Generate a chat completion for an INTERNAL RAG step (rerank, grading, dedup,
@@ -60,14 +60,18 @@ pub async fn chat(
 /// return short structured output where deliberation only wastes tokens/time.
 /// `model` allows a dedicated extraction model. On Ollama this sends
 /// `think: false`; OpenAI/vLLM have no standard toggle, so the prompts also carry
-/// a `/no_think` hint for models that honor it.
+/// a `/no_think` hint for models that honor it. `json` forces a JSON-only reply
+/// (Ollama `format:"json"`, OpenAI/vLLM `response_format: json_object`) — used by
+/// the steps that must return parseable JSON so the model wastes no tokens on
+/// prose/markdown/`<think>` and can never return an unparseable window.
 pub async fn chat_internal(
     client: &reqwest::Client,
     cfg: &RagConfig,
     messages: &[ChatMessage],
     model: &str,
+    json: bool,
 ) -> AppResult<String> {
-    chat_impl(client, cfg, messages, model, false).await
+    chat_impl(client, cfg, messages, model, false, json).await
 }
 
 async fn chat_impl(
@@ -76,15 +80,16 @@ async fn chat_impl(
     messages: &[ChatMessage],
     model: &str,
     think: bool,
+    json: bool,
 ) -> AppResult<String> {
     match cfg.llm_provider.as_str() {
         "openai" => {
-            oai_chat(client, &cfg.openai_base_url, &cfg.openai_api_key, model, messages, true, cfg.temperature).await
+            oai_chat(client, &cfg.openai_base_url, &cfg.openai_api_key, model, messages, true, cfg.temperature, json).await
         }
         "vllm" => {
-            oai_chat(client, &cfg.vllm_base_url, &cfg.vllm_api_key, model, messages, false, cfg.temperature).await
+            oai_chat(client, &cfg.vllm_base_url, &cfg.vllm_api_key, model, messages, false, cfg.temperature, json).await
         }
-        "ollama" => ollama_chat(client, cfg, messages, model, think).await,
+        "ollama" => ollama_chat(client, cfg, messages, model, think, json).await,
         other => Err(AppError::Provider(format!(
             "provedor de LLM desconhecido: {other}"
         ))),
@@ -128,6 +133,7 @@ async fn oai_chat(
     messages: &[ChatMessage],
     key_required: bool,
     temperature: f32,
+    json_mode: bool,
 ) -> AppResult<String> {
     if key_required && api_key.trim().is_empty() {
         return Err(AppError::Provider("API Key da OpenAI não configurada".into()));
@@ -137,9 +143,11 @@ async fn oai_chat(
         .iter()
         .map(|m| json!({ "role": m.role, "content": m.content }))
         .collect();
-    let mut req = client
-        .post(url)
-        .json(&json!({ "model": model, "messages": msgs, "temperature": temperature }));
+    let mut payload = json!({ "model": model, "messages": msgs, "temperature": temperature });
+    if json_mode {
+        payload["response_format"] = json!({ "type": "json_object" });
+    }
+    let mut req = client.post(url).json(&payload);
     if !api_key.trim().is_empty() {
         req = req.bearer_auth(api_key);
     }
@@ -185,6 +193,7 @@ async fn ollama_chat(
     messages: &[ChatMessage],
     model: &str,
     think: bool,
+    json_mode: bool,
 ) -> AppResult<String> {
     let base = cfg.ollama_endpoint.trim_end_matches('/');
     let url = format!("{base}/api/chat");
@@ -202,6 +211,11 @@ async fn ollama_chat(
     // (which reject the field on some Ollama builds) are unaffected.
     if !think {
         body["think"] = json!(false);
+    }
+    // Constrain decoding to a JSON object: no wasted tokens on markdown/prose,
+    // and the reply is always parseable.
+    if json_mode {
+        body["format"] = json!("json");
     }
     let req = client.post(&url).json(&body);
     let body: Value = post_json(req).await?;
