@@ -135,6 +135,19 @@ export type State = {
   reindexing: boolean;
   /// Citation modal: the document and its retrieved passages, or null.
   citation: { doc: string; passages: { quote: string; text: string }[] } | null;
+  /// Free-text filter for the Characters grid (name / role / trait).
+  charactersFilter: string;
+  /// Centralized dialog (replaces native alert/confirm). `mode` picks the shape:
+  /// "alert" = single OK; "confirm" = confirm/cancel. The confirm callback lives
+  /// outside the store (see `pendingConfirm`) — stores hold only serializable data.
+  dialog: {
+    mode: "alert" | "confirm";
+    title: string;
+    message: string;
+    confirmLabel: string;
+    cancelLabel: string;
+    danger: boolean;
+  } | null;
 };
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -192,11 +205,17 @@ const initial: State = {
   indexStale: false,
   reindexing: false,
   citation: null,
+  charactersFilter: "",
+  dialog: null,
 };
 
 // ---- Store + actions ------------------------------------------------------
 
 const [state, setState] = createStore<State>(structuredClone(initial));
+
+// Pending confirm callback for the centralized dialog. Kept out of the store so
+// only serializable data lives there; resolved by `resolveDialog`.
+let pendingConfirm: (() => void) | null = null;
 export { state };
 
 let toastTimer: ReturnType<typeof setTimeout> | undefined;
@@ -485,7 +504,7 @@ export const actions = {
       await api.reindex();
       setState("indexStale", false);
     } catch (e) {
-      alert(`Reindexação falhou: ${e}`);
+      actions.notify(`${e}`, "Reindexação falhou");
     } finally {
       setState("reindexing", false);
     }
@@ -509,7 +528,7 @@ export const actions = {
       });
     } catch (e) {
       console.error("extração falhou", e);
-      alert(`Extração falhou: ${e}`);
+      actions.notify(`${e}`, "Extração falhou");
     } finally {
       setState("extracting", false);
     }
@@ -640,6 +659,49 @@ export const actions = {
       ),
     );
     if (isTauri) await api.removeRelation({ ...rel }).catch((e) => console.error(e));
+  },
+
+  setCharactersFilter: (v: string) => setState("charactersFilter", v),
+
+  /// Show an informational dialog (replaces native `alert`).
+  notify(message: string, title = "Aviso") {
+    pendingConfirm = null;
+    setState("dialog", {
+      mode: "alert",
+      title,
+      message,
+      confirmLabel: "Entendi",
+      cancelLabel: "",
+      danger: false,
+    });
+  },
+
+  /// Ask for confirmation (replaces native `confirm`). `onConfirm` runs only if
+  /// the user confirms.
+  askConfirm(opts: {
+    title: string;
+    message: string;
+    confirmLabel?: string;
+    danger?: boolean;
+    onConfirm: () => void;
+  }) {
+    pendingConfirm = opts.onConfirm;
+    setState("dialog", {
+      mode: "confirm",
+      title: opts.title,
+      message: opts.message,
+      confirmLabel: opts.confirmLabel ?? "Confirmar",
+      cancelLabel: "Cancelar",
+      danger: opts.danger ?? false,
+    });
+  },
+
+  /// Resolve the open dialog. Runs the pending confirm callback when `ok`.
+  resolveDialog(ok: boolean) {
+    const cb = pendingConfirm;
+    pendingConfirm = null;
+    setState("dialog", null);
+    if (ok && cb) cb();
   },
 
   setSetting: <K extends keyof Settings>(key: K, value: Settings[K]) =>
