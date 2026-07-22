@@ -67,7 +67,6 @@ function bumpCargo(path) {
 bumpJson("package.json");
 bumpJson("src-tauri/tauri.conf.json");
 bumpCargo("src-tauri/Cargo.toml");
-bumpCargo("Cargo.toml");
 
 console.log(`\nBumped ${current} -> ${next}. Next steps:\n`);
 console.log(`  git commit -am "chore(release): v${next}"`);
