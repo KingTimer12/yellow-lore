@@ -82,6 +82,12 @@ export type Settings = {
   temperature: number;
   showSources: boolean;
   dedupEntities: boolean;
+  /// Empty = reuse the chat model for extraction (no second model to load).
+  extractionModel: string;
+  /// Concurrent extraction windows. 1 = sequential (safe for a single local GPU).
+  extractionConcurrency: number;
+  /// Extra LLM pass that re-orders retrieved chunks by relevance before answering.
+  rerank: boolean;
 };
 
 // `creating` marks a brand-new entity (manual add) vs editing an existing one.
@@ -148,6 +154,9 @@ export const DEFAULT_SETTINGS: Settings = {
   temperature: 0.2,
   showSources: true,
   dedupEntities: true,
+  extractionModel: "",
+  extractionConcurrency: 1,
+  rerank: false,
 };
 
 // ---- Seed data (browser preview only) -------------------------------------

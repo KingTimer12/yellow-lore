@@ -98,10 +98,41 @@ export default function SettingsView() {
           label="Mostrar trechos-fonte nas respostas do chat"
         />
         <Toggle
+          on={state.settings.rerank}
+          onToggle={() => actions.setSetting("rerank", !state.settings.rerank)}
+          label="Reranking de trechos por relevância (LLM)"
+          hint="Após a busca híbrida, uma chamada de LLM reordena os trechos recuperados por relevância antes de responder — corta ruído do top-k. Custa uma chamada a mais por pergunta."
+        />
+      </div>
+
+      {/* Entity extraction */}
+      <div class="flex flex-col gap-4">
+        <Divider label="Extração de entidades" />
+        <Field
+          label="Modelo de extração (opcional)"
+          value={state.settings.extractionModel}
+          onInput={(v) => actions.setSetting("extractionModel", v)}
+          placeholder="vazio = usa o modelo de LLM do chat"
+        />
+        <div class="text-11.5px text-fg-muted -mt-2">
+          Deixe vazio para reutilizar o modelo de chat (sem baixar nem carregar um segundo modelo). Aponte para um modelo menor/rápido só se tiver VRAM sobrando.
+        </div>
+        <Slider
+          label={`Janelas em paralelo (${state.settings.extractionConcurrency})`}
+          min={1}
+          max={8}
+          step={1}
+          value={state.settings.extractionConcurrency}
+          onInput={(v) => actions.setSetting("extractionConcurrency", v)}
+        />
+        <div class="text-11.5px text-fg-muted -mt-2">
+          1 = sequencial (seguro para uma GPU local — o Ollama serializa mesmo). Aumente só com provedores em nuvem (OpenAI/vLLM), onde chamadas paralelas cortam o tempo. Em GPU local, valores altos podem estourar a memória.
+        </div>
+        <Toggle
           on={state.settings.dedupEntities}
           onToggle={() => actions.setSetting("dedupEntities", !state.settings.dedupEntities)}
           label="Unificar entidades duplicadas via LLM na extração"
-          hint="Passo extra que mescla apelidos/nomes parciais (ex.: “Cesar” = “Cesar Magnus”). Uma chamada de LLM a mais por extração."
+          hint="Passo extra que mescla apelidos/nomes parciais (ex.: “Cesar” = “Cesar Magnus”), inclusive contra entidades já salvas. Só os nomes ambíguos são enviados ao LLM."
         />
       </div>
 
