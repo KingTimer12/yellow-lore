@@ -59,7 +59,11 @@ renomear, excluir). Comandos: `list_sessions`, `create_session`,
   deixa o raciocínio ligado; `chat_internal()` (rerank, grade do CRAG, dedup,
   extração, título) desliga — no Ollama envia `think:false`, e os prompts internos
   ainda carregam o hint `/no_think` p/ modelos OpenAI/vLLM. Corta latência dos
-  passos internos que só devolvem saída curta/estruturada.
+  passos internos que só devolvem saída curta/estruturada. A **resposta final**
+  também não raciocina por padrão (`showThinking` off — evita que modelos que
+  "pensam em texto puro" vazem um preâmbulo na resposta); ligável nas Configurações.
+  O **CRAG sempre transmite** a resposta final por streaming — o rascunho é só
+  checagem interna barata (no-think), nunca o que o usuário vê.
 - `rag.rs` — chunking · `build_document()` (chunk→embed) · `ask()` = pipeline
   **RAG-first** · `ask_stream()` = mesmo pipeline, mas emite tokens via callback.
   Recuperação: **híbrida** (semântico + lexical IDF), **direcionada por capítulo**
