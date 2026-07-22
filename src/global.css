@@ -169,6 +169,16 @@ textarea:focus {
   cursor: help;
 }
 .entity-mention:hover { background: var(--accent-soft); border-radius: 3px; }
+/* Inline [N] citation markers — hover shows the source, click opens the modal. */
+.citation-ref {
+  color: var(--accent);
+  font-size: 0.82em;
+  font-weight: 600;
+  cursor: pointer;
+  padding: 0 0.1em;
+  vertical-align: baseline;
+}
+.citation-ref:hover { text-decoration: underline; }
 .md strong { font-weight: 700; }
 .md em { font-style: italic; }
 .md code {
