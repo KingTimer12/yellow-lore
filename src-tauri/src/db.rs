@@ -453,6 +453,44 @@ impl Db {
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
+    /// Add a manual relation (edge) between two entities by name. No-op if the
+    /// exact (from, to, label) triple already exists, so it composes with the
+    /// dedup used by extraction. Names reference characters/places by display name.
+    pub fn add_relation(&self, vault: &str, r: &Relation) -> AppResult<()> {
+        let conn = self.lock();
+        let exists = conn
+            .query_row(
+                "SELECT 1 FROM relations WHERE vault_id = ?1 \
+                 AND lower(from_name) = lower(?2) AND lower(to_name) = lower(?3) \
+                 AND lower(label) = lower(?4) LIMIT 1",
+                params![vault, r.from, r.to, r.label],
+                |_| Ok(()),
+            )
+            .is_ok();
+        if exists {
+            return Ok(());
+        }
+        conn.execute(
+            "INSERT INTO relations (id, vault_id, from_name, to_name, label) VALUES (?1,?2,?3,?4,?5)",
+            params![Uuid::new_v4().to_string(), vault, r.from, r.to, r.label],
+        )
+        .map_err(sql)?;
+        Ok(())
+    }
+
+    /// Delete a relation by its (from, to, label) triple (case-insensitive).
+    pub fn remove_relation(&self, vault: &str, r: &Relation) -> AppResult<()> {
+        self.lock()
+            .execute(
+                "DELETE FROM relations WHERE vault_id = ?1 \
+                 AND lower(from_name) = lower(?2) AND lower(to_name) = lower(?3) \
+                 AND lower(label) = lower(?4)",
+                params![vault, r.from, r.to, r.label],
+            )
+            .map_err(sql)?;
+        Ok(())
+    }
+
     /// Insert one manually-created character (status typically "Adicionado").
     pub fn add_character(&self, vault: &str, c: &Character) -> AppResult<()> {
         let traits = serde_json::to_string(&c.traits)?;
