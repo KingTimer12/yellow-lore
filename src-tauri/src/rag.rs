@@ -1058,6 +1058,7 @@ pub async fn extract_entities(
     chunks: &[Chunk],
     existing_chars: &[String],
     existing_places: &[String],
+    existing_abilities: &[String],
 ) -> AppResult<ExtractResult> {
     if chunks.is_empty() {
         return Err(AppError::Msg(
@@ -1104,13 +1105,29 @@ pub async fn extract_entities(
     let mut rel_set: std::collections::HashSet<(String, String, String)> = Default::default();
     let mut relations_out: Vec<ExtractedRel> = Vec::new();
 
+    // Every entity already saved in the vault is shown to the model, by name, in
+    // every window. Without this the extractor re-invents a character it has
+    // already met in an earlier chapter ("Leo", "Leonardo Venante") instead of
+    // recognizing it and just adding what the new chapter reveals — merge_extracted
+    // updates by name, so reusing the exact saved name is what turns a duplicate
+    // into an update.
+    let roster = roster_block(existing_chars, existing_places, existing_abilities);
+    // Folded name → saved display name, so an emitted name that matches a saved
+    // entity keeps the saved spelling instead of drifting.
+    let known: std::collections::HashMap<String, String> = existing_chars
+        .iter()
+        .chain(existing_places.iter())
+        .chain(existing_abilities.iter())
+        .map(|n| (fold(n), n.clone()))
+        .collect();
+
     // Run the windows with the configured concurrency. Default 1 (sequential) is
     // the safe choice for a single local GPU; cloud providers can raise it to cut
     // wall-clock time. A bad window is dropped (filter_map), not fatal.
     let concurrency = cfg.extraction_concurrency.max(1);
     let futs = windows
         .iter()
-        .map(|w| extract_window(client, cfg, w, ex_model))
+        .map(|w| extract_window(client, cfg, w, ex_model, &roster, &known))
         .collect::<Vec<_>>();
     let parsed_windows: Vec<Extraction> = stream::iter(futs)
         .buffer_unordered(concurrency)
@@ -1173,6 +1190,16 @@ pub async fn extract_entities(
             place_names.push(n.clone());
         }
     }
+    // Abilities get the same treatment (in-run only — no cross-run alias rewrite is
+    // needed, since folding onto the saved name is what merge_extracted keys on).
+    let mut ability_names: Vec<String> = abilities_map.values().map(|a| a.name.clone()).collect();
+    for n in existing_abilities {
+        if !ability_names.iter().any(|e| e.eq_ignore_ascii_case(n)) {
+            ability_names.push(n.clone());
+        }
+    }
+    let ability_canon = canonical_map(&ability_names);
+
     let mut char_canon = canonical_map(&char_names);
     let mut place_canon = canonical_map(&place_names);
 
@@ -1207,8 +1234,16 @@ pub async fn extract_entities(
         }
         merge_place(&mut places_final, p);
     }
+    let mut abilities_final: std::collections::HashMap<String, ExtractedAbility> = Default::default();
+    for mut a in abilities_map.into_values() {
+        if let Some(full) = ability_canon.get(&a.name.to_lowercase()) {
+            a.name = full.clone();
+        }
+        merge_ability(&mut abilities_final, a);
+    }
     let chars_map = chars_final;
     let places_map = places_final;
+    let abilities_map = abilities_final;
 
     // Rewrite relations to canonical names (either type) and de-dupe again.
     let resolve = |name: &str| -> String {
@@ -1349,13 +1384,57 @@ fn merge_ability(map: &mut std::collections::HashMap<String, ExtractedAbility>, 
 }
 
 /// Run extraction over a single corpus window.
+/// The "already known" section of the extraction prompt: every saved entity, by
+/// name and by type. Capped only to keep a huge cast from crowding out the text
+/// itself — the whole roster is sent whenever it fits.
+fn roster_block(chars: &[String], places: &[String], abilities: &[String]) -> String {
+    if chars.is_empty() && places.is_empty() && abilities.is_empty() {
+        return String::new();
+    }
+    // Roughly a third of the window budget; beyond that the corpus would lose room.
+    const MAX_ROSTER: usize = 12_000;
+    let mut out = String::from(
+        "ENTIDADES JÁ CADASTRADAS NESTA OBRA (lidas de capítulos anteriores). \
+Se uma delas aparecer no texto abaixo, use EXATAMENTE o nome desta lista, copiado letra \
+por letra, e apenas ACRESCENTE o que o novo texto revela — NÃO crie uma segunda entrada, \
+NÃO troque por apelido, epíteto ou título, NÃO acrescente sobrenome. Só crie entidade \
+nova se ela realmente não estiver na lista.\n",
+    );
+    let mut push = |label: &str, names: &[String]| {
+        if names.is_empty() {
+            return;
+        }
+        let mut line = format!("{label}: ");
+        let mut n = 0usize;
+        for name in names {
+            if out.len() + line.len() > MAX_ROSTER {
+                line.push_str(&format!("… (+{} não listados)", names.len() - n));
+                break;
+            }
+            if n > 0 {
+                line.push_str("; ");
+            }
+            line.push_str(name);
+            n += 1;
+        }
+        out.push_str(&line);
+        out.push('\n');
+    };
+    push("Personagens", chars);
+    push("Lugares", places);
+    push("Habilidades", abilities);
+    out
+}
+
 async fn extract_window(
     client: &reqwest::Client,
     cfg: &RagConfig,
     corpus: &str,
     model: &str,
+    roster: &str,
+    known: &std::collections::HashMap<String, String>,
 ) -> AppResult<Extraction> {
-    let system = "Você extrai entidades de textos de ficção/worldbuilding. \
+    let rules = "Você extrai entidades de textos de ficção/worldbuilding. \
 Responda APENAS com JSON válido, sem texto extra, sem markdown. Formato:\n\
 {\"characters\":[{\"name\":\"\",\"role\":\"\",\"summary\":\"\",\"traits\":[\"\"],\"sourceDoc\":\"\",\"sourceQuote\":\"\"}],\
 \"places\":[{\"name\":\"\",\"type\":\"\",\"summary\":\"\",\"sourceDoc\":\"\",\"sourceQuote\":\"\"}],\
@@ -1385,11 +1464,17 @@ Contexto: \"Espadas do Julgamento\" que alguém CONJURA = ability; \"uma espada 
 Na dúvida sobre HABILIDADE, não inclua; é NORMAL capítulos iniciais não terem nenhuma — deixe \"abilities\" \
 vazio se não houver poder claro. Essa cautela vale só para abilities, JAMAIS para personagens.\n\
 Em \"traits\", liste NO MÁXIMO 6 tags de UMA ÚNICA palavra cada (ex.: \"Leal\", \"Impulsivo\"). \
-NÃO use frases nem expressões de várias palavras em traits — qualquer descrição mais longa vai no \"summary\". /no_think";
+NÃO use frases nem expressões de várias palavras em traits — qualquer descrição mais longa vai no \"summary\".";
+
+    let system = if roster.is_empty() {
+        format!("{rules} /no_think")
+    } else {
+        format!("{rules}\n\n{roster}\n/no_think")
+    };
 
     let user = format!("Extraia personagens, lugares e relações do conhecimento abaixo:\n\n{corpus}");
     let messages = vec![
-        ChatMessage { role: "system", content: system.to_string() },
+        ChatMessage { role: "system", content: system },
         ChatMessage { role: "user", content: user },
     ];
     let raw = providers::chat_internal(client, cfg, &messages, model).await?;
@@ -1400,7 +1485,7 @@ NÃO use frases nem expressões de várias palavras em traits — qualquer descr
         .ok_or_else(|| AppError::Msg("modelo não retornou JSON válido para extração".into()))?;
     let parsed: Extraction = serde_json::from_str(&json)
         .map_err(|e| AppError::Msg(format!("falha ao ler JSON da extração: {e}")))?;
-    Ok(ground_extraction(parsed, corpus))
+    Ok(ground_extraction(parsed, corpus, known))
 }
 
 /// Keep only what the source text actually says.
@@ -1413,10 +1498,19 @@ NÃO use frases nem expressões de várias palavras em traits — qualquer descr
 /// family name) has no verbatim occurrence, so it collapses back to "Leonardo",
 /// which also folds the "Leo / Leonardo" and "Leonardo (Leo) Venante" duplicates
 /// into the same entity instead of three dead vertices.
-fn ground_extraction(mut ex: Extraction, corpus: &str) -> Extraction {
+/// `known` maps folded → saved display name of entities already in the vault. A
+/// name that matches one of them keeps the SAVED spelling (as long as the text
+/// really mentions it), so a character met in chapter 3 is recognized in chapter
+/// 20 and updated instead of duplicated.
+fn ground_extraction(
+    mut ex: Extraction,
+    corpus: &str,
+    known: &std::collections::HashMap<String, String>,
+) -> Extraction {
     let hay = fold(corpus);
+    let ground_name = |raw: &str| ground_known_name(raw, &hay, known);
 
-    ex.characters.retain_mut(|c| match ground_name(&c.name, &hay) {
+    ex.characters.retain_mut(|c| match ground_name(&c.name) {
         Some(n) => {
             c.name = n;
             c.source_quote = grounded_quote(&c.source_quote, &hay);
@@ -1424,7 +1518,7 @@ fn ground_extraction(mut ex: Extraction, corpus: &str) -> Extraction {
         }
         None => false,
     });
-    ex.places.retain_mut(|p| match ground_name(&p.name, &hay) {
+    ex.places.retain_mut(|p| match ground_name(&p.name) {
         Some(n) => {
             p.name = n;
             p.source_quote = grounded_quote(&p.source_quote, &hay);
@@ -1432,7 +1526,7 @@ fn ground_extraction(mut ex: Extraction, corpus: &str) -> Extraction {
         }
         None => false,
     });
-    ex.abilities.retain_mut(|a| match ground_name(&a.name, &hay) {
+    ex.abilities.retain_mut(|a| match ground_name(&a.name) {
         Some(n) => {
             a.name = n;
             a.source_quote = grounded_quote(&a.source_quote, &hay);
@@ -1444,7 +1538,7 @@ fn ground_extraction(mut ex: Extraction, corpus: &str) -> Extraction {
     // entity names rather than at hallucinated variants (which render as extra,
     // unusable vertices in the graph).
     ex.relations.retain_mut(|r| {
-        match (ground_name(&r.from, &hay), ground_name(&r.to, &hay)) {
+        match (ground_name(&r.from), ground_name(&r.to)) {
             (Some(f), Some(t)) if !f.eq_ignore_ascii_case(&t) => {
                 r.from = f;
                 r.to = t;
@@ -1536,6 +1630,29 @@ const NAME_STOPWORDS: &[&str] = &[
     "na", "nos", "nas", "ao", "aos", "e", "ou", "que", "com", "por", "para", "sem", "seu", "sua",
     "ele", "ela", "eles", "elas", "isso", "esse", "essa", "este", "esta", "the", "of",
 ];
+
+/// Ground a name, preferring the spelling already saved in the vault.
+///
+/// If the emitted name matches a saved entity AND the text gives evidence of the
+/// mention, the SAVED name is returned — so "Leonardo Silva" reported over a
+/// chapter that only writes "Leonardo" updates the existing card rather than
+/// spawning a second one. Evidence is still required: a saved name the window
+/// never mentions is dropped, so the roster can't be copied in wholesale.
+fn ground_known_name(
+    raw: &str,
+    hay: &str,
+    known: &std::collections::HashMap<String, String>,
+) -> Option<String> {
+    let corpus_form = ground_name(raw, hay)?;
+    let cleaned = clean_name(raw);
+    Some(
+        known
+            .get(&fold(&cleaned))
+            .or_else(|| known.get(&fold(&corpus_form)))
+            .cloned()
+            .unwrap_or(corpus_form),
+    )
+}
 
 /// The longest run of consecutive words of `raw` that appears verbatim in the
 /// folded corpus `hay`. Ties break on how often the run occurs (a real name is
@@ -1950,7 +2067,7 @@ O Rei Yan Serafine chegou depois. Leo correu.";
             abilities: vec![ExtractedAbility { name: "Chamas do Vazio".into(), kind: String::new(), summary: String::new(), source_doc: String::new(), source_quote: String::new() }],
             relations: vec![ExtractedRel { from: "Leonardo Venante".into(), to: "Charlotte".into(), label: "conhece".into() }],
         };
-        let g = ground_extraction(ex, CORPUS);
+        let g = ground_extraction(ex, CORPUS, &Default::default());
         assert_eq!(g.characters.len(), 1);
         assert_eq!(g.characters[0].name, "Leonardo");
         assert_eq!(g.characters[0].source_quote, "", "citação inventada deve ser apagada");
@@ -1958,6 +2075,34 @@ O Rei Yan Serafine chegou depois. Leo correu.";
         // The relation endpoint was rewritten to the grounded name.
         assert_eq!(g.relations.len(), 1);
         assert_eq!(g.relations[0].from, "Leonardo");
+    }
+
+    /// The whole point of showing the saved cast to the extractor: a character met
+    /// in an earlier chapter must be recognized and updated, never duplicated.
+    #[test]
+    fn saved_entities_are_reused_not_duplicated() {
+        let hay = fold(CORPUS);
+        let known: std::collections::HashMap<String, String> =
+            [("charlotte", "Charlotte Bessa"), ("leonardo", "Leonardo")]
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+        // The chapter writes only "Charlotte"; the saved card is "Charlotte Bessa".
+        // Either spelling must land on the saved name so merge_extracted updates it.
+        assert_eq!(ground_known_name("Charlotte Bessa", &hay, &known).as_deref(), Some("Charlotte Bessa"));
+        assert_eq!(ground_known_name("Charlotte", &hay, &known).as_deref(), Some("Charlotte Bessa"));
+        // A saved name the window never mentions gets no free pass — the roster
+        // must not be copied in wholesale.
+        assert_eq!(ground_known_name("Mirela Aldaravi", &hay, &known), None);
+    }
+
+    #[test]
+    fn roster_lists_every_saved_entity() {
+        let chars = vec!["Leonardo".to_string(), "Charlotte Bessa".to_string()];
+        let r = roster_block(&chars, &["Aldébaran".to_string()], &[]);
+        assert!(r.contains("Leonardo; Charlotte Bessa"));
+        assert!(r.contains("Aldébaran"));
+        assert!(roster_block(&[], &[], &[]).is_empty());
     }
 
     #[test]

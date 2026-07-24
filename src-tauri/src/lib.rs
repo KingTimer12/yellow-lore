@@ -408,15 +408,24 @@ async fn extract_entities(
         return state.db.entities(&vault);
     }
 
-    // Pass the names already saved so the extractor can fold a name introduced in
-    // this run into a fuller name from a previous run (cross-run dedup).
+    // The full saved cast is handed to the extractor: it is shown to the model so a
+    // character from an earlier chapter is recognized and merely updated, and it
+    // also lets a name introduced in this run fold into a fuller name saved by a
+    // previous run (cross-run dedup).
     let existing = state.db.entities(&vault)?;
     let existing_chars: Vec<String> = existing.characters.iter().map(|c| c.name.clone()).collect();
     let existing_places: Vec<String> = existing.places.iter().map(|p| p.name.clone()).collect();
+    let existing_abilities: Vec<String> = existing.abilities.iter().map(|a| a.name.clone()).collect();
 
-    let res =
-        rag::extract_entities(&state.client, &cfg, &target, &existing_chars, &existing_places)
-            .await?;
+    let res = rag::extract_entities(
+        &state.client,
+        &cfg,
+        &target,
+        &existing_chars,
+        &existing_places,
+        &existing_abilities,
+    )
+    .await?;
     state.db.merge_extracted(&vault, &res.characters, &res.places, &res.abilities, &res.relations)?;
     // Fold previously-saved rows that this run revealed to be the same entity
     // (cross-run dupes like "Sophia" vs "Sophia, Flor do Abismo").
