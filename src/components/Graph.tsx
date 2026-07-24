@@ -40,6 +40,17 @@ export default function Graph() {
   // (`state.linkSource`), started from the entity drawer.
   const [linkCursor, setLinkCursor] = createSignal({ x: 0, y: 0 });
 
+  // ---- Volume controls -----------------------------------------------------
+  // A 29-chapter work yields hundreds of entities; drawing them all makes the map
+  // unreadable (and the O(n²) simulation crawl). Default to the most connected
+  // slice and let the reader widen or focus from there.
+  const [kinds, setKinds] = createSignal({ character: true, place: true, ability: true });
+  const [onlyLinked, setOnlyLinked] = createSignal(false);
+  const [cap, setCap] = createSignal(60);
+  const [focus, setFocus] = createSignal("");
+  const toggleKind = (k: "character" | "place" | "ability") =>
+    setKinds((s) => ({ ...s, [k]: !s[k] }));
+
   // ---- Build graph from entity data (rebuilds when data changes) ----------
   const graph = createMemo(() => {
     const nodes = new Map<string, Node>();
@@ -82,7 +93,41 @@ export default function Graph() {
         nodes.get(b)!.deg++;
       }
     }
-    return { nodes: [...nodes.values()], edges };
+
+    // ---- Apply the volume controls ----------------------------------------
+    const all = [...nodes.values()];
+    const k = kinds();
+    let vis = all.filter((n) => n.kind === "unknown" || k[n.kind]);
+
+    // Focus search: the matches plus everything directly related to them, so a
+    // name search yields that character's neighbourhood instead of a lone dot.
+    const q = focus().trim().toLowerCase();
+    if (q) {
+      const hit = new Set(vis.filter((n) => n.name.toLowerCase().includes(q)).map((n) => n.id));
+      const keep = new Set(hit);
+      for (const e of edges) {
+        if (hit.has(e.a)) keep.add(e.b);
+        if (hit.has(e.b)) keep.add(e.a);
+      }
+      vis = vis.filter((n) => keep.has(n.id));
+    }
+    if (onlyLinked()) vis = vis.filter((n) => n.deg > 0);
+
+    // Cap by connectivity: the hubs are what carry the story.
+    const total = all.length;
+    if (vis.length > cap()) {
+      vis = [...vis]
+        .sort((a, b) => b.deg - a.deg || a.name.localeCompare(b.name, "pt"))
+        .slice(0, cap());
+    }
+
+    const visible = new Set(vis.map((n) => n.id));
+    return {
+      nodes: vis,
+      edges: edges.filter((e) => visible.has(e.a) && visible.has(e.b)),
+      total,
+      hidden: total - vis.length,
+    };
   });
 
   const nodeById = createMemo(() => {
@@ -170,6 +215,9 @@ export default function Graph() {
         nd.vy += -nd.y * 0.006 * alpha;
         if (nd.fx !== undefined) { nd.x = nd.fx; nd.y = nd.fy!; nd.vx = 0; nd.vy = 0; }
         else { nd.x += nd.vx; nd.y += nd.vy; nd.vx *= 0.82; nd.vy *= 0.82; }
+        // Keep positions live, not just on unmount — changing a filter rebuilds the
+        // node list, and without this the layout would snap back to the seed spiral.
+        savedPos.set(nd.id, { x: nd.x, y: nd.y });
       }
       alpha *= 0.9915;
       if (alpha < 0.004) alpha = 0.004; // never fully freeze; keeps drag responsive
@@ -381,6 +429,72 @@ export default function Graph() {
         </g>
       </svg>
 
+      {/* Volume controls — keeps a large cast readable */}
+      <div class="absolute left-3 top-3 flex flex-col gap-2 max-w-260px">
+        <div class="relative">
+          <input
+            value={focus()}
+            onInput={(e) => { setFocus(e.currentTarget.value); reheat(); }}
+            placeholder="Focar em um nó…"
+            class="w-45 px-2.5 py-1.5 pr-7 rounded-8px border border-border bg-bg/85 backdrop-blur text-fg text-11.5px box-border outline-none transition-colors focus:border-accent"
+          />
+          <Show when={focus()}>
+            <div
+              onClick={() => { setFocus(""); reheat(); }}
+              title="Limpar"
+              class="absolute right-1.5 top-1/2 -translate-y-1/2 w-5 h-5 flex items-center justify-center rounded-5px text-fg-muted text-13px cursor-pointer hover:bg-hover hover:text-fg"
+            >
+              ×
+            </div>
+          </Show>
+        </div>
+        <div class="flex items-center gap-1.5 flex-wrap">
+          <For each={[["character", "Personagens"], ["place", "Lugares"], ["ability", "Habilidades"]] as const}>
+            {([k, label]) => (
+              <div
+                onClick={() => { toggleKind(k); reheat(); }}
+                class="flex items-center gap-1.25 px-2 py-1 rounded-6px border text-10.5px font-semibold cursor-pointer transition-colors select-none"
+                classList={{
+                  "border-border bg-bg/85 text-fg": kinds()[k],
+                  "border-border bg-bg/50 text-fg-muted opacity-60": !kinds()[k],
+                }}
+              >
+                <span class="w-2 h-2 rounded-full" style={{ background: COLOR[k] }} />
+                {label}
+              </div>
+            )}
+          </For>
+        </div>
+        <div class="flex items-center gap-1.5 flex-wrap">
+          <div
+            onClick={() => { setOnlyLinked((v) => !v); reheat(); }}
+            title="Esconde entidades sem nenhuma relação"
+            class="px-2 py-1 rounded-6px border border-border text-10.5px font-semibold cursor-pointer transition-colors select-none"
+            classList={{
+              "bg-accent-soft text-accent": onlyLinked(),
+              "bg-bg/85 text-fg-muted": !onlyLinked(),
+            }}
+          >
+            só conectados
+          </div>
+          <select
+            value={String(cap())}
+            onChange={(e) => { setCap(Number(e.currentTarget.value)); reheat(); }}
+            title="Quantos nós desenhar (os mais conectados primeiro)"
+            class="px-1.5 py-1 rounded-6px border border-border bg-bg/85 text-fg text-10.5px outline-none cursor-pointer"
+          >
+            <For each={[40, 60, 100, 250, 99999]}>
+              {(n) => <option value={String(n)}>{n === 99999 ? "todos" : `top ${n}`}</option>}
+            </For>
+          </select>
+        </div>
+        <Show when={graph().hidden > 0}>
+          <div class="text-10px text-fg-muted px-0.5">
+            {graph().hidden} de {graph().total} nós ocultos
+          </div>
+        </Show>
+      </div>
+
       {/* Connect-mode banner */}
       <Show when={state.linkSource}>
         {(src) => (
@@ -409,8 +523,10 @@ export default function Graph() {
       </div>
 
       <Show when={graph().nodes.length === 0}>
-        <div class="absolute inset-0 flex items-center justify-center text-13px text-fg-muted">
-          Nenhuma entidade ainda — extraia da base para montar o grafo.
+        <div class="absolute inset-0 flex items-center justify-center text-13px text-fg-muted text-center px-8">
+          {graph().total === 0
+            ? "Nenhuma entidade ainda — extraia da base para montar o grafo."
+            : "Nenhum nó corresponde aos filtros atuais."}
         </div>
       </Show>
     </div>
