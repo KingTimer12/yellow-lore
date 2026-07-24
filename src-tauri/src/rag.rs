@@ -194,7 +194,7 @@ async fn build_chat(
             let mut selected: Vec<&Chunk> =
                 chunks.iter().filter(|c| target_docs.contains(&c.doc_id)).collect();
             selected.sort_by(|a, b| {
-                a.doc_name.cmp(&b.doc_name).then(a.ordinal.cmp(&b.ordinal))
+                cmp_doc(&a.doc_name, &b.doc_name).then(a.ordinal.cmp(&b.ordinal))
             });
             // Budget the material so a long chapter can't blow up the context window
             // (which itself causes truncated answers on reasoning models).
@@ -241,6 +241,24 @@ async fn build_chat(
                 hits.extend(openings);
             }
 
+            // First-occurrence questions ("o que X falou pela PRIMEIRA VEZ para Y?",
+            // "quando se conheceram?") are about the EARLIEST scene in reading order.
+            // Cosine similarity has no notion of "earliest", so top-k lands on whatever
+            // late chapter phrases it best — the model then answers "não foi possível
+            // identificar" (or invents a prior acquaintance). Force-inject the earliest
+            // chunks that actually mention the entities named in the question.
+            if wants_first_time(&question) {
+                let have: std::collections::HashSet<&str> =
+                    hits.iter().map(|h| h.chunk.id.as_str()).collect();
+                let firsts: Vec<vector_store::ScoredChunk> =
+                    first_mention_chunks(&question, entity_names, chunks, 5)
+                        .into_iter()
+                        .filter(|c| !have.contains(c.id.as_str()))
+                        .map(|c| vector_store::ScoredChunk { chunk: c.clone(), score: 1.0 })
+                        .collect();
+                hits.extend(firsts);
+            }
+
             // Optional rerank: one cheap LLM pass orders the retrieved chunks by
             // relevance to the question, trimming top-k noise before we build the
             // context. Non-fatal — on any failure the hybrid order is kept.
@@ -255,10 +273,11 @@ async fn build_chat(
         // positional questions ("primeira frase", "início do capítulo") and never
         // confuses fragments of one document with another's.
         let mut ordered: Vec<&vector_store::ScoredChunk> = hits.iter().collect();
+        // Natural (number-aware) document order: "Capítulo 2" must come before
+        // "Capítulo 10". Plain string compare puts 10 first, which silently breaks
+        // reading order — and with it every "first time / earliest" question.
         ordered.sort_by(|a, b| {
-            a.chunk
-                .doc_name
-                .cmp(&b.chunk.doc_name)
+            cmp_doc(&a.chunk.doc_name, &b.chunk.doc_name)
                 .then(a.chunk.ordinal.cmp(&b.chunk.ordinal))
         });
         // Number each fragment [Fonte N] in the exact order the model reads it, so
@@ -307,6 +326,13 @@ específico (ex.: \"capítulo 1\"), use SOMENTE os trechos cujo nome de document
 corresponde — nunca misture documentos diferentes. Para perguntas sobre a abertura \
 (\"primeira frase\", \"como começa\"), use o trecho marcado \"início do documento\" \
 daquele documento; se ele não estiver presente, diga que não recuperou a abertura.\n\n\
+Responda SOMENTE com o que está escrito nos trechos. NÃO deduza, NÃO suponha e NÃO preencha \
+lacunas: se o texto não afirma algo (por exemplo, que dois personagens já se conheciam antes), \
+não afirme — e não trate uma suposição sua como fato. Se a informação pedida não estiver nos \
+trechos, diga isso e aponte o que faltou. Para perguntas de PRIMEIRA ocorrência (\"primeira vez \
+que…\", \"quando se conheceram\", \"primeira coisa que disse\"), os documentos vêm em ordem de \
+capítulo: use a ocorrência mais ANTIGA presente nos trechos, cite-a, e nunca escolha uma cena \
+posterior. Se houver diálogo literal, transcreva a fala entre aspas.\n\n\
 Ao final de cada afirmação apoiada nos trechos, cite a(s) fonte(s) usada(s) com o marcador \
 correspondente, ex.: [1] ou [2][3]. Cite APENAS as fontes que realmente sustentam a resposta. \
 Escreva de forma fluida: evite repetir o nome próprio dos personagens a cada frase — use pronomes \
@@ -789,6 +815,154 @@ fn wants_opening(question: &str) -> bool {
     has_unit && has_low_ordinal
 }
 
+/// Lowercase + strip Portuguese accents + collapse whitespace. Used for all
+/// text matching (grounding, entity lookup) so "Salazar" matches "SALAZÁR".
+fn fold(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut prev_space = false;
+    for ch in s.chars() {
+        let c = match ch {
+            'á' | 'à' | 'â' | 'ã' | 'ä' | 'Á' | 'À' | 'Â' | 'Ã' | 'Ä' => 'a',
+            'é' | 'è' | 'ê' | 'ë' | 'É' | 'È' | 'Ê' | 'Ë' => 'e',
+            'í' | 'ì' | 'î' | 'ï' | 'Í' | 'Ì' | 'Î' | 'Ï' => 'i',
+            'ó' | 'ò' | 'ô' | 'õ' | 'ö' | 'Ó' | 'Ò' | 'Ô' | 'Õ' | 'Ö' => 'o',
+            'ú' | 'ù' | 'û' | 'ü' | 'Ú' | 'Ù' | 'Û' | 'Ü' => 'u',
+            'ç' | 'Ç' => 'c',
+            'ñ' | 'Ñ' => 'n',
+            other => other,
+        };
+        if c.is_whitespace() {
+            if !prev_space {
+                out.push(' ');
+            }
+            prev_space = true;
+        } else {
+            for l in c.to_lowercase() {
+                out.push(l);
+            }
+            prev_space = false;
+        }
+    }
+    out.trim().to_string()
+}
+
+/// Natural (number-aware) comparison of document names, so "Capítulo 2" sorts
+/// before "Capítulo 10". Plain lexicographic compare inverts them, which destroys
+/// reading order on any work with 10+ chapters.
+fn cmp_doc(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let (fa, fb) = (fold(a), fold(b));
+    let mut ia = fa.chars().peekable();
+    let mut ib = fb.chars().peekable();
+    loop {
+        match (ia.peek().copied(), ib.peek().copied()) {
+            (None, None) => return Ordering::Equal,
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (Some(ca), Some(cb)) => {
+                if ca.is_ascii_digit() && cb.is_ascii_digit() {
+                    // Compare whole numeric runs by value, not digit by digit.
+                    let na: String = std::iter::from_fn(|| ia.next_if(|c| c.is_ascii_digit())).collect();
+                    let nb: String = std::iter::from_fn(|| ib.next_if(|c| c.is_ascii_digit())).collect();
+                    let va = na.trim_start_matches('0');
+                    let vb = nb.trim_start_matches('0');
+                    let ord = va.len().cmp(&vb.len()).then_with(|| va.cmp(vb));
+                    if ord != Ordering::Equal {
+                        return ord;
+                    }
+                } else {
+                    ia.next();
+                    ib.next();
+                    let ord = ca.cmp(&cb);
+                    if ord != Ordering::Equal {
+                        return ord;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Heuristic: is the question about the FIRST occurrence of something (first
+/// meeting, first words, first appearance)? These need the earliest chunk in
+/// reading order, which cosine similarity never ranks for.
+fn wants_first_time(question: &str) -> bool {
+    let q = fold(question);
+    const CUES: [&str; 11] = [
+        "primeira vez",
+        "primeiro encontro",
+        "primeira conversa",
+        "primeira fala",
+        "primeira interacao",
+        "primeira coisa que",
+        "se conheceram",
+        "se conheciam",
+        "quando conheceu",
+        "quando conhece",
+        "primeira aparicao",
+    ];
+    CUES.iter().any(|c| q.contains(c))
+}
+
+/// Earliest chunks (reading order) that mention the entities named in the
+/// question. Chunks mentioning ALL of them come first; if there are too few, the
+/// earliest chunks mentioning any single one fill the rest.
+fn first_mention_chunks<'a>(
+    question: &str,
+    entity_names: &[String],
+    chunks: &'a [Chunk],
+    limit: usize,
+) -> Vec<&'a Chunk> {
+    let q = fold(question);
+    // Seeds: known entity names that literally appear in the question.
+    let mut seeds: Vec<String> = Vec::new();
+    for name in entity_names {
+        let f = fold(name);
+        if f.chars().count() >= 3 && q.contains(&f) && !seeds.contains(&f) {
+            seeds.push(f);
+        }
+    }
+    if seeds.is_empty() {
+        return Vec::new();
+    }
+    // Drop seeds that are contained in a longer seed ("Leo" inside "Leonardo") —
+    // otherwise the short one matches chunks the full name never appears in.
+    let all_seeds = seeds.clone();
+    seeds.retain(|s| !all_seeds.iter().any(|o| o != s && o.contains(s.as_str())));
+
+    let mut ordered: Vec<&Chunk> = chunks.iter().collect();
+    ordered.sort_by(|a, b| cmp_doc(&a.doc_name, &b.doc_name).then(a.ordinal.cmp(&b.ordinal)));
+
+    let mut out: Vec<&Chunk> = Vec::new();
+    let mut partial: Vec<&Chunk> = Vec::new();
+    for c in ordered {
+        let t = fold(&c.text);
+        let hits = seeds.iter().filter(|s| t.contains(s.as_str())).count();
+        if hits == seeds.len() {
+            if out.len() < limit {
+                out.push(c);
+            }
+        } else if hits > 0 && partial.len() < limit {
+            partial.push(c);
+        }
+        if out.len() >= limit {
+            break;
+        }
+    }
+    // Co-occurrence is the strong signal; single mentions only pad a thin result.
+    if out.len() < 2 {
+        for c in partial {
+            if out.len() >= limit {
+                break;
+            }
+            if !out.iter().any(|e| e.id == c.id) {
+                out.push(c);
+            }
+        }
+    }
+    out
+}
+
 /// Strip a leading `<think>…</think>` reasoning block (closed or still open).
 fn strip_think(raw: &str) -> String {
     let s = raw.trim_start();
@@ -902,10 +1076,12 @@ pub async fn extract_entities(
     // Split the whole corpus into ~12k-char windows on chunk boundaries, run the
     // LLM per window, and merge — so large works are covered, not just the head.
     const WINDOW_CHARS: usize = 12_000;
-    // Cost/time guard. Raised from 12 — a 12-chapter work overflowed the old cap
-    // and silently dropped later chapters (missing their characters). Incremental
-    // extraction keeps each run small, so a higher ceiling rarely bites.
-    const MAX_WINDOWS: usize = 40;
+    // Cost/time guard. Raised again: 40 windows ≈ 480k chars, which a 29-chapter
+    // work already overflows — the tail chapters were silently dropped, so their
+    // characters simply never existed. Coverage beats speed here; incremental
+    // extraction keeps normal runs (a chapter or two) small anyway, and only a full
+    // re-extract pays the whole cost.
+    const MAX_WINDOWS: usize = 150;
     let mut windows: Vec<String> = Vec::new();
     let mut cur = String::new();
     for c in chunks {
@@ -1188,9 +1364,12 @@ Responda APENAS com JSON válido, sem texto extra, sem markdown. Formato:\n\
 Seja CONCISO para responder rápido: \"summary\" com 1 a 2 frases curtas; \"sourceQuote\" \
 uma citação literal de no máximo ~100 caracteres. Não repita informação nem escreva prosa fora do JSON. \
 Use o idioma do texto. \
-Use SEMPRE o nome mais completo de cada personagem/lugar (ex.: \"Cesar Magnus\", não só \"Cesar\"); \
-se o texto citar só o primeiro nome ou um apelido, trate como o mesmo personagem e use o nome completo. \
-Nas relações, use exatamente esses mesmos nomes completos.\n\
+REGRA DE NOME (crítica): copie o nome EXATAMENTE como ele aparece escrito no texto. \
+NUNCA invente sobrenome nem junte palavras próximas para formar um nome — títulos, classes, \
+espécies, facções, grupos e tipos de poder NÃO são sobrenomes. Se o texto só usa o primeiro nome \
+ou um apelido, use exatamente ele. Um nome por entrada: nada de \"Leo / Leonardo\", \
+\"Leonardo (Leo)\" ou variações no mesmo campo \"name\". Nas relações, use exatamente esses \
+mesmos nomes.\n\
 Extraia TODOS os personagens — SERES (pessoas, criaturas, entidades vivas ou sencientes) — \
 INCLUSIVE os citados por apelido, epíteto, título ou cargo (ex.: \"Salazar Bessa\", \"David Bessa\", \
 \"A Bruxa\", \"Rei Yan Serafine\", \"o Caçador\"): todos são personagens. NUNCA deixe de fora um ser só \
@@ -1219,8 +1398,203 @@ NÃO use frases nem expressões de várias palavras em traits — qualquer descr
     let raw = strip_think(&raw);
     let json = extract_json_block(&raw)
         .ok_or_else(|| AppError::Msg("modelo não retornou JSON válido para extração".into()))?;
-    serde_json::from_str(&json)
-        .map_err(|e| AppError::Msg(format!("falha ao ler JSON da extração: {e}")))
+    let parsed: Extraction = serde_json::from_str(&json)
+        .map_err(|e| AppError::Msg(format!("falha ao ler JSON da extração: {e}")))?;
+    Ok(ground_extraction(parsed, corpus))
+}
+
+/// Keep only what the source text actually says.
+///
+/// Every entity name is rewritten to the longest run of its own words that
+/// appears VERBATIM in the window the model just read; entities with no grounded
+/// form at all are dropped. This is what kills the two worst failure modes at
+/// scale: outright invented characters/abilities, and fabricated surnames —
+/// "Leonardo Venante" (where "Venante" is the name of the powered class, not a
+/// family name) has no verbatim occurrence, so it collapses back to "Leonardo",
+/// which also folds the "Leo / Leonardo" and "Leonardo (Leo) Venante" duplicates
+/// into the same entity instead of three dead vertices.
+fn ground_extraction(mut ex: Extraction, corpus: &str) -> Extraction {
+    let hay = fold(corpus);
+
+    ex.characters.retain_mut(|c| match ground_name(&c.name, &hay) {
+        Some(n) => {
+            c.name = n;
+            c.source_quote = grounded_quote(&c.source_quote, &hay);
+            true
+        }
+        None => false,
+    });
+    ex.places.retain_mut(|p| match ground_name(&p.name, &hay) {
+        Some(n) => {
+            p.name = n;
+            p.source_quote = grounded_quote(&p.source_quote, &hay);
+            true
+        }
+        None => false,
+    });
+    ex.abilities.retain_mut(|a| match ground_name(&a.name, &hay) {
+        Some(n) => {
+            a.name = n;
+            a.source_quote = grounded_quote(&a.source_quote, &hay);
+            true
+        }
+        None => false,
+    });
+    // Relation endpoints get the same treatment, so edges point at the grounded
+    // entity names rather than at hallucinated variants (which render as extra,
+    // unusable vertices in the graph).
+    ex.relations.retain_mut(|r| {
+        match (ground_name(&r.from, &hay), ground_name(&r.to, &hay)) {
+            (Some(f), Some(t)) if !f.eq_ignore_ascii_case(&t) => {
+                r.from = f;
+                r.to = t;
+                true
+            }
+            _ => false,
+        }
+    });
+    ex
+}
+
+/// Normalize a model-emitted entity name: drop parenthetical alias blocks, keep
+/// the longest alternative of a "A / B" form, keep only the part before an
+/// em-dash epithet, and collapse whitespace/edge punctuation.
+fn clean_name(raw: &str) -> String {
+    // Remove "(...)" / "[...]" alias blocks: "Leonardo (Leo) Venante" → "Leonardo Venante".
+    let mut s = String::with_capacity(raw.len());
+    let mut depth = 0i32;
+    for ch in raw.chars() {
+        match ch {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth = (depth - 1).max(0),
+            _ if depth == 0 => s.push(ch),
+            _ => {}
+        }
+    }
+    // "Leonardo — o Caçador": the name precedes the epithet.
+    for sep in [" — ", " – ", " - "] {
+        if let Some(i) = s.find(sep) {
+            s.truncate(i);
+        }
+    }
+    // "Leo / Leonardo": alternative spellings of one name — keep the fullest.
+    if s.contains('/') || s.contains('|') {
+        s = s
+            .split(|c| c == '/' || c == '|')
+            .max_by_key(|p| p.trim().chars().count())
+            .unwrap_or(&s)
+            .to_string();
+    }
+    s.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim_matches(|c: char| c == '"' || c == '\'' || c == ',' || c == '.' || c == ':' || c == ';')
+        .trim()
+        .to_string()
+}
+
+/// Occurrences of `needle` in `hay` that stand on word boundaries. Plain
+/// substring matching is not enough: "do" would "ground" itself inside
+/// "Leonardo", letting a hallucinated "Chamas do Vazio" survive as the entity
+/// "do".
+fn word_occurrences(hay: &str, needle: &str) -> usize {
+    if needle.is_empty() {
+        return 0;
+    }
+    let bytes = hay.as_bytes();
+    let boundary = |i: usize| -> bool {
+        if i == 0 || i >= bytes.len() {
+            return true;
+        }
+        !hay[..i]
+            .chars()
+            .next_back()
+            .map_or(false, |c| c.is_alphanumeric())
+    };
+    let mut count = 0;
+    let mut from = 0;
+    while let Some(rel) = hay[from..].find(needle) {
+        let start = from + rel;
+        let end = start + needle.len();
+        let ends_clean = hay[end..].chars().next().map_or(true, |c| !c.is_alphanumeric());
+        if boundary(start) && ends_clean {
+            count += 1;
+        }
+        from = start + needle.len().max(1);
+        if from >= hay.len() {
+            break;
+        }
+    }
+    count
+}
+
+/// Function words that must never survive as an entity name on their own — they
+/// appear everywhere, so a hallucinated multi-word name could otherwise ground
+/// itself down to one of them.
+const NAME_STOPWORDS: &[&str] = &[
+    "a", "o", "as", "os", "um", "uma", "uns", "umas", "de", "do", "da", "dos", "das", "em", "no",
+    "na", "nos", "nas", "ao", "aos", "e", "ou", "que", "com", "por", "para", "sem", "seu", "sua",
+    "ele", "ela", "eles", "elas", "isso", "esse", "essa", "este", "esta", "the", "of",
+];
+
+/// The longest run of consecutive words of `raw` that appears verbatim in the
+/// folded corpus `hay`. Ties break on how often the run occurs (a real name is
+/// repeated; an accidental fragment is not), then leftmost. `None` = the model
+/// made the name up.
+fn ground_name(raw: &str, hay: &str) -> Option<String> {
+    let name = clean_name(raw);
+    if name.is_empty() {
+        return None;
+    }
+    let words: Vec<&str> = name.split_whitespace().collect();
+    // A "name" longer than this is a sentence, not an entity.
+    if words.is_empty() || words.len() > 8 {
+        return None;
+    }
+    for len in (1..=words.len()).rev() {
+        let mut best: Option<(usize, usize, String)> = None; // (count, -start, text)
+        for start in 0..=(words.len() - len) {
+            let run = words[start..start + len].join(" ");
+            let folded = fold(&run);
+            if folded.chars().count() < 2 {
+                continue;
+            }
+            // A lone function word is never a name, however often it occurs.
+            if len == 1 && NAME_STOPWORDS.contains(&folded.as_str()) {
+                continue;
+            }
+            let count = word_occurrences(hay, &folded);
+            if count == 0 {
+                continue;
+            }
+            let better = match &best {
+                None => true,
+                Some((bc, bs, _)) => count > *bc || (count == *bc && start < *bs),
+            };
+            if better {
+                best = Some((count, start, run));
+            }
+        }
+        if let Some((_, _, run)) = best {
+            return Some(run);
+        }
+    }
+    None
+}
+
+/// Keep `quote` only if it really occurs in the source; otherwise blank it out —
+/// a fabricated "literal quote" is worse than none, since the UI presents it as
+/// evidence.
+fn grounded_quote(quote: &str, hay: &str) -> String {
+    let q = quote.trim().trim_matches('"').trim();
+    if q.chars().count() < 8 {
+        return String::new();
+    }
+    if hay.contains(fold(q).as_str()) {
+        q.to_string()
+    } else {
+        String::new()
+    }
 }
 
 /// Merge a character into the map: first non-empty text wins, traits union.
@@ -1259,13 +1633,46 @@ fn merge_place(map: &mut std::collections::HashMap<String, ExtractedPlace>, p: E
     }
 }
 
-/// Lowercased word tokens (len ≥ 2) of a name.
+/// Folded word tokens (len ≥ 2) of a name.
 fn name_tokens(name: &str) -> Vec<String> {
-    name.to_lowercase()
+    fold(name)
         .split(|c: char| !c.is_alphanumeric())
         .filter(|t| t.chars().count() >= 2)
         .map(|t| t.to_string())
         .collect()
+}
+
+/// Titles/honorifics and articles that precede a name. Stripped before comparing
+/// so "Rei Yan Serafine" and "Yan Serafine" are recognized as one character.
+const HONORIFICS: &[&str] = &[
+    "rei", "rainha", "principe", "princesa", "lorde", "lady", "dom", "dona", "sir", "senhor",
+    "senhora", "padre", "frei", "irmao", "irma", "mestre", "mestra", "capitao", "comandante",
+    "general", "doutor", "doutora", "professor", "professora", "sao", "santa", "santo", "conde",
+    "condessa", "duque", "duquesa", "barao", "cavaleiro", "tio", "tia", "the", "los",
+];
+
+/// Name tokens with leading honorifics/articles removed — the identity-bearing
+/// part of the name.
+fn core_tokens(name: &str) -> Vec<String> {
+    let mut t = name_tokens(name);
+    while t.len() > 1 && HONORIFICS.contains(&t[0].as_str()) {
+        t.remove(0);
+    }
+    t
+}
+
+/// Whether every token of `short` also appears in `long` (order-insensitive).
+/// Order-insensitive on purpose: the model emits "Leo / Leonardo" → tokens
+/// [leo, leonardo], which is NOT an in-order subsequence of "Leonardo (Leo)
+/// Venante" → [leonardo, leo, venante], so the old ordered check missed it.
+fn is_subset(short: &[String], long: &[String]) -> bool {
+    short.iter().all(|s| long.contains(s))
+}
+
+/// Is `short` a plausible diminutive/short form of `long` ("leo" → "leonardo")?
+/// Requires a real prefix of at least 3 characters, so "ana" ↛ "andre".
+fn is_diminutive(short: &str, long: &str) -> bool {
+    short.chars().count() >= 3 && long.chars().count() > short.chars().count() && long.starts_with(short)
 }
 
 /// Names worth sending to the LLM dedup pass: those sharing at least one token
@@ -1273,55 +1680,89 @@ fn name_tokens(name: &str) -> Vec<String> {
 /// Aldric" ↔ "Aldric"). Names with no token overlap can't be aliases of anything
 /// here, so they're skipped to keep the dedup payload small and targeted.
 fn dubious_candidates(names: &[String]) -> Vec<String> {
-    let toks: Vec<Vec<String>> = names.iter().map(|n| name_tokens(n)).collect();
+    let toks: Vec<Vec<String>> = names.iter().map(|n| core_tokens(n)).collect();
     let mut out = Vec::new();
     for (i, ti) in toks.iter().enumerate() {
         if ti.is_empty() {
             continue;
         }
+        // Shares a whole token with another name ("Cesar" ↔ "Cesar Magnus")...
         let shares = toks
             .iter()
             .enumerate()
             .any(|(j, tj)| j != i && tj.iter().any(|t| ti.contains(t)));
-        if shares {
+        // ...or is a one-word short form whose prefix matches another name
+        // ("Leo" ↔ "Leonardo" — no shared token, so the old gate excluded it and
+        // the nickname never even reached the dedup pass)...
+        let prefixes = ti.len() == 1
+            && toks.iter().enumerate().any(|(j, tj)| {
+                j != i && tj.iter().any(|t| is_diminutive(&ti[0], t) || is_diminutive(t, &ti[0]))
+            });
+        // ...or is a short one-word name, the shape nicknames/epithets take
+        // ("Lô" for Charlotte), which only the LLM can resolve.
+        let nickname_shape = ti.len() == 1 && ti[0].chars().count() <= 5;
+        if shares || prefixes || nickname_shape {
             out.push(names[i].clone());
         }
     }
     out
 }
 
-/// Whether `short`'s tokens appear in `long` in order (a subsequence).
-fn is_subsequence(short: &[String], long: &[String]) -> bool {
-    let mut it = long.iter();
-    short.iter().all(|s| it.any(|l| l == s))
-}
-
-/// Map each partial name (lowercased) to the fullest name that contains it as a
-/// token subsequence — so "Cesar" resolves to "Cesar Magnus". Only shorter →
-/// longer, and resolution is chained so aliases collapse to one canonical name.
+/// Map each partial name (folded) to its canonical display name:
+///   * honorific variants collapse onto the untitled form ("Rei Yan Serafine" → "Yan Serafine");
+///   * a name whose words are all contained in a longer name folds into it ("Cesar" → "Cesar Magnus");
+///   * an unambiguous one-word short form folds into its long form ("Leo" → "Leonardo").
+/// Resolution is chained so aliases collapse to a single canonical name.
 fn canonical_map(names: &[String]) -> std::collections::HashMap<String, String> {
-    let toks: Vec<(String, Vec<String>)> =
-        names.iter().map(|n| (n.clone(), name_tokens(n))).collect();
+    let info: Vec<(String, Vec<String>)> =
+        names.iter().map(|n| (n.clone(), core_tokens(n))).collect();
     let mut out: std::collections::HashMap<String, String> = Default::default();
-    for (name, t) in &toks {
-        if t.is_empty() {
+
+    // Pass 1 — same identity core, different honorifics: prefer the plain name.
+    for (name, t) in &info {
+        if t.is_empty() || name_tokens(name).len() == t.len() {
+            continue; // no honorific to drop
+        }
+        if let Some(plain) = info
+            .iter()
+            .find(|(o, ot)| ot == t && name_tokens(o).len() == ot.len())
+        {
+            // Keys stay plain-lowercased (not accent-folded): db::apply_aliases
+            // matches them against SQL lower(name).
+            out.insert(name.to_lowercase(), plain.0.clone());
+        }
+    }
+
+    // Pass 2 — containment and unambiguous short forms.
+    for (name, t) in &info {
+        if t.is_empty() || out.contains_key(&name.to_lowercase()) {
             continue;
         }
         let mut best: Option<&(String, Vec<String>)> = None;
-        for cand in &toks {
-            if cand.0 == *name {
+        let mut dim: Option<&(String, Vec<String>)> = None;
+        let mut dim_count = 0usize;
+        for cand in &info {
+            if cand.0.eq_ignore_ascii_case(name) || cand.1.is_empty() {
                 continue;
             }
-            if cand.1.len() > t.len() && is_subsequence(t, &cand.1) {
+            if cand.1.len() > t.len() && is_subset(t, &cand.1) {
                 if best.map_or(true, |b| b.1.len() < cand.1.len()) {
                     best = Some(cand);
                 }
+            } else if t.len() == 1 && is_diminutive(&t[0], &cand.1[0]) {
+                // Count every long form this short name could belong to; fold only
+                // when exactly one exists, so "Leo" never guesses between
+                // "Leonardo" and "Leopoldo".
+                dim_count += 1;
+                dim = Some(cand);
             }
         }
-        if let Some(b) = best {
+        let pick = best.or(if dim_count == 1 { dim } else { None });
+        if let Some(b) = pick {
             out.insert(name.to_lowercase(), b.0.clone());
         }
     }
+
     chain_resolve(&mut out);
     out
 }
@@ -1370,6 +1811,29 @@ async fn llm_dedup(
     if names.len() < 2 {
         return Ok(out);
     }
+    // One giant list degrades badly: a 29-chapter work yields hundreds of names and
+    // the model starts truncating and inventing. Batch it, and let a failed batch
+    // cost only that batch.
+    const BATCH: usize = 60;
+    for batch in names.chunks(BATCH) {
+        if batch.len() < 2 {
+            continue;
+        }
+        if let Ok(m) = llm_dedup_batch(client, cfg, kind, batch, model).await {
+            out.extend(m);
+        }
+    }
+    Ok(out)
+}
+
+async fn llm_dedup_batch(
+    client: &reqwest::Client,
+    cfg: &RagConfig,
+    kind: &str,
+    names: &[String],
+    model: &str,
+) -> AppResult<std::collections::HashMap<String, String>> {
+    let mut out = std::collections::HashMap::new();
     let list = names
         .iter()
         .map(|n| format!("- {n}"))
@@ -1377,11 +1841,16 @@ async fn llm_dedup(
         .join("\n");
     let system = format!(
         "Você recebe uma lista de nomes de {kind} extraídos da MESMA obra. \
-Alguns podem se referir à mesma entidade (primeiro nome, apelido, título, variação). \
-Agrupe apenas os que são claramente a mesma entidade. Responda APENAS com JSON, sem markdown:\n\
-{{\"groups\":[{{\"canonical\":\"nome mais completo/canônico\",\"aliases\":[\"outro nome\",\"...\"]}}]}}\n\
-Inclua SOMENTE grupos com 2 ou mais nomes. Se não houver duplicatas, retorne {{\"groups\":[]}}. \
-Na dúvida, NÃO agrupe."
+Alguns são formas diferentes do MESMO ser: primeiro nome, apelido, diminutivo (\"Leo\" para \
+\"Leonardo\"), epíteto, título, ou a mesma pessoa com e sem sobrenome. Agrupe essas formas. \
+Responda APENAS com JSON, sem markdown:\n\
+{{\"groups\":[{{\"canonical\":\"nome da lista\",\"aliases\":[\"outro nome da lista\",\"...\"]}}]}}\n\
+REGRAS: \"canonical\" e cada alias DEVEM ser copiados EXATAMENTE de um nome da lista — \
+nunca escreva um nome que não está na lista e nunca combine dois nomes num só. \
+Escolha como \"canonical\" a forma mais usada e mais simples (sem título). \
+NÃO agrupe seres diferentes — parentes que compartilham sobrenome (pai e filho, irmãos) \
+são pessoas DISTINTAS. Inclua SOMENTE grupos com 2 ou mais nomes; sem duplicatas, \
+retorne {{\"groups\":[]}}. /no_think"
     );
     let user = format!("Nomes:\n{list}");
     let messages = vec![
@@ -1395,17 +1864,39 @@ Na dúvida, NÃO agrupe."
     let parsed: DedupResult =
         serde_json::from_str(&json).map_err(|e| AppError::Msg(format!("dedup: {e}")))?;
 
-    // Only trust groups whose members actually came from the extracted list.
-    let known: std::collections::HashSet<String> = names.iter().map(|n| n.to_lowercase()).collect();
+    // Only trust names that actually came from the list we sent.
+    let known: std::collections::HashMap<String, String> =
+        names.iter().map(|n| (n.to_lowercase(), n.clone())).collect();
     for g in parsed.groups {
-        let canonical = if g.canonical.trim().is_empty() {
+        // The canonical MUST be one of the given names. Without this check the model
+        // is free to invent a display name for the whole group (e.g. gluing a class
+        // name on as a surname), and every alias then points at a name that exists
+        // nowhere in the text.
+        let members: Vec<String> = g
+            .aliases
+            .iter()
+            .chain(std::iter::once(&g.canonical))
+            .filter_map(|n| known.get(&n.to_lowercase()).cloned())
+            .collect();
+        if members.len() < 2 {
             continue;
-        } else {
-            g.canonical.clone()
+        }
+        let canonical = match known.get(&g.canonical.to_lowercase()) {
+            Some(c) => c.clone(),
+            // Invented canonical → fall back to the group's shortest real name,
+            // which is the plainest form (titles and epithets only add words).
+            None => members
+                .iter()
+                .min_by_key(|n| (name_tokens(n).len(), n.chars().count()))
+                .cloned()
+                .unwrap_or_default(),
         };
-        for alias in g.aliases.iter().chain(std::iter::once(&g.canonical)) {
+        if canonical.is_empty() {
+            continue;
+        }
+        for alias in members {
             let low = alias.to_lowercase();
-            if known.contains(&low) && !low.eq_ignore_ascii_case(&canonical) {
+            if !low.eq_ignore_ascii_case(&canonical) {
                 out.insert(low, canonical.clone());
             }
         }
@@ -1422,5 +1913,142 @@ fn extract_json_block(raw: &str) -> Option<String> {
         Some(raw[start..=end].to_string())
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The real-world corpus shape: the text says "Leonardo" and separately talks
+    /// about "Venante" as the name of the powered class — never "Leonardo Venante".
+    const CORPUS: &str = "Leonardo olhou para Charlotte. Os Venante nasciam com poderes. \
+Leonardo sorriu. Charlotte respondeu: — Você é um deles? Salazar Bessa observava. \
+O Rei Yan Serafine chegou depois. Leo correu.";
+
+    #[test]
+    fn fabricated_surname_collapses_to_the_grounded_name() {
+        let hay = fold(CORPUS);
+        // All three model variants ground to the same real name → one entity, not three.
+        assert_eq!(ground_name("Leonardo Venante", &hay).as_deref(), Some("Leonardo"));
+        assert_eq!(ground_name("Leonardo (Leo) Venante", &hay).as_deref(), Some("Leonardo"));
+        assert_eq!(ground_name("Leo / Leonardo", &hay).as_deref(), Some("Leonardo"));
+        // A name the text never contains is a hallucination and is dropped.
+        assert_eq!(ground_name("Mirela Aldaravi", &hay), None);
+        // A name written verbatim survives intact.
+        assert_eq!(ground_name("Salazar Bessa", &hay).as_deref(), Some("Salazar Bessa"));
+    }
+
+    #[test]
+    fn hallucinated_entities_are_filtered_out() {
+        let ex = Extraction {
+            characters: vec![
+                ExtractedChar { name: "Leonardo Venante".into(), role: String::new(), summary: String::new(), traits: vec![], source_doc: String::new(), source_quote: "frase que nunca foi escrita".into() },
+                ExtractedChar { name: "Personagem Inexistente".into(), role: String::new(), summary: String::new(), traits: vec![], source_doc: String::new(), source_quote: String::new() },
+            ],
+            places: vec![],
+            abilities: vec![ExtractedAbility { name: "Chamas do Vazio".into(), kind: String::new(), summary: String::new(), source_doc: String::new(), source_quote: String::new() }],
+            relations: vec![ExtractedRel { from: "Leonardo Venante".into(), to: "Charlotte".into(), label: "conhece".into() }],
+        };
+        let g = ground_extraction(ex, CORPUS);
+        assert_eq!(g.characters.len(), 1);
+        assert_eq!(g.characters[0].name, "Leonardo");
+        assert_eq!(g.characters[0].source_quote, "", "citação inventada deve ser apagada");
+        assert!(g.abilities.is_empty(), "habilidade inventada deve sair");
+        // The relation endpoint was rewritten to the grounded name.
+        assert_eq!(g.relations.len(), 1);
+        assert_eq!(g.relations[0].from, "Leonardo");
+    }
+
+    #[test]
+    fn duplicate_name_forms_collapse_to_one_canonical() {
+        let names = vec![
+            "Leonardo".to_string(),
+            "Leo".to_string(),
+            "Rei Yan Serafine".to_string(),
+            "Yan Serafine".to_string(),
+        ];
+        let m = canonical_map(&names);
+        assert_eq!(m.get("leo").map(String::as_str), Some("Leonardo"));
+        // The honorific form folds onto the plain name, not the other way around.
+        assert_eq!(m.get("rei yan serafine").map(String::as_str), Some("Yan Serafine"));
+    }
+
+    #[test]
+    fn ambiguous_short_form_is_left_alone() {
+        let names = vec!["Leo".to_string(), "Leonardo".to_string(), "Leopoldo".to_string()];
+        assert!(canonical_map(&names).get("leo").is_none());
+    }
+
+    #[test]
+    fn nicknames_reach_the_dedup_pass() {
+        // "Leo" shares no whole token with "Leonardo Silva", and "Lô" shares none
+        // with "Charlotte" — both must still be offered to the LLM dedup.
+        let names = vec!["Leonardo Silva".to_string(), "Leo".to_string(), "Lô".to_string(), "Charlotte".to_string()];
+        let d = dubious_candidates(&names);
+        assert!(d.contains(&"Leo".to_string()));
+        assert!(d.contains(&"Lô".to_string()));
+    }
+
+    #[test]
+    fn chapters_sort_in_reading_order() {
+        let mut docs = vec!["Capítulo 10.txt", "Capítulo 2.txt", "Capítulo 1.txt", "Capítulo 21.txt"];
+        docs.sort_by(|a, b| cmp_doc(a, b));
+        assert_eq!(docs, vec!["Capítulo 1.txt", "Capítulo 2.txt", "Capítulo 10.txt", "Capítulo 21.txt"]);
+    }
+
+    #[test]
+    fn first_occurrence_questions_are_detected() {
+        assert!(wants_first_time("O que a Charlotte falou pela primeira vez para o Leonardo?"));
+        assert!(wants_first_time("Quando eles se conheceram?"));
+        assert!(!wants_first_time("O que a Charlotte falou no capítulo 5?"));
+        // The old opening heuristic never fired for this class of question.
+        assert!(!wants_opening("O que a Charlotte falou pela primeira vez para o Leonardo?"));
+    }
+
+    #[test]
+    fn earliest_co_occurrence_is_retrieved() {
+        let mk = |doc: &str, ord: usize, text: &str| Chunk {
+            id: format!("{doc}-{ord}"),
+            doc_id: doc.to_string(),
+            doc_name: doc.to_string(),
+            ordinal: ord,
+            text: text.to_string(),
+            vector: vec![],
+        };
+        let chunks = vec![
+            mk("Capítulo 10.txt", 0, "Charlotte e Leonardo discutiram de novo."),
+            mk("Capítulo 2.txt", 0, "Charlotte encarou Leonardo pela primeira vez."),
+            mk("Capítulo 3.txt", 0, "Leonardo estava só."),
+        ];
+        let names = vec!["Charlotte".to_string(), "Leonardo".to_string()];
+        let got = first_mention_chunks(
+            "O que a Charlotte falou pela primeira vez para o Leonardo?",
+            &names,
+            &chunks,
+            5,
+        );
+        // Chapter 2 must come first — plain string sort would have put 10 ahead of it.
+        assert_eq!(got[0].doc_name, "Capítulo 2.txt");
+    }
+
+    #[test]
+    fn dedup_canonical_must_exist_in_the_list() {
+        // Simulates the model answering with an invented canonical name.
+        let names = vec!["Leonardo".to_string(), "Leo".to_string()];
+        let known: std::collections::HashMap<String, String> =
+            names.iter().map(|n| (n.to_lowercase(), n.clone())).collect();
+        let members: Vec<String> = ["Leo", "Leonardo"]
+            .iter()
+            .filter_map(|n| known.get(&n.to_lowercase()).cloned())
+            .collect();
+        let invented = "Leonardo Venante";
+        assert!(known.get(&invented.to_lowercase()).is_none());
+        let fallback = members
+            .iter()
+            .min_by_key(|n| (name_tokens(n).len(), n.chars().count()))
+            .cloned()
+            .unwrap();
+        assert_eq!(fallback, "Leo");
     }
 }
