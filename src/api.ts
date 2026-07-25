@@ -1,7 +1,7 @@
 import { invoke as tauriInvoke, Channel } from "@tauri-apps/api/core";
 import type { Ability, Character, Doc, Message, Place, Relation, Session, Settings, Source, Vault } from "./store";
 
-export type StoredMessage = { id: string; role: "user" | "assistant"; text: string; thinking: string; sources: Source[] };
+export type StoredMessage = { id: string; role: "user" | "assistant"; text: string; thinking: string; sources: Source[]; durationMs: number | null };
 
 // True only inside the Tauri webview. In a plain browser (`bun run dev`) we
 // fall back to mock data so the UI still works for design/preview.
@@ -9,7 +9,28 @@ export const isTauri =
   typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
 export type Answer = { text: string; sources: Source[] };
-export type Entities = { characters: Character[]; places: Place[]; abilities: Ability[]; relations: Relation[] };
+export type Entities = {
+  characters: Character[];
+  places: Place[];
+  abilities: Ability[];
+  relations: Relation[];
+  /// Links the text states without naming one side — suggestions, not graph facts.
+  pendingRelations: Relation[];
+};
+export type ExtractOutcome = { entities: Entities; durationMs: number; cancelled: boolean };
+export type ExtractionStats = { durationMs: number; at: string; entityCount: number };
+
+// Progress emitted once per completed batch of extraction windows.
+export type ExtractEvent = {
+  type: "progress";
+  window: number;
+  totalWindows: number;
+  characters: number;
+  places: number;
+  abilities: number;
+  docs: string[];
+  elapsedMs: number;
+};
 
 // Streaming events emitted by the `ask_stream` command.
 export type StreamEvent =
@@ -66,14 +87,37 @@ export const api = {
   sessionMessages: (id: string) => tauriInvoke<StoredMessage[]>("session_messages", { id }),
   generateSessionTitle: (id: string, question: string, answer: string) =>
     tauriInvoke<string>("generate_session_title", { id, question, answer }),
-  addMessage: (session: string, role: string, text: string, thinking: string, sources: unknown) =>
-    tauriInvoke<void>("add_message", { session, role, text, thinking, sources }),
+  addMessage: (
+    session: string,
+    role: string,
+    text: string,
+    thinking: string,
+    sources: unknown,
+    durationMs?: number | null,
+  ) =>
+    tauriInvoke<void>("add_message", {
+      session,
+      role,
+      text,
+      thinking,
+      sources,
+      durationMs: durationMs ?? null,
+    }),
 
   // entities
   getEntities: () => tauriInvoke<Entities>("get_entities"),
   // Incremental by default; `force` re-scans every document (still preserving
   // edited/added entities).
-  extractEntities: (force = false) => tauriInvoke<Entities>("extract_entities", { force }),
+  extractEntities: (force = false, onEvent?: (e: ExtractEvent) => void) => {
+    const channel = new Channel<ExtractEvent>();
+    if (onEvent) channel.onmessage = onEvent;
+    return tauriInvoke<ExtractOutcome>("extract_entities", { force, onEvent: channel });
+  },
+  // Stops between batches, keeping what was already reconciled.
+  cancelExtraction: () => tauriInvoke<void>("cancel_extraction"),
+  lastExtraction: () => tauriInvoke<ExtractionStats | null>("last_extraction"),
+  promotePendingRelation: (relation: Relation, name: string) =>
+    tauriInvoke<void>("promote_pending_relation", { relation, name }),
   addCharacter: (character: Character) => tauriInvoke<void>("add_character", { character }),
   addPlace: (place: Place) => tauriInvoke<void>("add_place", { place }),
   addAbility: (ability: Ability) => tauriInvoke<void>("add_ability", { ability }),

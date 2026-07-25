@@ -97,6 +97,19 @@ pub struct StoredMessage {
     pub thinking: String,
     /// Sources as the JSON array the frontend uses (doc/quote/text objects).
     pub sources: serde_json::Value,
+    /// Wall-clock time the answer took, in ms. `None` for messages saved before
+    /// timing existed (and for user turns).
+    pub duration_ms: Option<i64>,
+}
+
+/// Duration and date of the last extraction of a vault, so the UI can tell the
+/// user what a run of this size cost last time.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtractionStats {
+    pub duration_ms: i64,
+    pub at: String,
+    pub entity_count: i64,
 }
 
 /// Everything the frontend needs to render the entity views for a vault.
@@ -107,6 +120,10 @@ pub struct Entities {
     pub places: Vec<Place>,
     pub abilities: Vec<Ability>,
     pub relations: Vec<Relation>,
+    /// Links the text states but does not name ("a mãe de Leonardo", nobody named).
+    /// Kept apart from `relations` on purpose: they must never reach the graph or
+    /// GraphRAG as facts, only the curation list where the user can name them.
+    pub pending_relations: Vec<Relation>,
 }
 
 // ---- Database -------------------------------------------------------------
@@ -182,6 +199,19 @@ impl Db {
                 [],
             )
             .ok();
+        }
+        // Migration: how long an answer took. NULL on rows written before this
+        // existed, which the UI renders as "no timing" rather than "0s".
+        let has_duration = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('messages') WHERE name = 'duration_ms'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|c| c > 0)
+            .unwrap_or(false);
+        if !has_duration {
+            conn.execute("ALTER TABLE messages ADD COLUMN duration_ms INTEGER", []).ok();
         }
         Ok(Db { conn: Mutex::new(conn) })
     }
@@ -427,6 +457,61 @@ impl Db {
         Ok(())
     }
 
+    /// How long the last extraction of this vault took, and when it ran. Lets the
+    /// UI answer "how long will this take?" before the user starts a long run.
+    pub fn last_extraction(&self, vault: &str) -> AppResult<Option<ExtractionStats>> {
+        // The guard is dropped before `count_entities` takes it again — this Mutex
+        // is not reentrant.
+        let stored = {
+            let conn = self.lock();
+            conn.query_row(
+                "SELECT value FROM meta WHERE key = ?1",
+                params![format!("extract_stats:{vault}")],
+                |r| r.get::<_, String>(0),
+            )
+            .ok()
+        };
+        let Some(v) = stored else { return Ok(None) };
+        // Stored as "<ms>|<iso datetime>".
+        let Some((ms, at)) = v.split_once('|') else { return Ok(None) };
+        let Ok(duration_ms) = ms.parse::<i64>() else { return Ok(None) };
+        Ok(Some(ExtractionStats {
+            duration_ms,
+            at: at.to_string(),
+            entity_count: self.count_entities(vault).unwrap_or(0),
+        }))
+    }
+
+    pub fn set_last_extraction(&self, vault: &str, duration_ms: i64) -> AppResult<()> {
+        let conn = self.lock();
+        let now: String = conn
+            .query_row("SELECT datetime('now')", [], |r| r.get(0))
+            .unwrap_or_default();
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = ?2",
+            params![format!("extract_stats:{vault}"), format!("{duration_ms}|{now}")],
+        )
+        .map_err(sql)?;
+        Ok(())
+    }
+
+    fn count_entities(&self, vault: &str) -> AppResult<i64> {
+        let conn = self.lock();
+        let mut total = 0i64;
+        for table in ["characters", "places", "abilities"] {
+            let n: i64 = conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE vault_id = ?1"),
+                    params![vault],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            total += n;
+        }
+        Ok(total)
+    }
+
     // --- Entities ---
 
     pub fn entities(&self, vault: &str) -> AppResult<Entities> {
@@ -435,6 +520,7 @@ impl Db {
             places: self.list_places(vault)?,
             abilities: self.list_abilities(vault)?,
             relations: self.list_relations(vault)?,
+            pending_relations: self.list_pending_relations(vault)?,
         })
     }
 
@@ -503,17 +589,50 @@ impl Db {
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
+    /// Confirmed edges only. `Pendente` rows are excluded: their `from_name` is a
+    /// relational term, not an entity, so letting them through would put the ghost
+    /// vertex we deliberately reject back on the graph and feed GraphRAG a
+    /// non-fact.
     pub fn list_relations(&self, vault: &str) -> AppResult<Vec<Relation>> {
+        self.relations_with_status(vault, false)
+    }
+
+    /// Links whose unnamed side the text never resolves — suggestions awaiting a
+    /// name, shown only in the curation list.
+    pub fn list_pending_relations(&self, vault: &str) -> AppResult<Vec<Relation>> {
+        self.relations_with_status(vault, true)
+    }
+
+    fn relations_with_status(&self, vault: &str, pending: bool) -> AppResult<Vec<Relation>> {
         let conn = self.lock();
-        let mut stmt = conn
-            .prepare("SELECT from_name, to_name, label FROM relations WHERE vault_id = ?1")
-            .map_err(sql)?;
+        let sql_text = if pending {
+            "SELECT from_name, to_name, label FROM relations WHERE vault_id = ?1 AND status = 'Pendente'"
+        } else {
+            "SELECT from_name, to_name, label FROM relations WHERE vault_id = ?1 AND status <> 'Pendente'"
+        };
+        let mut stmt = conn.prepare(sql_text).map_err(sql)?;
         let rows = stmt
             .query_map(params![vault], |r| {
                 Ok(Relation { from: r.get(0)?, to: r.get(1)?, label: r.get(2)? })
             })
             .map_err(sql)?;
         Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// Turn a pending link into a real edge by naming its unnamed side. The
+    /// promoted edge is `Manual`, so extraction will never touch it — naming is a
+    /// user decision and must not be undone by the next run.
+    pub fn promote_pending_relation(
+        &self,
+        vault: &str,
+        pending: &Relation,
+        name: &str,
+    ) -> AppResult<()> {
+        self.remove_relation(vault, pending)?;
+        self.add_relation(
+            vault,
+            &Relation { from: name.to_string(), to: pending.to.clone(), label: pending.label.clone() },
+        )
     }
 
     /// Fold already-saved entity rows into their canonical name, resolving dupes
@@ -633,24 +752,24 @@ impl Db {
             // User-created/edited relations (status 'Manual') are never rewritten —
             // only auto-extracted endpoints are folded onto the canonical name.
             tx.execute(
-                "UPDATE relations SET from_name=?3 WHERE vault_id=?1 AND lower(from_name)=?2 AND status<>'Manual'",
+                "UPDATE relations SET from_name=?3 WHERE vault_id=?1 AND lower(from_name)=?2 AND status='Extraído'",
                 params![vault, alias, canon],
             )
             .map_err(sql)?;
             tx.execute(
-                "UPDATE relations SET to_name=?3 WHERE vault_id=?1 AND lower(to_name)=?2 AND status<>'Manual'",
+                "UPDATE relations SET to_name=?3 WHERE vault_id=?1 AND lower(to_name)=?2 AND status='Extraído'",
                 params![vault, alias, canon],
             )
             .map_err(sql)?;
         }
         tx.execute(
-            "DELETE FROM relations WHERE vault_id=?1 AND status<>'Manual' AND lower(from_name)=lower(to_name)",
+            "DELETE FROM relations WHERE vault_id=?1 AND status='Extraído' AND lower(from_name)=lower(to_name)",
             params![vault],
         )
         .map_err(sql)?;
         // Dedup extracted duplicates only; Manual edges are protected.
         tx.execute(
-            "DELETE FROM relations WHERE vault_id=?1 AND status<>'Manual' AND id NOT IN \
+            "DELETE FROM relations WHERE vault_id=?1 AND status='Extraído' AND id NOT IN \
              (SELECT min(id) FROM relations WHERE vault_id=?1 \
               GROUP BY lower(from_name), lower(to_name), lower(label))",
             params![vault],
@@ -855,6 +974,7 @@ impl Db {
         places: &[Place],
         abilities: &[Ability],
         relations: &[Relation],
+        pending: &[Relation],
     ) -> AppResult<()> {
         let mut conn = self.lock();
         let tx = conn.transaction().map_err(sql)?;
@@ -1035,6 +1155,21 @@ impl Db {
                 ).map_err(sql)?;
             }
         }
+        // Pending links, same dedup. They are NOT promoted automatically when a
+        // later chapter finally names someone: the project has a history of wrong
+        // merges, and "same target + same label" is far too weak to bet an identity
+        // on (a character can have two aunts). The user promotes them from the
+        // curation list, where the suggestion is visible and reversible.
+        for r in pending {
+            let key = (r.from.to_lowercase(), r.to.to_lowercase(), r.label.to_lowercase());
+            if existing_rel.insert(key) {
+                tx.execute(
+                    "INSERT INTO relations (id, vault_id, from_name, to_name, label, status)
+                     VALUES (?1,?2,?3,?4,?5,'Pendente')",
+                    params![Uuid::new_v4().to_string(), vault, r.from, r.to, r.label],
+                ).map_err(sql)?;
+            }
+        }
 
         tx.commit().map_err(sql)?;
         Ok(())
@@ -1111,7 +1246,7 @@ impl Db {
     pub fn session_messages(&self, session: &str) -> AppResult<Vec<StoredMessage>> {
         let conn = self.lock();
         let mut stmt = conn
-            .prepare("SELECT id, role, text, thinking, sources FROM messages WHERE session_id = ?1 ORDER BY ordinal ASC")
+            .prepare("SELECT id, role, text, thinking, sources, duration_ms FROM messages WHERE session_id = ?1 ORDER BY ordinal ASC")
             .map_err(sql)?;
         let rows = stmt
             .query_map(params![session], |r| {
@@ -1122,6 +1257,7 @@ impl Db {
                     text: r.get(2)?,
                     thinking: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
                     sources: serde_json::from_str(&sources).unwrap_or(serde_json::Value::Array(vec![])),
+                    duration_ms: r.get::<_, Option<i64>>(5)?,
                 })
             })
             .map_err(sql)?;
@@ -1137,6 +1273,7 @@ impl Db {
         text: &str,
         thinking: &str,
         sources: &serde_json::Value,
+        duration_ms: Option<i64>,
     ) -> AppResult<()> {
         let mut conn = self.lock();
         let tx = conn.transaction().map_err(sql)?;
@@ -1145,9 +1282,9 @@ impl Db {
             .unwrap_or(0);
         let sources_json = serde_json::to_string(sources).unwrap_or_else(|_| "[]".into());
         tx.execute(
-            "INSERT INTO messages (id, session_id, vault_id, role, text, thinking, sources, ordinal, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, datetime('now'))",
-            params![Uuid::new_v4().to_string(), session, vault, role, text, thinking, sources_json, ord],
+            "INSERT INTO messages (id, session_id, vault_id, role, text, thinking, sources, ordinal, created_at, duration_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, datetime('now'), ?9)",
+            params![Uuid::new_v4().to_string(), session, vault, role, text, thinking, sources_json, ord, duration_ms],
         )
         .map_err(sql)?;
         tx.execute("UPDATE sessions SET updated_at = datetime('now') WHERE id = ?1", params![session])

@@ -49,6 +49,14 @@ pub struct RagConfig {
     #[serde(default = "default_true")]
     pub dedup_entities: bool,
 
+    /// Send each candidate's one-line summary and direct relations to the dedup
+    /// pass, not just the bare name. Catches duplicates whose names share nothing
+    /// ("Elisa" vs an unnamed role) — but multiplies that call's payload by roughly
+    /// ten and, because merging the wrong two people is much worse than leaving a
+    /// duplicate, it is OFF by default.
+    #[serde(default)]
+    pub dedup_with_context: bool,
+
     /// Optional model used ONLY for entity extraction. Empty = reuse `llm_model`
     /// (no second model to download or hold in VRAM — safe for weak GPUs).
     /// Point it at a smaller/faster model when you have the memory to spare.
@@ -124,6 +132,7 @@ impl Default for RagConfig {
             temperature: default_temperature(),
             show_sources: true,
             dedup_entities: true,
+            dedup_with_context: false,
             extraction_model: String::new(),
             extraction_concurrency: default_extraction_concurrency(),
             rerank: false,

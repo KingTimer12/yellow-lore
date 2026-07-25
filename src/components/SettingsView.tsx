@@ -146,6 +146,14 @@ export default function SettingsView() {
           label="Unificar entidades duplicadas via LLM na extração"
           hint="Passo extra que mescla apelidos/nomes parciais (ex.: “Cesar” = “Cesar Magnus”), inclusive contra entidades já salvas. Só os nomes ambíguos são enviados ao LLM."
         />
+        <Show when={state.settings.dedupEntities}>
+          <Toggle
+            on={state.settings.dedupWithContext}
+            onToggle={() => actions.setSetting("dedupWithContext", !state.settings.dedupWithContext)}
+            label="Enviar contexto junto dos nomes na unificação"
+            hint="Manda também o resumo de uma linha e as relações diretas de cada candidato, o que permite detectar duplicata cujos nomes não têm nada em comum. Custa cerca de dez vezes mais tokens nessa chamada e, como fundir duas pessoas diferentes é pior que deixar uma duplicata, vem desligado."
+          />
+        </Show>
       </div>
 
       <div class="flex items-center gap-3.5">

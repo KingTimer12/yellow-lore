@@ -1036,6 +1036,10 @@ struct Extraction {
     abilities: Vec<ExtractedAbility>,
     #[serde(default)]
     relations: Vec<ExtractedRel>,
+    /// Filled by `ground_extraction`, never by the model: links whose unnamed side
+    /// is a relational term the text never resolves to a name.
+    #[serde(skip)]
+    pending: Vec<ExtractedRel>,
 }
 
 /// Result of an extraction run: the fresh entities/relations, plus the alias
@@ -1046,8 +1050,31 @@ pub struct ExtractResult {
     pub places: Vec<Place>,
     pub abilities: Vec<Ability>,
     pub relations: Vec<Relation>,
+    /// Links whose unnamed side stayed unnamed ("a mãe" → Leonardo). Not entities,
+    /// not graph facts — suggestions the user can name later.
+    pub pending: Vec<Relation>,
     pub char_aliases: std::collections::HashMap<String, String>,
     pub place_aliases: std::collections::HashMap<String, String>,
+    /// Documents fully covered before the run ended. On cancellation this is
+    /// shorter than the request, so the untouched documents stay un-extracted and
+    /// the next run picks them up.
+    pub covered_docs: Vec<String>,
+    /// True when the run stopped early because the user cancelled.
+    pub cancelled: bool,
+}
+
+/// Progress of an extraction run, emitted once per completed batch of windows.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtractProgress {
+    pub window: usize,
+    pub total_windows: usize,
+    pub characters: usize,
+    pub places: usize,
+    pub abilities: usize,
+    /// Documents covered by the batch just finished, for a "currently on chapter
+    /// 14 of 29" style label.
+    pub docs: Vec<String>,
 }
 
 /// Split the corpus into LLM-sized windows on chunk boundaries.
@@ -1056,7 +1083,16 @@ pub struct ExtractResult {
 /// of text: welding the tail of one chapter to the head of the next put two
 /// unrelated scenes in one prompt, and the model then read a relational mention
 /// ("a mãe") against the wrong chapter and failed to tie it to a name.
-fn build_windows(chunks: &[Chunk]) -> Vec<String> {
+/// One LLM-sized slice of the corpus, plus which documents it covers — needed to
+/// report progress ("on chapter 14 of 29") and to know, after a cancellation,
+/// which documents were fully read and may be marked as extracted.
+struct Window {
+    text: String,
+    doc_ids: Vec<String>,
+    doc_names: Vec<String>,
+}
+
+fn build_windows(chunks: &[Chunk]) -> Vec<Window> {
     const WINDOW_CHARS: usize = 12_000;
     // Below this a window is too thin to be worth its own LLM call, so packing
     // continues across the document boundary rather than firing a call per short
@@ -1068,28 +1104,40 @@ fn build_windows(chunks: &[Chunk]) -> Vec<String> {
     // normal runs (a chapter or two) small, and only a full re-extract pays it all.
     const MAX_WINDOWS: usize = 150;
 
-    let mut windows: Vec<String> = Vec::new();
+    let mut windows: Vec<Window> = Vec::new();
     let mut cur = String::new();
+    let mut ids: Vec<String> = Vec::new();
+    let mut names: Vec<String> = Vec::new();
     let mut cur_doc: Option<&str> = None;
+    macro_rules! flush {
+        () => {{
+            windows.push(Window {
+                text: std::mem::take(&mut cur),
+                doc_ids: std::mem::take(&mut ids),
+                doc_names: std::mem::take(&mut names),
+            });
+            if windows.len() >= MAX_WINDOWS {
+                return windows;
+            }
+        }};
+    }
     for c in chunks {
         let new_doc = cur_doc.map_or(false, |d| d != c.doc_name.as_str());
         if new_doc && cur.len() >= MIN_SPLIT {
-            windows.push(std::mem::take(&mut cur));
-            if windows.len() >= MAX_WINDOWS {
-                return windows;
-            }
+            flush!();
         }
         cur_doc = Some(&c.doc_name);
+        if !ids.contains(&c.doc_id) {
+            ids.push(c.doc_id.clone());
+            names.push(c.doc_name.clone());
+        }
         cur.push_str(&format!("[{}]\n{}\n\n", c.doc_name, c.text));
         if cur.len() >= WINDOW_CHARS {
-            windows.push(std::mem::take(&mut cur));
-            if windows.len() >= MAX_WINDOWS {
-                return windows;
-            }
+            flush!();
         }
     }
     if !cur.trim().is_empty() {
-        windows.push(cur);
+        windows.push(Window { text: cur, doc_ids: ids, doc_names: names });
     }
     windows
 }
@@ -1103,6 +1151,8 @@ pub async fn extract_entities(
     existing_chars: &[String],
     existing_places: &[String],
     existing_abilities: &[String],
+    cancel: &std::sync::atomic::AtomicBool,
+    mut on_progress: impl FnMut(ExtractProgress),
 ) -> AppResult<ExtractResult> {
     if chunks.is_empty() {
         return Err(AppError::Msg(
@@ -1154,11 +1204,33 @@ pub async fn extract_entities(
     // batches, so growing it costs no extra LLM calls and keeps the parallelism
     // cloud users configured. A bad window is dropped (filter_map), not fatal.
     let concurrency = cfg.extraction_concurrency.max(1);
+
+    // Cancellation is checked between batches, never mid-window: a half-read window
+    // would contribute a partial cast. Documents whose every window finished are
+    // reported as covered, so `mark_extracted` only records what was really read and
+    // the rest is picked up by the next run.
+    let mut windows_left: std::collections::HashMap<&str, usize> = Default::default();
+    for w in &windows {
+        for id in &w.doc_ids {
+            *windows_left.entry(id.as_str()).or_insert(0) += 1;
+        }
+    }
+    let mut covered_docs: Vec<String> = Vec::new();
+    let mut cancelled = false;
+    let mut done_windows = 0usize;
+    let total_windows = windows.len();
+    let mut pending_out: Vec<ExtractedRel> = Vec::new();
+    let mut pending_set: std::collections::HashSet<(String, String, String)> = Default::default();
+
     for batch in windows.chunks(concurrency) {
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            cancelled = true;
+            break;
+        }
         let roster = roster_block(&roster_chars, &roster_places, &roster_abilities);
         let futs = batch
             .iter()
-            .map(|w| extract_window(client, cfg, w, ex_model, &roster, &known))
+            .map(|w| extract_window(client, cfg, &w.text, ex_model, &roster, &known))
             .collect::<Vec<_>>();
         let parsed_windows: Vec<Extraction> = stream::iter(futs)
             .buffer_unordered(concurrency)
@@ -1167,6 +1239,16 @@ pub async fn extract_entities(
             .await;
 
         for parsed in parsed_windows {
+            for r in &parsed.pending {
+                let key = (r.from.to_lowercase(), r.to.to_lowercase(), r.label.to_lowercase());
+                if pending_set.insert(key) {
+                    pending_out.push(ExtractedRel {
+                        from: r.from.clone(),
+                        to: r.to.clone(),
+                        label: r.label.clone(),
+                    });
+                }
+            }
             for c in parsed.characters {
                 if c.name.trim().is_empty() {
                     continue;
@@ -1198,9 +1280,48 @@ pub async fn extract_entities(
                 }
             }
         }
+
+        // Batch closed: report progress and record fully-read documents.
+        done_windows += batch.len();
+        let mut docs = Vec::new();
+        for w in batch {
+            for (id, name) in w.doc_ids.iter().zip(w.doc_names.iter()) {
+                if let Some(left) = windows_left.get_mut(id.as_str()) {
+                    *left -= 1;
+                    if *left == 0 {
+                        covered_docs.push(id.clone());
+                    }
+                }
+                if !docs.contains(name) {
+                    docs.push(name.clone());
+                }
+            }
+        }
+        on_progress(ExtractProgress {
+            window: done_windows,
+            total_windows,
+            characters: chars_map.len(),
+            places: places_map.len(),
+            abilities: abilities_map.len(),
+            docs,
+        });
     }
 
     if chars_map.is_empty() && places_map.is_empty() && abilities_map.is_empty() {
+        // Cancelling before the first batch produced anything is not a failure.
+        if cancelled {
+            return Ok(ExtractResult {
+                characters: vec![],
+                places: vec![],
+                abilities: vec![],
+                relations: vec![],
+                pending: vec![],
+                char_aliases: Default::default(),
+                place_aliases: Default::default(),
+                covered_docs,
+                cancelled,
+            });
+        }
         return Err(AppError::Msg(
             "o modelo não retornou entidades válidas — tente outro modelo de LLM".into(),
         ));
@@ -1243,13 +1364,22 @@ pub async fn extract_entities(
     // share a token with another are sent (the dubious ones); unambiguous names
     // are skipped, keeping the payload small. Failures are non-fatal.
     if cfg.dedup_entities {
+        // With `dedup_with_context`, each candidate also carries its one-line
+        // summary and its direct relations — the only way to spot a duplicate whose
+        // names have nothing in common. Off by default: it inflates the payload and
+        // a wrong merge costs more than a leftover duplicate.
+        let ctx = if cfg.dedup_with_context {
+            dedup_context(&chars_map, &places_map, &relations_out)
+        } else {
+            Default::default()
+        };
         let char_dubious = dubious_candidates(&char_names);
         let place_dubious = dubious_candidates(&place_names);
-        if let Ok(m) = llm_dedup(client, cfg, "personagens", &char_dubious, ex_model).await {
+        if let Ok(m) = llm_dedup(client, cfg, "personagens", &char_dubious, ex_model, &ctx).await {
             for (k, v) in m { char_canon.insert(k, v); }
             chain_resolve(&mut char_canon);
         }
-        if let Ok(m) = llm_dedup(client, cfg, "lugares", &place_dubious, ex_model).await {
+        if let Ok(m) = llm_dedup(client, cfg, "lugares", &place_dubious, ex_model, &ctx).await {
             for (k, v) in m { place_canon.insert(k, v); }
             chain_resolve(&mut place_canon);
         }
@@ -1301,7 +1431,7 @@ pub async fn extract_entities(
         })
         .collect();
 
-    let characters = chars_map
+    let characters: Vec<Character> = chars_map
         .into_values()
         .map(|c| {
             // Keep traits as a short set of ONE-WORD tags (≤ 6). Anything longer is
@@ -1321,7 +1451,7 @@ pub async fn extract_entities(
         })
         .collect();
 
-    let abilities = abilities_map
+    let abilities: Vec<Ability> = abilities_map
         .into_values()
         .map(|a| Ability {
             id: Uuid::new_v4().to_string(),
@@ -1334,7 +1464,7 @@ pub async fn extract_entities(
         })
         .collect();
 
-    let places = places_map
+    let places: Vec<Place> = places_map
         .into_values()
         .map(|p| Place {
             id: Uuid::new_v4().to_string(),
@@ -1352,6 +1482,27 @@ pub async fn extract_entities(
         .map(|r| Relation { from: r.from, to: r.to, label: r.label })
         .collect();
 
+    // Pending links keep only their named side, canonicalized like any other
+    // endpoint; if that side did not survive the run, the suggestion is meaningless.
+    let named: std::collections::HashSet<String> = characters
+        .iter()
+        .map(|c| c.name.to_lowercase())
+        .chain(places.iter().map(|p| p.name.to_lowercase()))
+        .chain(abilities.iter().map(|a| a.name.to_lowercase()))
+        .chain(existing_chars.iter().map(|n| n.to_lowercase()))
+        .chain(existing_places.iter().map(|n| n.to_lowercase()))
+        .collect();
+    let pending: Vec<Relation> = pending_out
+        .into_iter()
+        .map(|r| Relation { from: r.from, to: resolve(&r.to), label: r.label })
+        .filter(|r| named.contains(&r.to.to_lowercase()))
+        .collect();
+
+    // `resolve` borrows the canon maps immutably; it is dead from here on, so the
+    // retain below can take them mutably.
+    #[allow(clippy::drop_non_drop)]
+    let _ = resolve;
+
     // Keep only aliases that actually point elsewhere — the caller uses these to
     // merge previously-saved rows into their canonical name.
     char_canon.retain(|k, v| *k != v.to_lowercase());
@@ -1362,8 +1513,11 @@ pub async fn extract_entities(
         places,
         abilities,
         relations,
+        pending,
         char_aliases: char_canon,
         place_aliases: place_canon,
+        covered_docs,
+        cancelled,
     })
 }
 
@@ -1595,6 +1749,7 @@ fn ground_extraction(
     // Relation endpoints get the same treatment, so edges point at the grounded
     // entity names rather than at hallucinated variants (which render as extra,
     // unusable vertices in the graph).
+    let mut pending: Vec<ExtractedRel> = Vec::new();
     ex.relations.retain_mut(|r| {
         match (ground_name(&r.from), ground_name(&r.to)) {
             (Some(f), Some(t)) if !f.eq_ignore_ascii_case(&t) => {
@@ -1602,10 +1757,46 @@ fn ground_extraction(
                 r.to = t;
                 true
             }
+            // Exactly one side failed to ground because it is a relational term the
+            // text never names ("a mãe" → Leonardo). Dropping the edge loses a real
+            // fact the story states, so it is kept as a PENDING link: no vertex, no
+            // graph fact, just a suggestion the user can name once a later chapter
+            // does. The term itself must appear in the text, so an invented one is
+            // still discarded.
+            (None, Some(named)) if is_relational_term(&r.from, &hay) => {
+                pending.push(ExtractedRel {
+                    from: clean_name(&r.from),
+                    to: named,
+                    label: r.label.clone(),
+                });
+                false
+            }
+            (Some(named), None) if is_relational_term(&r.to, &hay) => {
+                pending.push(ExtractedRel {
+                    from: clean_name(&r.to),
+                    to: named,
+                    label: r.label.clone(),
+                });
+                false
+            }
             _ => false,
         }
     });
+    ex.pending = pending;
     ex
+}
+
+/// Is `raw` a relational/role phrase the text really uses ("a mãe", "o pai de
+/// Leonardo")? Requires both a role noun among its words and a literal occurrence,
+/// so a hallucinated term is not stored as a pending link.
+fn is_relational_term(raw: &str, hay: &str) -> bool {
+    let cleaned = clean_name(raw);
+    if cleaned.is_empty() {
+        return false;
+    }
+    let toks = name_tokens(&cleaned);
+    toks.iter().any(|t| ROLE_NOUNS.contains(&t.as_str()))
+        && word_occurrences(hay, &fold(&cleaned)) > 0
 }
 
 /// Normalize a model-emitted entity name: drop parenthetical alias blocks, keep
@@ -2071,12 +2262,63 @@ struct DedupResult {
 
 /// Ask the LLM which names in `names` refer to the same entity. Returns a map of
 /// alias (lowercased) → canonical display name. Only groups of 2+ matter.
+/// Folded name → one-line context ("summary · relações") for the dedup pass.
+/// Summaries are trimmed hard: the pass needs enough to tell two people apart, not
+/// the whole card.
+fn dedup_context(
+    chars: &std::collections::HashMap<String, ExtractedChar>,
+    places: &std::collections::HashMap<String, ExtractedPlace>,
+    relations: &[ExtractedRel],
+) -> std::collections::HashMap<String, String> {
+    const MAX_SUMMARY: usize = 140;
+    const MAX_RELS: usize = 3;
+    let mut out: std::collections::HashMap<String, String> = Default::default();
+    let clip = |s: &str| -> String {
+        let t = s.trim();
+        if t.chars().count() <= MAX_SUMMARY {
+            t.to_string()
+        } else {
+            t.chars().take(MAX_SUMMARY).collect::<String>() + "…"
+        }
+    };
+    for c in chars.values() {
+        out.insert(fold(&c.name), clip(&c.summary));
+    }
+    for p in places.values() {
+        out.insert(fold(&p.name), clip(&p.summary));
+    }
+    let mut counts: std::collections::HashMap<String, usize> = Default::default();
+    for r in relations {
+        for (own, other, arrow) in
+            [(&r.from, &r.to, "→"), (&r.to, &r.from, "←")]
+        {
+            let key = fold(own);
+            let n = counts.entry(key.clone()).or_insert(0);
+            if *n >= MAX_RELS {
+                continue;
+            }
+            *n += 1;
+            let label = if r.label.trim().is_empty() { "liga" } else { r.label.trim() };
+            let line = format!("{arrow} {label} {other}");
+            out.entry(key).and_modify(|e| {
+                if !e.is_empty() {
+                    e.push_str(" · ");
+                }
+                e.push_str(&line);
+            });
+        }
+    }
+    out.retain(|_, v| !v.trim().is_empty());
+    out
+}
+
 async fn llm_dedup(
     client: &reqwest::Client,
     cfg: &RagConfig,
     kind: &str,
     names: &[String],
     model: &str,
+    ctx: &std::collections::HashMap<String, String>,
 ) -> AppResult<std::collections::HashMap<String, String>> {
     let mut out = std::collections::HashMap::new();
     if names.len() < 2 {
@@ -2090,7 +2332,7 @@ async fn llm_dedup(
         if batch.len() < 2 {
             continue;
         }
-        if let Ok(m) = llm_dedup_batch(client, cfg, kind, batch, model).await {
+        if let Ok(m) = llm_dedup_batch(client, cfg, kind, batch, model, ctx).await {
             out.extend(m);
         }
     }
@@ -2103,11 +2345,15 @@ async fn llm_dedup_batch(
     kind: &str,
     names: &[String],
     model: &str,
+    ctx: &std::collections::HashMap<String, String>,
 ) -> AppResult<std::collections::HashMap<String, String>> {
     let mut out = std::collections::HashMap::new();
     let list = names
         .iter()
-        .map(|n| format!("- {n}"))
+        .map(|n| match ctx.get(&fold(n)) {
+            Some(c) => format!("- {n} — {c}"),
+            None => format!("- {n}"),
+        })
         .collect::<Vec<_>>()
         .join("\n");
     let system = format!(
@@ -2121,7 +2367,15 @@ nunca escreva um nome que não está na lista e nunca combine dois nomes num só
 Escolha como \"canonical\" a forma mais usada e mais simples (sem título). \
 NÃO agrupe seres diferentes — parentes que compartilham sobrenome (pai e filho, irmãos) \
 são pessoas DISTINTAS. Inclua SOMENTE grupos com 2 ou mais nomes; sem duplicatas, \
-retorne {{\"groups\":[]}}. /no_think"
+retorne {{\"groups\":[]}}.{} /no_think",
+        if ctx.is_empty() {
+            ""
+        } else {
+            " Cada nome pode vir seguido de \" — \" e um resumo com as relações diretas: \
+use isso para decidir, e agrupe só quando o contexto mostrar que é a MESMA pessoa \
+(mesmo papel, mesmas relações apontando para o mesmo alvo). Contexto parecido não basta: \
+dois irmãos têm o mesmo papel e não são a mesma pessoa."
+        }
     );
     let user = format!("Nomes:\n{list}");
     let messages = vec![
@@ -2220,6 +2474,7 @@ O Rei Yan Serafine chegou depois. Leo correu.";
             places: vec![],
             abilities: vec![ExtractedAbility { name: "Chamas do Vazio".into(), kind: String::new(), summary: String::new(), source_doc: String::new(), source_quote: String::new() }],
             relations: vec![ExtractedRel { from: "Leonardo Venante".into(), to: "Charlotte".into(), label: "conhece".into() }],
+            pending: vec![],
         };
         let g = ground_extraction(ex, CORPUS, &Default::default());
         assert_eq!(g.characters.len(), 1);
@@ -2270,6 +2525,66 @@ Chamavam a velha de A Bruxa naquela vila.";
         assert_eq!(ground_name("Elisa", &hay, corpus).as_deref(), Some("Elisa"));
     }
 
+    /// The unnamed side is not thrown away: it becomes a pending suggestion, with
+    /// no vertex and no graph fact, that the user can name later.
+    #[test]
+    fn unnamed_relational_side_becomes_a_pending_link() {
+        let corpus = "A mãe de Leonardo deposita dinheiro. Leonardo agradeceu.";
+        let ex = Extraction {
+            characters: vec![],
+            places: vec![],
+            abilities: vec![],
+            relations: vec![
+                ExtractedRel { from: "a mãe".into(), to: "Leonardo".into(), label: "mãe de".into() },
+                // Invented term with no occurrence → not even pending.
+                ExtractedRel { from: "o tio".into(), to: "Leonardo".into(), label: "tio de".into() },
+            ],
+            pending: vec![],
+        };
+        let g = ground_extraction(ex, corpus, &Default::default());
+        assert!(g.relations.is_empty(), "nada vira aresta confirmada");
+        assert_eq!(g.pending.len(), 1);
+        assert_eq!(g.pending[0].from, "a mãe");
+        assert_eq!(g.pending[0].to, "Leonardo");
+        assert_eq!(g.pending[0].label, "mãe de");
+    }
+
+    #[test]
+    fn relational_term_needs_evidence_in_the_text() {
+        let hay = fold("A mãe de Leonardo chegou.");
+        assert!(is_relational_term("a mãe", &hay));
+        assert!(!is_relational_term("a madrasta", &hay), "termo não escrito no texto");
+        assert!(!is_relational_term("Leonardo", &hay), "nome próprio não é termo relacional");
+    }
+
+    /// Only the names actually sent get context, and the line stays short enough
+    /// that a 60-name batch does not explode.
+    #[test]
+    fn dedup_context_carries_summary_and_relations() {
+        let mut chars: std::collections::HashMap<String, ExtractedChar> = Default::default();
+        chars.insert(
+            "elisa".into(),
+            ExtractedChar {
+                name: "Elisa".into(),
+                role: String::new(),
+                summary: "Protege Leonardo.".into(),
+                traits: vec![],
+                source_doc: String::new(),
+                source_quote: String::new(),
+            },
+        );
+        let rels = vec![ExtractedRel {
+            from: "Elisa".into(),
+            to: "Leonardo".into(),
+            label: "mãe de".into(),
+        }];
+        let ctx = dedup_context(&chars, &Default::default(), &rels);
+        let line = ctx.get("elisa").expect("contexto da Elisa");
+        assert!(line.contains("Protege Leonardo."));
+        assert!(line.contains("mãe de Leonardo"));
+        assert!(line.chars().count() < 260, "linha curta o bastante para um lote de 60");
+    }
+
     #[test]
     fn windows_break_on_chapter_boundaries() {
         let mk = |doc: &str, n: usize| Chunk {
@@ -2284,7 +2599,8 @@ Chamavam a velha de A Bruxa naquela vila.";
         // to the other even though together they fit inside one 12k window.
         let w = build_windows(&[mk("Capítulo 1.txt", 0), mk("Capítulo 2.txt", 0)]);
         assert_eq!(w.len(), 2);
-        assert!(w[0].contains("Capítulo 1.txt") && !w[0].contains("Capítulo 2.txt"));
+        assert!(w[0].text.contains("Capítulo 1.txt") && !w[0].text.contains("Capítulo 2.txt"));
+        assert_eq!(w[0].doc_ids, vec!["Capítulo 1.txt".to_string()]);
         // Short chapters still share a window — one LLM call per tiny chapter would
         // be pure cost.
         let tiny = |doc: &str| Chunk {

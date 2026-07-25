@@ -1,5 +1,5 @@
 import { For, Show } from "solid-js";
-import { state, actions, type Source } from "../store";
+import { state, actions, formatDuration, type Source } from "../store";
 import { providerLabel } from "../theme";
 import Markdown from "./Markdown";
 import Ornament from "./Ornament";
@@ -110,6 +110,15 @@ export default function ChatView() {
                         )}
                       </For>
                     </div>
+                  </Show>
+                  {/* How long the answer took — same visual weight as a source
+                      badge, so it informs without competing with the text. */}
+                  <Show when={!isUser && m.durationMs}>
+                    {(ms) => (
+                      <div class="mt-2 text-10.5px text-fg-muted font-mono">
+                        {formatDuration(ms())}
+                      </div>
+                    )}
                   </Show>
                 </div>
               </div>

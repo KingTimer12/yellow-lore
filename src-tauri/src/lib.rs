@@ -25,6 +25,8 @@ struct AppState {
     data_dir: PathBuf,
     /// Set by `cancel_generation` to stop an in-flight streaming answer.
     cancel: AtomicBool,
+    /// Set by `cancel_extraction` to stop a long extraction between batches.
+    cancel_extract: AtomicBool,
 }
 
 impl AppState {
@@ -363,12 +365,43 @@ fn add_message(
     text: String,
     thinking: String,
     sources: serde_json::Value,
+    duration_ms: Option<i64>,
 ) -> AppResult<()> {
     let vault = state.active()?;
-    state.db.add_message(&vault, &session, &role, &text, &thinking, &sources)
+    state
+        .db
+        .add_message(&vault, &session, &role, &text, &thinking, &sources, duration_ms)
 }
 
 // ---- Entities -------------------------------------------------------------
+
+/// Progress events sent to the frontend while an extraction runs. One per
+/// completed batch of windows — the batch boundary already exists (the running
+/// roster is rebuilt there), so reporting costs nothing extra.
+#[derive(Clone, serde::Serialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+enum ExtractEvent {
+    #[serde(rename_all = "camelCase")]
+    Progress {
+        window: usize,
+        total_windows: usize,
+        characters: usize,
+        places: usize,
+        abilities: usize,
+        docs: Vec<String>,
+        elapsed_ms: u64,
+    },
+}
+
+/// What an extraction run produced, plus how long it took and whether the user
+/// stopped it early.
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExtractOutcome {
+    entities: Entities,
+    duration_ms: i64,
+    cancelled: bool,
+}
 
 #[tauri::command]
 fn get_entities(state: tauri::State<'_, AppState>) -> AppResult<Entities> {
@@ -380,15 +413,25 @@ fn get_entities(state: tauri::State<'_, AppState>) -> AppResult<Entities> {
 /// covered by a previous run are scanned, and results are MERGED — entities the
 /// user edited or added are never overwritten. `force = true` re-scans every
 /// document (still preserving edited/added entities).
+///
+/// Progress is emitted on `on_event` once per completed batch of windows, and the
+/// run can be stopped with `cancel_extraction`: cancelling stops before the next
+/// batch and KEEPS everything reconciled so far, marking as extracted only the
+/// documents that were read end to end — so the next run resumes cleanly.
 #[tauri::command]
 async fn extract_entities(
     state: tauri::State<'_, AppState>,
     force: Option<bool>,
-) -> AppResult<Entities> {
+    on_event: tauri::ipc::Channel<ExtractEvent>,
+) -> AppResult<ExtractOutcome> {
     let vault = state.active()?;
     let cfg = state.config.lock().await.clone();
     let chunks = state.db.load_chunks(&vault)?;
     let force = force.unwrap_or(false);
+    let started = std::time::Instant::now();
+
+    // Fresh run — clear any leftover cancel request.
+    state.cancel_extract.store(false, Ordering::Relaxed);
 
     if force {
         state.db.reset_extracted(&vault)?;
@@ -405,7 +448,11 @@ async fn extract_entities(
 
     // Nothing new to do — return the current entities untouched.
     if target.is_empty() {
-        return state.db.entities(&vault);
+        return Ok(ExtractOutcome {
+            entities: state.db.entities(&vault)?,
+            duration_ms: 0,
+            cancelled: false,
+        });
     }
 
     // The full saved cast is handed to the extractor: it is shown to the model so a
@@ -424,20 +471,74 @@ async fn extract_entities(
         &existing_chars,
         &existing_places,
         &existing_abilities,
+        &state.cancel_extract,
+        |p| {
+            let _ = on_event.send(ExtractEvent::Progress {
+                window: p.window,
+                total_windows: p.total_windows,
+                characters: p.characters,
+                places: p.places,
+                abilities: p.abilities,
+                docs: p.docs,
+                elapsed_ms: started.elapsed().as_millis() as u64,
+            });
+        },
     )
     .await?;
-    state.db.merge_extracted(&vault, &res.characters, &res.places, &res.abilities, &res.relations)?;
+    state.db.merge_extracted(
+        &vault,
+        &res.characters,
+        &res.places,
+        &res.abilities,
+        &res.relations,
+        &res.pending,
+    )?;
     // Fold previously-saved rows that this run revealed to be the same entity
     // (cross-run dupes like "Sophia" vs "Sophia, Flor do Abismo").
     state.db.apply_aliases(&vault, &res.char_aliases, &res.place_aliases)?;
 
-    // Record the documents we just covered so the next run skips them.
-    let mut ids: Vec<String> = target.iter().map(|c| c.doc_id.clone()).collect();
+    // Record only the documents that were read end to end. On a cancelled run the
+    // rest stays un-extracted, so the next run resumes instead of skipping them.
+    let mut ids: Vec<String> = res.covered_docs.clone();
     ids.sort();
     ids.dedup();
     state.db.mark_extracted(&vault, &ids)?;
 
-    state.db.entities(&vault)
+    let duration_ms = started.elapsed().as_millis() as i64;
+    // Only a complete run is a useful estimate for "how long will this take?".
+    if !res.cancelled {
+        state.db.set_last_extraction(&vault, duration_ms).ok();
+    }
+    Ok(ExtractOutcome {
+        entities: state.db.entities(&vault)?,
+        duration_ms,
+        cancelled: res.cancelled,
+    })
+}
+
+/// Stop an in-flight extraction. It finishes the batch already in flight, keeps
+/// everything reconciled so far, and returns.
+#[tauri::command]
+fn cancel_extraction(state: tauri::State<'_, AppState>) {
+    state.cancel_extract.store(true, Ordering::Relaxed);
+}
+
+#[tauri::command]
+fn last_extraction(state: tauri::State<'_, AppState>) -> AppResult<Option<db::ExtractionStats>> {
+    let vault = state.active()?;
+    state.db.last_extraction(&vault)
+}
+
+/// Promote a pending link by naming its unnamed side. The result is a `Manual`
+/// edge, so extraction never touches it.
+#[tauri::command]
+fn promote_pending_relation(
+    state: tauri::State<'_, AppState>,
+    relation: db::Relation,
+    name: String,
+) -> AppResult<()> {
+    let vault = state.active()?;
+    state.db.promote_pending_relation(&vault, &relation, &name)
 }
 
 #[tauri::command]
@@ -540,6 +641,7 @@ pub fn run() {
                 config: Mutex::new(config),
                 data_dir,
                 cancel: AtomicBool::new(false),
+                cancel_extract: AtomicBool::new(false),
             });
             Ok(())
         })
@@ -570,6 +672,9 @@ pub fn run() {
             add_message,
             get_entities,
             extract_entities,
+            cancel_extraction,
+            last_extraction,
+            promote_pending_relation,
             add_character,
             add_place,
             add_ability,

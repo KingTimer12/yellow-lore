@@ -1,5 +1,5 @@
 import { For, Show, createMemo, createSignal } from "solid-js";
-import { state, actions } from "../store";
+import { state, actions, formatDuration } from "../store";
 import { AVATAR_HUES, initials } from "../theme";
 import Graph from "./Graph";
 
@@ -89,6 +89,8 @@ export default function CharactersView() {
           </button>
         </div>
       </div>
+
+      <ExtractionProgress />
 
       <Show when={state.charactersTab === "grid" && state.characters.length > 0}>
         <div class="relative">
@@ -188,6 +190,90 @@ export default function CharactersView() {
   );
 }
 
+// ---- Extraction progress ---------------------------------------------------
+//
+// A 29-chapter vault takes minutes. A static "Extraindo..." label reads as
+// frozen, so this shows the real work: which window of how many, which chapter
+// the current batch is on, how many entities exist so far, and elapsed time —
+// all from the per-batch events the backend already emits.
+function ExtractionProgress() {
+  const pct = () => {
+    const p = state.extractProgress;
+    if (!p || p.totalWindows === 0) return 0;
+    return Math.min(100, Math.round((p.window / p.totalWindows) * 100));
+  };
+  const found = () => {
+    const p = state.extractProgress;
+    if (!p) return "";
+    return `${p.characters} personagens · ${p.places} lugares · ${p.abilities} habilidades`;
+  };
+
+  return (
+    <>
+      <Show when={state.extracting}>
+        <div class="border border-border rounded-14px bg-panel p-4 flex flex-col gap-2.5 anim-pop">
+          <div class="flex items-center justify-between gap-3 flex-wrap">
+            <div class="text-12.5px font-semibold">
+              {state.extractProgress
+                ? `Lendo janela ${state.extractProgress.window} de ${state.extractProgress.totalWindows}`
+                : "Preparando a leitura…"}
+            </div>
+            <div class="flex items-center gap-3">
+              <Show when={state.extractProgress}>
+                {(p) => (
+                  <span class="text-11.5px text-fg-muted font-mono">
+                    {formatDuration(p().elapsedMs)}
+                  </span>
+                )}
+              </Show>
+              <button
+                onClick={() =>
+                  actions.askConfirm({
+                    title: "Interromper a extração?",
+                    message:
+                      "As entidades já conciliadas são mantidas. Os capítulos que ainda não foram lidos por completo entram na próxima extração.",
+                    confirmLabel: "Interromper",
+                    onConfirm: () => actions.cancelExtraction(),
+                  })
+                }
+                class="px-2.5 py-1 rounded-7px border border-border bg-bg text-fg-muted text-11.5px font-semibold cursor-pointer transition-colors hover:text-fg hover:border-danger"
+              >
+                Interromper
+              </button>
+            </div>
+          </div>
+          <div class="h-1.5 rounded-full bg-hover overflow-hidden">
+            <div
+              class="h-full bg-accent transition-[width] duration-300"
+              style={{ width: `${Math.max(pct(), 3)}%` }}
+            />
+          </div>
+          <Show when={state.extractProgress}>
+            {(p) => (
+              <div class="flex flex-col gap-1 text-11.5px text-fg-muted">
+                <div>{found()} encontrados até agora</div>
+                <Show when={p().docs.length > 0}>
+                  <div class="truncate">Último lote: {p().docs.join(", ")}</div>
+                </Show>
+              </div>
+            )}
+          </Show>
+        </div>
+      </Show>
+
+      {/* Idle: what the last run cost, so a long one is not a surprise. */}
+      <Show when={!state.extracting && state.lastExtraction}>
+        {(last) => (
+          <div class="text-11.5px text-fg-muted">
+            Última extração: <b>{formatDuration(last().durationMs)}</b> · {last().entityCount} entidades
+            <Show when={last().at}> · {last().at}</Show>
+          </div>
+        )}
+      </Show>
+    </>
+  );
+}
+
 // ---- Manual relation editing ----------------------------------------------
 //
 // Auto-extraction gets sloppier as more chapters pile up; curating edges by hand
@@ -252,6 +338,51 @@ function RelationsEditor() {
           Adicionar
         </button>
       </div>
+
+      {/* Pending links: the text states the tie but never names one side. */}
+      <Show when={state.pendingRelations.length > 0}>
+        <div class="border border-dashed border-border rounded-11px p-3 flex flex-col gap-2">
+          <div class="text-11.5px font-bold text-fg-muted uppercase tracking-[0.04em]">
+            Vínculos pendentes ({state.pendingRelations.length})
+          </div>
+          <div class="text-11px text-fg-muted leading-[1.45]">
+            O texto afirma o vínculo mas não nomeia quem é. Não entram no grafo até
+            você dizer de quem se trata — adivinhar seria fundir a pessoa errada.
+          </div>
+          <div class="flex flex-col gap-1.5 max-h-160px overflow-y-auto">
+            <For each={state.pendingRelations}>
+              {(r) => (
+                <div class="flex items-center gap-2 text-12.5px py-1 px-2 rounded-7px hover:bg-hover group">
+                  <span class="italic text-fg-muted">{r.from}</span>
+                  <span class="text-fg-muted">—{r.label ? ` ${r.label} ` : " "}→</span>
+                  <span class="font-semibold">{r.to}</span>
+                  <button
+                    onClick={() =>
+                      actions.askPrompt({
+                        title: "Quem é?",
+                        message: `"${r.from}" ${r.label ? `(${r.label}) ` : ""}de ${r.to}`,
+                        placeholder: "nome próprio (ex.: Elisa)",
+                        confirmLabel: "Nomear",
+                        onSubmit: (name) => void actions.promotePending(r, name),
+                      })
+                    }
+                    class="ml-auto px-2 py-0.75 rounded-6px border border-border bg-bg text-11px font-semibold text-fg-muted cursor-pointer transition-colors hover:text-accent hover:border-accent"
+                  >
+                    Nomear
+                  </button>
+                  <button
+                    onClick={() => void actions.dismissPending(r)}
+                    title="Descartar"
+                    class="w-5 h-5 flex-none rounded-full text-fg-muted text-13px leading-none cursor-pointer border-none bg-transparent hover:text-danger transition-colors"
+                  >
+                    ×
+                  </button>
+                </div>
+              )}
+            </For>
+          </div>
+        </div>
+      </Show>
 
       {/* Existing relations */}
       <Show

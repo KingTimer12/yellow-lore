@@ -13,7 +13,22 @@ export type Message = {
   /// Reasoning captured from a `<think>…</think>` block, shown separately.
   thinking?: string;
   sources?: Source[];
+  /// Wall-clock time the answer took, in ms. Undefined for user turns and for
+  /// messages saved before timing existed.
+  durationMs?: number | null;
 };
+
+/// Human-readable duration: "4min 12s" for long runs, "3.4s" for short ones.
+/// Used for both extraction totals and per-answer timing.
+export function formatDuration(ms: number): string {
+  if (!Number.isFinite(ms) || ms < 0) return "";
+  if (ms < 1000) return `${Math.round(ms)}ms`;
+  const total = Math.round(ms / 100) / 10;
+  if (total < 60) return `${total.toFixed(1)}s`;
+  const mins = Math.floor(total / 60);
+  const secs = Math.round(total % 60);
+  return `${mins}min ${secs}s`;
+}
 
 /// Split a raw model reply into its `<think>` reasoning and the final answer.
 /// Handles the still-open case during streaming (no closing tag yet).
@@ -93,6 +108,8 @@ export type Settings = {
   temperature: number;
   showSources: boolean;
   dedupEntities: boolean;
+  /// Send each candidate's summary + relations to the dedup pass, not just names.
+  dedupWithContext: boolean;
   /// Empty = reuse the chat model for extraction (no second model to load).
   extractionModel: string;
   /// Concurrent extraction windows. 1 = sequential (safe for a single local GPU).
@@ -125,6 +142,21 @@ export type State = {
   vaults: Vault[];
   activeVaultId: string;
   extracting: boolean;
+  /// Live progress of the running extraction, or null when idle. Fed by the
+  /// per-batch events the backend emits, so the UI shows real work instead of a
+  /// generic spinner.
+  extractProgress: {
+    window: number;
+    totalWindows: number;
+    characters: number;
+    places: number;
+    abilities: number;
+    docs: string[];
+    elapsedMs: number;
+  } | null;
+  /// Duration + date of the last completed extraction, so the user can predict
+  /// how long the next one of similar size will take.
+  lastExtraction: { durationMs: number; at: string; entityCount: number } | null;
   chatInput: string;
   messages: Message[];
   /// Saved conversations for the active vault. `currentSessionId` is "" for a
@@ -137,6 +169,9 @@ export type State = {
   charactersTab: "grid" | "graph";
   characters: Character[];
   relations: Relation[];
+  /// Links the text asserts but never names on one side ("a mãe" → Leonardo).
+  /// Never drawn as graph facts — the user names them from the curation list.
+  pendingRelations: Relation[];
   places: Place[];
   abilities: Ability[];
   /// Free-text filters for the Places and Abilities grids (name / type).
@@ -208,6 +243,7 @@ export const DEFAULT_SETTINGS: Settings = {
   temperature: 0.2,
   showSources: true,
   dedupEntities: true,
+  dedupWithContext: false,
   extractionModel: "",
   extractionConcurrency: 1,
   rerank: false,
@@ -224,6 +260,8 @@ const initial: State = {
   vaults: [],
   activeVaultId: "",
   extracting: false,
+  extractProgress: null,
+  lastExtraction: null,
   chatInput: "",
   pending: false,
   // Chat starts empty, like a fresh AI conversation.
@@ -235,6 +273,7 @@ const initial: State = {
   charactersTab: "grid",
   characters: [],
   relations: [],
+  pendingRelations: [],
   places: [],
   abilities: [],
   placesFilter: "",
@@ -270,11 +309,12 @@ let toastTimer: ReturnType<typeof setTimeout> | undefined;
 /// Reload the docs + extracted entities for the active vault (Tauri only).
 async function loadActiveVault() {
   if (!isTauri) return;
-  const [docs, entities, index, sessions] = await Promise.all([
+  const [docs, entities, index, sessions, lastExtraction] = await Promise.all([
     api.listDocuments(),
     api.getEntities(),
     api.indexInfo().catch(() => ({ stale: false })),
     api.listSessions().catch(() => [] as Session[]),
+    api.lastExtraction().catch(() => null),
   ]);
   setState({
     docs,
@@ -282,6 +322,8 @@ async function loadActiveVault() {
     places: entities.places,
     abilities: entities.abilities,
     relations: entities.relations,
+    pendingRelations: entities.pendingRelations ?? [],
+    lastExtraction,
     indexStale: index.stale,
     sessions,
     // Open on a blank new chat — "what do you want to do?".
@@ -367,7 +409,7 @@ export const actions = {
         await actions.selectVault(remaining[0].id);
       } else {
         // No vaults left → back to the empty state.
-        setState({ activeVaultId: "", messages: [], docs: [], characters: [], places: [], abilities: [], relations: [], sessions: [], currentSessionId: "" });
+        setState({ activeVaultId: "", messages: [], docs: [], characters: [], places: [], abilities: [], relations: [], pendingRelations: [], sessions: [], currentSessionId: "" });
       }
     }
   },
@@ -412,6 +454,7 @@ export const actions = {
         text: m.text,
         thinking: m.thinking || undefined,
         sources: m.sources,
+        durationMs: m.durationMs,
       })));
     } catch (e) {
       console.error("sessão falhou", e);
@@ -481,6 +524,9 @@ export const actions = {
     if (sessionId) api.addMessage(sessionId, "user", text, "", []).catch((e) => console.error(e));
 
     let raw = "";
+    // Timed from the moment the question is sent: that is the wait the user
+    // actually feels, and it includes the corrective-RAG second round.
+    const startedAt = Date.now();
     await new Promise<void>((resolve) => {
       const finish = () => { setState("pending", false); resolve(); };
       api
@@ -491,9 +537,10 @@ export const actions = {
             setState("messages", idx, (m) => ({ ...m, thinking, text: body }));
           } else if (e.type === "done") {
             const { thinking, text: body } = splitThink(raw);
-            setState("messages", idx, (m) => ({ ...m, sources: e.sources }));
+            const durationMs = Date.now() - startedAt;
+            setState("messages", idx, (m) => ({ ...m, sources: e.sources, durationMs }));
             if (sessionId) {
-              api.addMessage(sessionId, "assistant", body, thinking, e.sources).catch((er) => console.error(er));
+              api.addMessage(sessionId, "assistant", body, thinking, e.sources, durationMs).catch((er) => console.error(er));
               bumpSession(sessionId);
               // Summarize the first exchange into a concise title (like ChatGPT).
               if (isNewSession && body.trim()) {
@@ -508,7 +555,7 @@ export const actions = {
           } else if (e.type === "error") {
             const msg = `Erro ao consultar: ${e.message}`;
             setState("messages", idx, (m) => ({ ...m, text: msg }));
-            if (sessionId) api.addMessage(sessionId, "assistant", msg, "", []).catch((er) => console.error(er));
+            if (sessionId) api.addMessage(sessionId, "assistant", msg, "", [], Date.now() - startedAt).catch((er) => console.error(er));
             finish();
           }
         })
@@ -566,21 +613,84 @@ export const actions = {
   async extractEntities(force = false) {
     if (state.extracting) return;
     if (!isTauri) return;
-    setState("extracting", true);
+    setState({ extracting: true, extractProgress: null });
     try {
-      const entities = await api.extractEntities(force);
-      setState({
-        characters: entities.characters,
-        places: entities.places,
-        abilities: entities.abilities,
-        relations: entities.relations,
+      const out = await api.extractEntities(force, (e) => {
+        setState("extractProgress", {
+          window: e.window,
+          totalWindows: e.totalWindows,
+          characters: e.characters,
+          places: e.places,
+          abilities: e.abilities,
+          docs: e.docs,
+          elapsedMs: e.elapsedMs,
+        });
       });
+      setState({
+        characters: out.entities.characters,
+        places: out.entities.places,
+        abilities: out.entities.abilities,
+        relations: out.entities.relations,
+        pendingRelations: out.entities.pendingRelations ?? [],
+      });
+      const total =
+        out.entities.characters.length + out.entities.places.length + out.entities.abilities.length;
+      // A cancelled run keeps what it already reconciled, so say so instead of
+      // letting the user think the work was thrown away.
+      if (out.cancelled) {
+        actions.notify(
+          `Interrompida em ${formatDuration(out.durationMs)} — ${total} entidades mantidas. Os capítulos não lidos entram na próxima extração.`,
+          "Extração interrompida",
+        );
+      } else {
+        setState("lastExtraction", {
+          durationMs: out.durationMs,
+          at: new Date().toISOString().replace("T", " ").slice(0, 19),
+          entityCount: total,
+        });
+      }
     } catch (e) {
       console.error("extração falhou", e);
       actions.notify(`${e}`, "Extração falhou");
     } finally {
-      setState("extracting", false);
+      setState({ extracting: false, extractProgress: null });
     }
+  },
+
+  /// Stop a long extraction. The backend finishes the batch in flight and keeps
+  /// everything already reconciled.
+  cancelExtraction() {
+    if (!isTauri || !state.extracting) return;
+    void api.cancelExtraction().catch((e) => console.error(e));
+  },
+
+  /// Name the unnamed side of a pending link, turning it into a real (Manual)
+  /// edge. Never automatic: guessing which named person a bare "a mãe" refers to
+  /// is exactly the kind of silent wrong merge this project has been burned by.
+  async promotePending(relation: Relation, name: string) {
+    if (!name.trim()) return;
+    if (isTauri) {
+      try {
+        await api.promotePendingRelation(relation, name.trim());
+      } catch (e) {
+        actions.notify(`${e}`, "Não foi possível nomear");
+        return;
+      }
+    }
+    setState(produce((s) => {
+      s.pendingRelations = s.pendingRelations.filter(
+        (r) => !(r.from === relation.from && r.to === relation.to && r.label === relation.label),
+      );
+      s.relations.push({ from: name.trim(), to: relation.to, label: relation.label });
+    }));
+  },
+
+  /// Discard a pending link the user judges wrong or irrelevant.
+  async dismissPending(relation: Relation) {
+    if (isTauri) await api.removeRelation(relation).catch((e) => console.error(e));
+    setState("pendingRelations", (list) =>
+      list.filter((r) => !(r.from === relation.from && r.to === relation.to && r.label === relation.label)),
+    );
   },
 
   /// Open the drawer to create a new entity by hand (status "Adicionado").

@@ -47,7 +47,9 @@ renomear, excluir). Comandos: `list_sessions`, `create_session`,
 - `db.rs` — **SQLite (rusqlite bundled, WAL)**: vaults, documents, chunks,
   characters, places, **abilities**, relations (com `status`
   Manual/Extraído, migrado por `ALTER TABLE` na abertura). `delete_entity` remove a
-  linha **e as relações órfãs** dela, senão sobra vértice morto no grafo. Vetores gravados como **BLOB f32 little-endian**
+  linha **e as relações órfãs** dela, senão sobra vértice morto no grafo.
+  `messages.duration_ms` guarda o tempo de cada resposta (NULL nas linhas antigas,
+  que a UI trata como "sem tempo", não como zero). Vetores gravados como **BLOB f32 little-endian**
   (4 bytes/dim — menor e mais rápido que JSON; leitura aceita o formato JSON
   antigo). `id` do documento é **BLAKE3(conteúdo)** → reingestão idempotente e
   dedupe. Meta `emb:<vault>` guarda o modelo de embedding indexado (p/ detectar
@@ -145,15 +147,42 @@ janelas extraem candidatos, tudo é conciliado **em memória**, e só então
   ("Leo" → "Leonardo") só quando existe uma única forma longa possível. Inclui os
   nomes já salvos, então um nome novo funde no card antigo. Nomes canônicos
   reescrevem também as relações.
+- **Dedup com contexto** (`dedupWithContext`, **off** por padrão): manda também o
+  resumo de uma linha (cortado em 140 chars) e até 3 relações diretas de cada
+  candidato. É a única forma de pegar duplicata cujos nomes não têm nada em comum,
+  mas infla a carga daquela chamada cerca de 10× (≈1,1k → ≈15k chars num lote de 60)
+  e fundir duas pessoas diferentes é pior que deixar uma duplicata — daí ser opção,
+  não comportamento fixo. O prompt ganha o aviso de que contexto parecido não basta
+  (dois irmãos têm o mesmo papel).
 - **Dedup opcional via LLM** (`dedupEntities`), direcionado: só nomes ambíguos —
   que compartilham token, ou são forma curta por prefixo ("Leo"), ou apelido curto
   ("Lô") — vão para o modelo, em **lotes de 60** (uma chamada com centenas de nomes
   truncava e alucinava). `canonical` e aliases **só valem se vierem da lista
   enviada**: sem essa checagem o modelo inventa o nome do grupo inteiro.
+- **Vínculo pendente**: quando o lado relacional não é nomeado em lugar nenhum
+  ("a mãe de Leonardo", ninguém nomeado), a aresta não é jogada fora — vira relação
+  `status='Pendente'`, guardando o termo e o lado nomeado. Pendentes **não** entram
+  em `list_relations`, logo não aparecem no grafo nem no GraphRAG: só na lista de
+  curadoria, onde o usuário clica "Nomear" e ela se torna aresta `Manual`. A
+  promoção **nunca é automática** — "mesmo alvo + mesmo rótulo" é fraco demais para
+  apostar identidade (um personagem pode ter duas tias) e o projeto já se queimou
+  com fusão silenciosa errada. O termo precisa existir literalmente no texto, senão
+  nem pendente é gravado.
 - **Incremental**: só documentos ainda não extraídos (set em `meta`). Entidades
-  **Editado/Adicionado** e relações **Manual** nunca são sobrescritas nem apagadas
-  (`is_protected`; `apply_aliases` também não toca aresta manual). JSON tolerante a
-  `<think>`. `extractionModel` opcional (vazio = reutiliza o de chat).
+  **Editado/Adicionado** e relações **Manual**/**Pendente** nunca são sobrescritas
+  nem apagadas (`is_protected`; `apply_aliases` só reescreve `status='Extraído'`).
+  JSON tolerante a `<think>`. `extractionModel` opcional (vazio = reutiliza o de
+  chat).
+- **Progresso e cancelamento**: a cada lote fechado o backend emite
+  `ExtractEvent::Progress` por `Channel` (janela N/total, contagem de
+  personagens/lugares/habilidades, documentos do lote, tempo decorrido) — o limite
+  de lote já existia para remontar o registro, então reportar não custa chamada
+  nenhuma. `cancel_extraction` levanta um `AtomicBool` checado **entre** lotes,
+  nunca no meio de uma janela (janela pela metade daria elenco parcial).
+  Cancelar **mantém** tudo o que já foi conciliado e marca como extraído **somente
+  os documentos lidos de ponta a ponta** (`covered_docs`), então a próxima rodada
+  retoma os capítulos que faltaram em vez de pulá-los. A duração total vai para
+  `meta` (`extract_stats:<vault>`) e a UI mostra "última extração: 4min 12s".
 - `config.rs` — `RagConfig` (`config.json`, global).
 - `lib.rs` — estado + comandos Tauri.
 
@@ -177,7 +206,11 @@ separa `<think>` e renderiza markdown), `cancel_generation` (para a geração vi
 `AtomicBool`). Entidades: `get_entities`, `extract_entities` (arg `force`:
 incremental por padrão, `true` re-scaneia tudo — apaga só `status='Extraído'`),
 `add_character`, `add_place`, `add_ability`, `update_character`, `update_place`,
-`update_ability`, `delete_character`, `delete_place`, `delete_ability`.
+`update_ability`, `delete_character`, `delete_place`, `delete_ability`,
+`cancel_extraction` (para entre lotes, preservando o conciliado),
+`last_extraction` (duração/data da última rodada), `promote_pending_relation`.
+`extract_entities` recebe um `Channel` de progresso e devolve
+`{entities, durationMs, cancelled}`.
 
 ## Config (Settings) — LLM ≠ embedding
 
@@ -191,7 +224,8 @@ incremental por padrão, `true` re-scaneia tudo — apaga só `status='Extraído
   CRAG** (off).
 - Extração: **modelo dedicado** opcional (`extractionModel`), **janelas em
   paralelo** (`extractionConcurrency`, default 1 — é também o tamanho do lote entre
-  as remontagens do registro corrente), **dedup via LLM** (`dedupEntities`).
+  as remontagens do registro corrente), **dedup via LLM** (`dedupEntities`) e **contexto na unificação**
+  (`dedupWithContext`, off).
 - **Escala da UI**: `zoom` no `.app-shell` por largura de viewport (1.1 acima de
   1600px, 1.2 acima de 2100px, 1.32 acima de 2800px) — tela grande não deixa a
   fonte minúscula.
@@ -300,13 +334,8 @@ incremental por padrão, `true` re-scaneia tudo — apaga só `status='Extraído
   das janelas anteriores da rodada), **grounding contra o texto**, **rejeição de
   termo relacional**, **dedup contra entidades existentes** e **verificação
   direcionada de entidades duvidosas** (só nomes ambíguos vão ao dedup-LLM).
-- **Dedup por papel/contexto**: hoje o dedup-LLM recebe **só nomes**, então não tem
-  como saber que "mãe" e "Elisa" são a mesma pessoa. Mandar contexto (relações e
-  resumo de cada entidade) resolveria casos que sobrarem — custa várias chamadas
-  grandes, e a classe principal já morre na rejeição determinística. Reavaliar
-  depois de medir no vault de 29 capítulos.
-- **Relação pendente**: quando ninguém nomeia a pessoa ("a mãe", sem nome no texto),
-  hoje o vínculo é descartado. Guardar como aresta pendente exigiria coluna nova.
+- Feito: **dedup com contexto** (`dedupWithContext`, off por padrão) e **relação
+  pendente** com promoção manual.
 
 ## Ideias — tempo de extração
 
