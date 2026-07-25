@@ -183,6 +183,25 @@ janelas extraem candidatos, tudo é conciliado **em memória**, e só então
   os documentos lidos de ponta a ponta** (`covered_docs`), então a próxima rodada
   retoma os capítulos que faltaram em vez de pulá-los. A duração total vai para
   `meta` (`extract_stats:<vault>`) e a UI mostra "última extração: 4min 12s".
+- **Diagnóstico por camada** (`ExtractDiag`, sempre ligado): o pipeline empilha
+  várias rejeições e cada uma é invisível por construção — nome filtrado não deixa
+  rastro no vault. Toda rodada, então, se mede e grava
+  `<appData>/extract-report.txt` (botão "Diagnóstico da extração" na aba
+  Personagens, comando `extraction_report`). O relatório traz: modo
+  (incremental/Tudo) e **quais capítulos foram ignorados por já estarem extraídos**;
+  janelas geradas vs. limite e **quantos trechos o limite cortou**; janelas com JSON
+  válido vs. **falhas** (com a janela, o capítulo e o erro — janela que falha é
+  descartada **sem nova tentativa**, então quem só aparece nela desaparece do
+  resultado); candidatos **brutos** por janela (chars do texto → contagens →
+  mantidos, marcando janela grande que devolveu ≤2 personagens = o **modelo** ficou
+  calado, não os filtros); descartes separados por camada (`grounding` /
+  `termo relacional` / `forma` / `relação`) com nome, janela e motivo; e as fusões,
+  separando `canonical_map` (determinística) do dedup por LLM. Nada do filtro muda —
+  só passa a ser contado. Duas evidências que o motivo detalhado expõe: o termo
+  relacional informa se o texto escreve a palavra com maiúscula **apenas em início
+  de frase** (epíteto real que a regra não consegue distinguir de substantivo comum)
+  e qual **alternativa não-papel do mesmo tamanho caiu junto** — a checagem de papel
+  aborta a busca inteira, então "mãe Elisa" perde a Elisa também.
 - `config.rs` — `RagConfig` (`config.json`, global).
 - `lib.rs` — estado + comandos Tauri.
 
@@ -208,9 +227,10 @@ incremental por padrão, `true` re-scaneia tudo — apaga só `status='Extraído
 `add_character`, `add_place`, `add_ability`, `update_character`, `update_place`,
 `update_ability`, `delete_character`, `delete_place`, `delete_ability`,
 `cancel_extraction` (para entre lotes, preservando o conciliado),
-`last_extraction` (duração/data da última rodada), `promote_pending_relation`.
+`last_extraction` (duração/data da última rodada), `promote_pending_relation`,
+`extraction_report` (texto do diagnóstico da última rodada).
 `extract_entities` recebe um `Channel` de progresso e devolve
-`{entities, durationMs, cancelled}`.
+`{entities, durationMs, cancelled, reportPath}`.
 
 ## Config (Settings) — LLM ≠ embedding
 
@@ -273,6 +293,31 @@ incremental por padrão, `true` re-scaneia tudo — apaga só `status='Extraído
   verboso ainda pode estourar. Modelo não-reasoning ou `num_ctx` maior ajuda.
 - **macOS**: sem Apple Developer ID, o auto-update funciona mas o SO alerta app
   não-notarizado. (Sem solução do meu lado — exige conta paga da Apple.)
+- **Recall menor que o esperado (em investigação)**: depois das correções de
+  fragmentação/alucinação, a extração passou a trazer **menos** personagens do que o
+  texto tem. Nenhuma camada foi afrouxada ainda de propósito: primeiro medir, com o
+  diagnóstico por camada descrito acima. Três defeitos já confirmados por teste
+  unitário (`cargo test --lib`), ainda **não corrigidos**:
+  1. **Janela que falha desaparece em silêncio.** `extract_window` que erra (rede,
+     JSON inválido, timeout) era descartada por `filter_map(ok)` sem retentativa e
+     sem aviso; quem só aparece nela nunca chegou a ser procurado. Agora vai para o
+     relatório (`window_failures`) — falta decidir retentativa.
+  2. **A checagem de papel aborta a busca inteira.** Em `ground_name_reason`, se o
+     melhor trecho de um tamanho é encabeçado por substantivo de papel, a função
+     retorna erro na hora, sem tentar os trechos menores: `"mãe Elisa"` perde a
+     **Elisa** também (`role_noun_drop_reports_the_name_it_took_down`).
+  3. **Epíteto só em início de frase é indistinguível de substantivo comum.**
+     `appears_as_proper_noun` exige maiúscula no meio da frase; um apelido que a
+     prosa sempre escreve depois de ponto ("Velha entrou.") é rejeitado como se
+     fosse "a mãe" (`role_noun_drop_flags_sentence_initial_capitalization`).
+  Hipóteses ainda sem medição real (precisam do vault de 29 capítulos): dedup-LLM
+  fundindo pessoas distintas — `dubious_candidates` manda **todo** nome de uma
+  palavra com ≤5 chars, o que é muita gente; e estado congelado pelo incremental
+  (capítulos extraídos por uma versão antiga do pipeline nunca são relidos sem
+  "Tudo"). Roteiro: rodar **Tudo** no vault real, abrir "Diagnóstico da extração",
+  e para cada personagem que o autor sabe existir procurar o nome no relatório —
+  aparece como candidato bruto? Se não, a janela do capítulo dele rodou (está em
+  `window_stats`) ou falhou? Se aparece, qual camada o descartou?
 
 ### Resolvidas
 
