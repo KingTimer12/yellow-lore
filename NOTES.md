@@ -45,7 +45,9 @@ renomear, excluir). Comandos: `list_sessions`, `create_session`,
 ## Backend Rust (`src-tauri/src/`)
 
 - `db.rs` — **SQLite (rusqlite bundled, WAL)**: vaults, documents, chunks,
-  characters, places, relations. Vetores gravados como **BLOB f32 little-endian**
+  characters, places, **abilities**, relations (com `status`
+  Manual/Extraído, migrado por `ALTER TABLE` na abertura). `delete_entity` remove a
+  linha **e as relações órfãs** dela, senão sobra vértice morto no grafo. Vetores gravados como **BLOB f32 little-endian**
   (4 bytes/dim — menor e mais rápido que JSON; leitura aceita o formato JSON
   antigo). `id` do documento é **BLAKE3(conteúdo)** → reingestão idempotente e
   dedupe. Meta `emb:<vault>` guarda o modelo de embedding indexado (p/ detectar
@@ -82,27 +84,88 @@ renomear, excluir). Comandos: `list_sessions`, `create_session`,
   mais. Uma única re-tentativa (sem loop aberto). No streaming: rascunho adequado é
   entregue direto (um push); só a re-tentativa é transmitida token a token.
   Chunks têm `ordinal` (ordem de leitura, recalculado no load).
-  `extract_entities()` = LLM lê o vault em **janelas de ~12k chars** (até **40**
-  janelas), com **concorrência configurável** (`extractionConcurrency`, default 1
-  = sequencial; suba só em nuvem), **modelo de extração dedicado opcional**
-  (`extractionModel`; vazio = reutiliza o de chat), e **mescla** as entidades por
-  nome (case-insensitive; traits unidos, relações dedup). **Incremental**: só
-  documentos ainda não extraídos (set em
-  `meta`); entidades **Editado/Adicionado nunca são sobrescritas** (`is_protected`).
-  Extração de JSON tolerante a `<think>` (strip antes de parsear). Coreferência:
-  alias por subsequência de tokens ("Cesar" → "Cesar Magnus") + **dedup opcional
-  via LLM** (`dedupEntities`) **direcionado** (só nomes ambíguos, que compartilham
-  algum token) e **contra entidades já salvas** (funde "Cesar" de um run novo na
-  "Cesar Magnus" de um run anterior). Nomes canônicos reescrevem também as relações.
+  **Ordem de leitura natural** (`cmp_doc`): nomes de documento são comparados
+  cientes de número, senão "Capítulo 10" vem antes de "Capítulo 2" e a ordem
+  quebra a partir de dez capítulos. **Perguntas de primeira ocorrência**
+  (`wants_first_time`: "primeira vez", "quando se conheceram") injetam os trechos
+  mais **antigos** que citam as entidades da pergunta — o cosseno não tem noção de
+  "mais antigo" e caía em capítulo tardio. O system prompt **proíbe dedução**:
+  responder só o que está escrito, dizer o que falta, nunca supor vínculo anterior
+  que o texto não afirma.
+
+### Extração de entidades (`extract_entities`)
+
+Personagens, **lugares** e **habilidades** (poderes/magias/técnicas — "Previsão",
+"Espadas do Julgamento") mais as relações entre eles. O pipeline é map-reduce: as
+janelas extraem candidatos, tudo é conciliado **em memória**, e só então
+`merge_extracted` grava uma vez — nada é gravado janela a janela.
+
+- **Janelas** de ~12k chars (até **150**; 40 já cortava ~40% de uma obra de 29
+  capítulos em silêncio, junto dos personagens dos capítulos finais). A janela
+  **quebra em fronteira de capítulo** quando já tem ≥4k chars, para não colar o fim
+  de um capítulo no começo do outro; capítulos curtos compartilham janela para não
+  gastar uma chamada cada (`build_windows`).
+- **Registro corrente no prompt**: cada janela recebe a lista de **todas** as
+  entidades conhecidas (as salvas no vault **e** as descobertas nas janelas
+  anteriores da mesma rodada), com a instrução de copiar o nome letra por letra e
+  só acrescentar o que o texto novo revela. As janelas rodam em **lotes do tamanho
+  de `extractionConcurrency`** e a lista é remontada entre lotes — o registro
+  cresce sem nenhuma chamada de LLM extra e o paralelismo de nuvem é preservado.
+  Como `merge_extracted` atualiza por nome, reusar o nome exato é o que transforma
+  duplicata em atualização.
+- **Grounding** (`ground_extraction`): o modelo não é acreditado. Cada nome é
+  reescrito para a maior sequência das próprias palavras que aparece
+  **literalmente** (com fronteira de palavra) na janela lida; sem forma ancorada, a
+  entidade é descartada. Mata personagem/habilidade inventado e **sobrenome
+  fabricado** — "Leonardo Venante" ("Venante" é o nome da classe com poderes, nunca
+  grudado nele no texto) colapsa em "Leonardo", junto de "Leo / Leonardo" e
+  "Leonardo (Leo) Venante". `sourceQuote` que não existe no texto é apagada. Se o
+  nome bate com uma entidade conhecida, a **grafia salva** vence (capítulo escreve
+  "Charlotte", card é "Charlotte Bessa" → "Charlotte Bessa"), mas a evidência
+  continua obrigatória: nome do registro que a janela não menciona é descartado,
+  senão o modelo copiaria a lista inteira para a saída.
+- **Termos relacionais**: nome não pode começar com preposição ("de Leonardo",
+  fatiado de "a mãe de Leonardo", virava vértice ao lado do Leonardo real) e
+  substantivo de papel/parentesco como cabeça do nome ("mãe", "a mãe de Leonardo",
+  "a madrasta") deixa de ser entidade — duplicava a pessoa nomeada ("mãe" ao lado
+  de "Elisa"). Só passa quando o texto usa a palavra como **nome próprio**:
+  maiúscula no meio da frase (`appears_as_proper_noun`), o que distingue "A Bruxa"
+  de "a mãe". O vínculo sobrevive como aresta rotulada. Artigos são preservados.
+- **Prompt**: nome copiado exatamente como está escrito (nunca inventar sobrenome
+  nem colar palavras vizinhas — título, classe, espécie e facção não são
+  sobrenome), um nome por entrada, papel genérico vira relação e não entidade,
+  traits com no máximo 6 tags de uma palavra (o resto vai para o summary) e
+  **proibido resumo com alternativas** ("madrasta ou mãe biológica") — decidir pelo
+  contexto ou descrever só o que o texto afirma. Habilidade exige contexto de
+  poder: arma nomeada ("uma espada sagrada") e organização ("a Inquisição") não
+  contam, e capítulo inicial sem nenhuma é normal.
+- **Coreferência** (`canonical_map`): contenção de tokens **sem ordem** — a versão
+  ordenada não casava `[leo, leonardo]` com `[leonardo, leo, venante]` —, títulos
+  colapsando na forma simples ("Rei Yan Serafine" → "Yan Serafine") e diminutivos
+  ("Leo" → "Leonardo") só quando existe uma única forma longa possível. Inclui os
+  nomes já salvos, então um nome novo funde no card antigo. Nomes canônicos
+  reescrevem também as relações.
+- **Dedup opcional via LLM** (`dedupEntities`), direcionado: só nomes ambíguos —
+  que compartilham token, ou são forma curta por prefixo ("Leo"), ou apelido curto
+  ("Lô") — vão para o modelo, em **lotes de 60** (uma chamada com centenas de nomes
+  truncava e alucinava). `canonical` e aliases **só valem se vierem da lista
+  enviada**: sem essa checagem o modelo inventa o nome do grupo inteiro.
+- **Incremental**: só documentos ainda não extraídos (set em `meta`). Entidades
+  **Editado/Adicionado** e relações **Manual** nunca são sobrescritas nem apagadas
+  (`is_protected`; `apply_aliases` também não toca aresta manual). JSON tolerante a
+  `<think>`. `extractionModel` opcional (vazio = reutiliza o de chat).
 - `config.rs` — `RagConfig` (`config.json`, global).
 - `lib.rs` — estado + comandos Tauri.
 
 **Relações manuais (curadoria do grafo)**: o usuário adiciona/remove arestas na
-aba Grafo (`RelationsEditor` em `CharactersView`). Comandos `add_relation` /
-`remove_relation` (chave natural `from,to,label`, case-insensitive; `reset_extracted`
-nunca apaga relações). Isso alimenta o GraphRAG — como a extração automática fica
-mais imprecisa a cada capítulo novo, ligações curadas à mão mantêm a recuperação
-correta.
+aba Grafo (`RelationsEditor` em `CharactersView`) ou **ligando nós no próprio
+grafo** — o botão no painel de edição fecha o drawer e o clique seguinte escolhe o
+destino (`state.linkSource`), com rótulo editável e exclusão. Comandos
+`add_relation` / `remove_relation` (chave natural `from,to,label`,
+case-insensitive; `reset_extracted` nunca apaga relações). Aresta criada pelo
+usuário nasce `status='Manual'` e a extração **nunca** a modifica. Isso alimenta o
+GraphRAG — como a extração automática fica mais imprecisa a cada capítulo novo,
+ligações curadas à mão mantêm a recuperação correta.
 
 ### Comandos Tauri
 
@@ -112,8 +175,9 @@ Config: `get_config`, `save_config`. Vaults: `list_vaults`, `get_active_vault`,
 `index_info`, `reindex`. Chat: `ask`, `ask_stream` (tokens via `Channel`; front
 separa `<think>` e renderiza markdown), `cancel_generation` (para a geração via
 `AtomicBool`). Entidades: `get_entities`, `extract_entities` (arg `force`:
-incremental por padrão, `true` re-scaneia tudo), `add_character`, `add_place`,
-`update_character`, `update_place`.
+incremental por padrão, `true` re-scaneia tudo — apaga só `status='Extraído'`),
+`add_character`, `add_place`, `add_ability`, `update_character`, `update_place`,
+`update_ability`, `delete_character`, `delete_place`, `delete_ability`.
 
 ## Config (Settings) — LLM ≠ embedding
 
@@ -126,8 +190,11 @@ incremental por padrão, `true` re-scaneia tudo), `add_character`, `add_place`,
   cortava a resposta), mostrar fontes, **reranking** (off), **RAG corretivo /
   CRAG** (off).
 - Extração: **modelo dedicado** opcional (`extractionModel`), **janelas em
-  paralelo** (`extractionConcurrency`, default 1), **dedup via LLM**
-  (`dedupEntities`).
+  paralelo** (`extractionConcurrency`, default 1 — é também o tamanho do lote entre
+  as remontagens do registro corrente), **dedup via LLM** (`dedupEntities`).
+- **Escala da UI**: `zoom` no `.app-shell` por largura de viewport (1.1 acima de
+  1600px, 1.2 acima de 2100px, 1.32 acima de 2800px) — tela grande não deixa a
+  fonte minúscula.
 
 ## Rodar
 
@@ -136,6 +203,16 @@ incremental por padrão, `true` re-scaneia tudo), `add_character`, `add_place`,
   - **Ollama** rodando (`ollama serve`) + modelos (`ollama pull llama3.1`,
     `ollama pull nomic-embed-text`), **ou**
   - chave OpenAI no Settings.
+- `cd src-tauri && cargo test --lib` → testes de unidade de `rag.rs`: grounding
+  (sobrenome fabricado, entidade e citação inventadas), termos relacionais
+  ("mãe"/"de Leonardo"/"A Bruxa"), coreferência (títulos, diminutivos, forma curta
+  ambígua), registro corrente, quebra de janela por capítulo, ordem natural de
+  capítulo e recuperação da primeira ocorrência. Roda sem LLM.
+- Verificação manual da extração num vault grande: anote o estado, rode
+  **"Tudo"** (re-extrair, apaga só `status='Extraído'`), e confira que papel
+  genérico não é personagem, que o protagonista está num card só e que o resumo
+  não tem alternativas ("X ou Y"). Depois adicione um capítulo e rode "Extrair
+  novos": nada deve duplicar o que já existia.
 - Ingestão: **.txt / .md** (lidos no front via `file.text()`) e **.pdf / .docx**
   (front envia bytes em base64; `extract.rs` extrai o texto no Rust — `pdf-extract`
   para PDF, `zip` + `quick-xml` lendo `word/document.xml` para DOCX).
@@ -143,7 +220,12 @@ incremental por padrão, `true` re-scaneia tudo), `add_character`, `add_place`,
 ## Ainda mock / próximos passos
 
 - Grafo (`Graph.tsx`): força-dirigido no front (SVG, sem lib), não usa layout
-  do backend; para vaults enormes (centenas de nós) trocar a repulsão O(n²) por
+  do backend. Personagens, lugares e habilidades no mesmo mapa, com **controles de
+  volume** — busca de foco (o nó e sua vizinhança), filtro por tipo, "só
+  conectados" e limite de nós desenhados (top N por conexões, default 60) com
+  contagem do que está oculto; sem isso uma obra de 29 capítulos vira um borrão.
+  Posições são salvas a cada frame, senão mudar filtro joga o layout de volta na
+  espiral inicial. Para vaults enormes ainda vale trocar a repulsão O(n²) por
   Barnes-Hut.
 
 ## Limitações conhecidas (levantadas em uso real)
@@ -155,6 +237,23 @@ incremental por padrão, `true` re-scaneia tudo), `add_character`, `add_place`,
 
 ### Resolvidas
 
+- ~~Extração degradando com o volume (29 capítulos)~~: personagem fragmentado em
+  vários vértices, sobrenome inventado, habilidade e personagem alucinados, e
+  pedaço de frase ("de Leonardo") ou papel genérico ("mãe") como entidade. Causas
+  reais, todas no código: nada validava o retorno do modelo; o prompt mandava "use
+  sempre o nome mais completo" (o que fazia colar palavras vizinhas); a conciliação
+  por subsequência era sensível à ordem; nome relacional nunca era rejeitado; e cada
+  janela redescobria a mesma pessoa sem ver o que as outras já tinham achado. Ver a
+  seção de extração acima.
+- ~~"Capítulo 10" antes de "Capítulo 2"~~: ordenação de documento era comparação de
+  string. Com dez capítulos ou mais a ordem de leitura quebrava e levava consigo
+  qualquer pergunta de "primeira vez".
+- ~~Pergunta de primeira ocorrência sem resposta~~: "o que X falou pela primeira vez
+  para Y" não acionava nada (a heurística de abertura exigia "frase"/"parágrafo") e
+  o top-k caía em capítulo tardio; o modelo então dizia não saber e supunha que os
+  dois já se conheciam.
+- ~~Últimos capítulos ignorados na extração~~: `MAX_WINDOWS` 40 (~480k chars) era
+  estourado por 29 capítulos e o resto era descartado em silêncio.
 - ~~Dedup de entidades entre extrações~~: o dedup-LLM agora roda **contra as
   entidades já salvas** ("Cesar" de um run novo funde na "Cesar Magnus" salva).
 - ~~Filtro de citações heurístico~~: substituído por **citações declaradas pelo
@@ -192,11 +291,22 @@ incremental por padrão, `true` re-scaneia tudo), `add_character`, `add_place`,
 ## Ideias — precisão da extração
 
 - **Saída estruturada garantida**: Ollama `format: "json"` / grammar GBNF ou
-  JSON schema → elimina falha de "JSON inválido" de modelos pequenos.
-- **Few-shot com personagens conhecidos**: injetar nomes canônicos já extraídos
-  no prompt → consistência de nomeação entre janelas/runs.
-- Feito: **dedup contra entidades existentes** e **verificação direcionada de
-  entidades duvidosas** (só nomes ambíguos vão ao dedup-LLM).
+  JSON schema → elimina falha de "JSON inválido" de modelos pequenos. **Cuidado**:
+  já foi tentado e revertido — no vLLM o `response_format: json_object` liga
+  guided decoding e a extração de 2 capítulos passou de minutos para +20 min; no
+  Ollama o `format:"json"` provoca enchente de espaço em branco. Se voltar, usar
+  backend xgrammar no vLLM e medir antes.
+- Feito: **registro corrente no prompt** (nomes canônicos já conhecidos, do vault e
+  das janelas anteriores da rodada), **grounding contra o texto**, **rejeição de
+  termo relacional**, **dedup contra entidades existentes** e **verificação
+  direcionada de entidades duvidosas** (só nomes ambíguos vão ao dedup-LLM).
+- **Dedup por papel/contexto**: hoje o dedup-LLM recebe **só nomes**, então não tem
+  como saber que "mãe" e "Elisa" são a mesma pessoa. Mandar contexto (relações e
+  resumo de cada entidade) resolveria casos que sobrarem — custa várias chamadas
+  grandes, e a classe principal já morre na rejeição determinística. Reavaliar
+  depois de medir no vault de 29 capítulos.
+- **Relação pendente**: quando ninguém nomeia a pessoa ("a mãe", sem nome no texto),
+  hoje o vínculo é descartado. Guardar como aresta pendente exigiria coluna nova.
 
 ## Ideias — tempo de extração
 
