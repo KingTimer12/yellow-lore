@@ -1050,6 +1050,50 @@ pub struct ExtractResult {
     pub place_aliases: std::collections::HashMap<String, String>,
 }
 
+/// Split the corpus into LLM-sized windows on chunk boundaries.
+///
+/// Windows also break at a document boundary once they hold a reasonable amount
+/// of text: welding the tail of one chapter to the head of the next put two
+/// unrelated scenes in one prompt, and the model then read a relational mention
+/// ("a mãe") against the wrong chapter and failed to tie it to a name.
+fn build_windows(chunks: &[Chunk]) -> Vec<String> {
+    const WINDOW_CHARS: usize = 12_000;
+    // Below this a window is too thin to be worth its own LLM call, so packing
+    // continues across the document boundary rather than firing a call per short
+    // chapter.
+    const MIN_SPLIT: usize = WINDOW_CHARS / 3;
+    // Cost/time guard. 40 windows ≈ 480k chars, which a 29-chapter work already
+    // overflows — the tail chapters were silently dropped, so their characters
+    // simply never existed. Coverage beats speed; incremental extraction keeps
+    // normal runs (a chapter or two) small, and only a full re-extract pays it all.
+    const MAX_WINDOWS: usize = 150;
+
+    let mut windows: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut cur_doc: Option<&str> = None;
+    for c in chunks {
+        let new_doc = cur_doc.map_or(false, |d| d != c.doc_name.as_str());
+        if new_doc && cur.len() >= MIN_SPLIT {
+            windows.push(std::mem::take(&mut cur));
+            if windows.len() >= MAX_WINDOWS {
+                return windows;
+            }
+        }
+        cur_doc = Some(&c.doc_name);
+        cur.push_str(&format!("[{}]\n{}\n\n", c.doc_name, c.text));
+        if cur.len() >= WINDOW_CHARS {
+            windows.push(std::mem::take(&mut cur));
+            if windows.len() >= MAX_WINDOWS {
+                return windows;
+            }
+        }
+    }
+    if !cur.trim().is_empty() {
+        windows.push(cur);
+    }
+    windows
+}
+
 /// Ask the LLM to read the vault's knowledge and extract characters, places and
 /// relations as structured JSON.
 pub async fn extract_entities(
@@ -1074,29 +1118,7 @@ pub async fn extract_entities(
         cfg.extraction_model.as_str()
     };
 
-    // Split the whole corpus into ~12k-char windows on chunk boundaries, run the
-    // LLM per window, and merge — so large works are covered, not just the head.
-    const WINDOW_CHARS: usize = 12_000;
-    // Cost/time guard. Raised again: 40 windows ≈ 480k chars, which a 29-chapter
-    // work already overflows — the tail chapters were silently dropped, so their
-    // characters simply never existed. Coverage beats speed here; incremental
-    // extraction keeps normal runs (a chapter or two) small anyway, and only a full
-    // re-extract pays the whole cost.
-    const MAX_WINDOWS: usize = 150;
-    let mut windows: Vec<String> = Vec::new();
-    let mut cur = String::new();
-    for c in chunks {
-        cur.push_str(&format!("[{}]\n{}\n\n", c.doc_name, c.text));
-        if cur.len() >= WINDOW_CHARS {
-            windows.push(std::mem::take(&mut cur));
-            if windows.len() >= MAX_WINDOWS {
-                break;
-            }
-        }
-    }
-    if !cur.trim().is_empty() && windows.len() < MAX_WINDOWS {
-        windows.push(cur);
-    }
+    let windows = build_windows(chunks);
 
     // Accumulate + merge across windows.
     let mut chars_map: std::collections::HashMap<String, ExtractedChar> = Default::default();
@@ -1111,56 +1133,69 @@ pub async fn extract_entities(
     // recognizing it and just adding what the new chapter reveals — merge_extracted
     // updates by name, so reusing the exact saved name is what turns a duplicate
     // into an update.
-    let roster = roster_block(existing_chars, existing_places, existing_abilities);
-    // Folded name → saved display name, so an emitted name that matches a saved
-    // entity keeps the saved spelling instead of drifting.
-    let known: std::collections::HashMap<String, String> = existing_chars
+    // The roster GROWS as the run proceeds: a character first named in window 3 is
+    // on the list window 4 sees. Without that, each window rediscovers the same
+    // person independently and the variants only meet in the post-hoc merge — which
+    // is exactly why fragmentation got worse the more windows a work produced.
+    let mut roster_chars: Vec<String> = existing_chars.to_vec();
+    let mut roster_places: Vec<String> = existing_places.to_vec();
+    let mut roster_abilities: Vec<String> = existing_abilities.to_vec();
+    // Folded name → display name, so an emitted name that matches a known entity
+    // keeps that spelling instead of drifting.
+    let mut known: std::collections::HashMap<String, String> = roster_chars
         .iter()
-        .chain(existing_places.iter())
-        .chain(existing_abilities.iter())
+        .chain(roster_places.iter())
+        .chain(roster_abilities.iter())
         .map(|n| (fold(n), n.clone()))
         .collect();
 
-    // Run the windows with the configured concurrency. Default 1 (sequential) is
-    // the safe choice for a single local GPU; cloud providers can raise it to cut
-    // wall-clock time. A bad window is dropped (filter_map), not fatal.
+    // Windows run in batches of `extraction_concurrency` (default 1 = sequential,
+    // the safe choice for a single local GPU). The roster is rebuilt between
+    // batches, so growing it costs no extra LLM calls and keeps the parallelism
+    // cloud users configured. A bad window is dropped (filter_map), not fatal.
     let concurrency = cfg.extraction_concurrency.max(1);
-    let futs = windows
-        .iter()
-        .map(|w| extract_window(client, cfg, w, ex_model, &roster, &known))
-        .collect::<Vec<_>>();
-    let parsed_windows: Vec<Extraction> = stream::iter(futs)
-        .buffer_unordered(concurrency)
-        .filter_map(|r| async move { r.ok() })
-        .collect()
-        .await;
+    for batch in windows.chunks(concurrency) {
+        let roster = roster_block(&roster_chars, &roster_places, &roster_abilities);
+        let futs = batch
+            .iter()
+            .map(|w| extract_window(client, cfg, w, ex_model, &roster, &known))
+            .collect::<Vec<_>>();
+        let parsed_windows: Vec<Extraction> = stream::iter(futs)
+            .buffer_unordered(concurrency)
+            .filter_map(|r| async move { r.ok() })
+            .collect()
+            .await;
 
-    for parsed in parsed_windows {
-        for c in parsed.characters {
-            if c.name.trim().is_empty() {
-                continue;
+        for parsed in parsed_windows {
+            for c in parsed.characters {
+                if c.name.trim().is_empty() {
+                    continue;
+                }
+                register(&mut known, &mut roster_chars, &c.name);
+                merge_char(&mut chars_map, c);
             }
-            merge_char(&mut chars_map, c);
-        }
-        for p in parsed.places {
-            if p.name.trim().is_empty() {
-                continue;
+            for p in parsed.places {
+                if p.name.trim().is_empty() {
+                    continue;
+                }
+                register(&mut known, &mut roster_places, &p.name);
+                merge_place(&mut places_map, p);
             }
-            merge_place(&mut places_map, p);
-        }
-        for a in parsed.abilities {
-            if a.name.trim().is_empty() {
-                continue;
+            for a in parsed.abilities {
+                if a.name.trim().is_empty() {
+                    continue;
+                }
+                register(&mut known, &mut roster_abilities, &a.name);
+                merge_ability(&mut abilities_map, a);
             }
-            merge_ability(&mut abilities_map, a);
-        }
-        for r in parsed.relations {
-            if r.from.trim().is_empty() || r.to.trim().is_empty() {
-                continue;
-            }
-            let key = (r.from.to_lowercase(), r.to.to_lowercase(), r.label.to_lowercase());
-            if rel_set.insert(key) {
-                relations_out.push(r);
+            for r in parsed.relations {
+                if r.from.trim().is_empty() || r.to.trim().is_empty() {
+                    continue;
+                }
+                let key = (r.from.to_lowercase(), r.to.to_lowercase(), r.label.to_lowercase());
+                if rel_set.insert(key) {
+                    relations_out.push(r);
+                }
             }
         }
     }
@@ -1384,6 +1419,20 @@ fn merge_ability(map: &mut std::collections::HashMap<String, ExtractedAbility>, 
 }
 
 /// Run extraction over a single corpus window.
+/// Add a freshly extracted name to the running registry, if new.
+fn register(
+    known: &mut std::collections::HashMap<String, String>,
+    roster: &mut Vec<String>,
+    name: &str,
+) {
+    let key = fold(name);
+    if key.is_empty() || known.contains_key(&key) {
+        return;
+    }
+    known.insert(key, name.to_string());
+    roster.push(name.to_string());
+}
+
 /// The "already known" section of the extraction prompt: every saved entity, by
 /// name and by type. Capped only to keep a huge cast from crowding out the text
 /// itself — the whole roster is sent whenever it fits.
@@ -1448,7 +1497,16 @@ NUNCA invente sobrenome nem junte palavras próximas para formar um nome — tí
 espécies, facções, grupos e tipos de poder NÃO são sobrenomes. Se o texto só usa o primeiro nome \
 ou um apelido, use exatamente ele. Um nome por entrada: nada de \"Leo / Leonardo\", \
 \"Leonardo (Leo)\" ou variações no mesmo campo \"name\". Nas relações, use exatamente esses \
-mesmos nomes.\n\
+mesmos nomes. Nome NUNCA começa com preposição (\"de Leonardo\" está errado).\n\
+TERMOS RELACIONAIS: nunca crie entidade a partir de um papel ou parentesco genérico \
+(\"mãe\", \"a mãe de Leonardo\", \"o pai\", \"o professor\", \"um amigo\", \"a madrasta\"). \
+Se o texto — ou a lista de já cadastradas — identifica essa pessoa por nome próprio, use o \
+NOME PRÓPRIO e registre o vínculo em \"relations\" (ex.: from \"Elisa\", to \"Leonardo\", \
+label \"mãe de\"). Se ninguém a nomeia, NÃO crie entidade nenhuma: só a relação, se fizer \
+sentido. Um papel genérico virando personagem próprio duplica quem já tem nome.\n\
+DECIDA, não hesite: o \"summary\" afirma o que o texto sustenta. É PROIBIDO escrever \
+alternativas (\"madrasta ou mãe biológica\", \"aliado ou traidor\") — resolva pelo contexto do \
+capítulo; se o texto não permite decidir, descreva apenas o fato observável e omita o resto.\n\
 Extraia TODOS os personagens — SERES (pessoas, criaturas, entidades vivas ou sencientes) — \
 INCLUSIVE os citados por apelido, epíteto, título ou cargo (ex.: \"Salazar Bessa\", \"David Bessa\", \
 \"A Bruxa\", \"Rei Yan Serafine\", \"o Caçador\"): todos são personagens. NUNCA deixe de fora um ser só \
@@ -1508,7 +1566,7 @@ fn ground_extraction(
     known: &std::collections::HashMap<String, String>,
 ) -> Extraction {
     let hay = fold(corpus);
-    let ground_name = |raw: &str| ground_known_name(raw, &hay, known);
+    let ground_name = |raw: &str| ground_known_name(raw, &hay, corpus, known);
 
     ex.characters.retain_mut(|c| match ground_name(&c.name) {
         Some(n) => {
@@ -1563,6 +1621,24 @@ fn clean_name(raw: &str) -> String {
             ')' | ']' | '}' => depth = (depth - 1).max(0),
             _ if depth == 0 => s.push(ch),
             _ => {}
+        }
+    }
+    // A name must never start with a preposition: the model emits "de Leonardo"
+    // (from "a mãe de Leonardo") and that became its own vertex next to the real
+    // Leonardo. Dropping the connector folds it back onto him. Articles are kept —
+    // "A Bruxa" is a genuine epithet.
+    loop {
+        let stripped = {
+            let toks: Vec<&str> = s.split_whitespace().collect();
+            if toks.len() > 1 && NAME_CONNECTORS.contains(&fold(toks[0]).as_str()) {
+                Some(toks[1..].join(" "))
+            } else {
+                None
+            }
+        };
+        match stripped {
+            Some(rest) => s = rest,
+            None => break,
         }
     }
     // "Leonardo — o Caçador": the name precedes the epithet.
@@ -1622,6 +1698,33 @@ fn word_occurrences(hay: &str, needle: &str) -> usize {
     count
 }
 
+/// Connectors that can never open a name. "de Leonardo" (sliced out of "a mãe de
+/// Leonardo") was becoming a vertex of its own beside the real Leonardo.
+const NAME_CONNECTORS: &[&str] = &[
+    "de", "do", "da", "dos", "das", "em", "no", "na", "nos", "nas", "ao", "aos", "com", "por",
+    "para", "pra", "e", "ou", "que", "sobre", "entre", "ate", "desde",
+];
+
+/// Common nouns for a role or family tie. On their own these are never an entity:
+/// the text says "a mãe", "o professor", "um amigo", and the extractor turned each
+/// into a permanent nameless vertex duplicating the named person ("mãe" beside
+/// "Elisa"). They are only accepted when the text uses them as a proper name
+/// (capitalized mid-sentence, e.g. "A Bruxa"), which `appears_as_proper_noun`
+/// checks.
+const ROLE_NOUNS: &[&str] = &[
+    "mae", "pai", "mamae", "papai", "filho", "filha", "filhos", "filhas", "irmao", "irma",
+    "irmaos", "irmas", "avo", "avos", "vo", "va", "tio", "tia", "primo", "prima", "sobrinho",
+    "sobrinha", "esposa", "esposo", "marido", "namorado", "namorada", "noivo", "noiva", "genro",
+    "nora", "padrasto", "madrasta", "enteado", "enteada", "familia", "pais", "parente",
+    "professor", "professora", "aluno", "aluna", "amigo", "amiga", "amigos", "amigas", "colega",
+    "vizinho", "vizinha", "chefe", "patrao", "empregada", "criado", "criada", "servo", "serva",
+    "soldado", "soldados", "guarda", "guardas", "medico", "medica", "enfermeira", "motorista",
+    "cliente", "dono", "homem", "mulher", "menino", "menina", "garoto", "garota", "rapaz", "moca",
+    "crianca", "criancas", "bebe", "velho", "velha", "jovem", "pessoa", "pessoas", "gente",
+    "alguem", "ninguem", "todos", "protagonista", "personagem", "narrador", "grupo", "equipe",
+    "inimigo", "aliado", "estranho", "desconhecido", "figura", "vozes", "voz",
+];
+
 /// Function words that must never survive as an entity name on their own — they
 /// appear everywhere, so a hallucinated multi-word name could otherwise ground
 /// itself down to one of them.
@@ -1641,9 +1744,10 @@ const NAME_STOPWORDS: &[&str] = &[
 fn ground_known_name(
     raw: &str,
     hay: &str,
+    corpus: &str,
     known: &std::collections::HashMap<String, String>,
 ) -> Option<String> {
-    let corpus_form = ground_name(raw, hay)?;
+    let corpus_form = ground_name(raw, hay, corpus)?;
     let cleaned = clean_name(raw);
     Some(
         known
@@ -1658,7 +1762,7 @@ fn ground_known_name(
 /// folded corpus `hay`. Ties break on how often the run occurs (a real name is
 /// repeated; an accidental fragment is not), then leftmost. `None` = the model
 /// made the name up.
-fn ground_name(raw: &str, hay: &str) -> Option<String> {
+fn ground_name(raw: &str, hay: &str, corpus: &str) -> Option<String> {
     let name = clean_name(raw);
     if name.is_empty() {
         return None;
@@ -1693,10 +1797,60 @@ fn ground_name(raw: &str, hay: &str) -> Option<String> {
             }
         }
         if let Some((_, _, run)) = best {
+            // A phrase headed by a role/kinship noun ("mãe", "mãe de Leonardo",
+            // "madrasta de X") is a description of someone, not a name. Accept it
+            // only when the text itself uses it as a proper name.
+            let head = name_tokens(&run).into_iter().next().unwrap_or_default();
+            if ROLE_NOUNS.contains(&head.as_str()) && !appears_as_proper_noun(corpus, &run) {
+                return None;
+            }
             return Some(run);
         }
     }
     None
+}
+
+/// Does `name` occur in `corpus` capitalized and NOT merely at the start of a
+/// sentence? That is what separates a real proper name used as an epithet ("A
+/// Bruxa") from a common noun the prose happens to use ("a mãe").
+fn appears_as_proper_noun(corpus: &str, name: &str) -> bool {
+    let nc: Vec<char> = name.chars().collect();
+    let cc: Vec<char> = corpus.chars().collect();
+    if nc.is_empty() || cc.len() < nc.len() {
+        return false;
+    }
+    let eq = |a: char, b: char| a == b || a.to_lowercase().eq(b.to_lowercase());
+    for i in 0..=(cc.len() - nc.len()) {
+        if !nc.iter().enumerate().all(|(j, b)| eq(cc[i + j], *b)) {
+            continue;
+        }
+        // Whole word only, and capitalized in the text.
+        if i > 0 && cc[i - 1].is_alphanumeric() {
+            continue;
+        }
+        let end = i + nc.len();
+        if end < cc.len() && cc[end].is_alphanumeric() {
+            continue;
+        }
+        if !cc[i].is_uppercase() {
+            continue;
+        }
+        // Sentence-initial capitalization proves nothing — look for the previous
+        // visible character.
+        let mut prev = None;
+        for k in (0..i).rev() {
+            if !cc[k].is_whitespace() {
+                prev = Some(cc[k]);
+                break;
+            }
+        }
+        match prev {
+            None => continue,
+            Some(p) if ".!?…:;—–\"«»'“”".contains(p) => continue,
+            _ => return true,
+        }
+    }
+    false
 }
 
 /// Keep `quote` only if it really occurs in the source; otherwise blank it out —
@@ -2047,13 +2201,13 @@ O Rei Yan Serafine chegou depois. Leo correu.";
     fn fabricated_surname_collapses_to_the_grounded_name() {
         let hay = fold(CORPUS);
         // All three model variants ground to the same real name → one entity, not three.
-        assert_eq!(ground_name("Leonardo Venante", &hay).as_deref(), Some("Leonardo"));
-        assert_eq!(ground_name("Leonardo (Leo) Venante", &hay).as_deref(), Some("Leonardo"));
-        assert_eq!(ground_name("Leo / Leonardo", &hay).as_deref(), Some("Leonardo"));
+        assert_eq!(ground_name("Leonardo Venante", &hay, CORPUS).as_deref(), Some("Leonardo"));
+        assert_eq!(ground_name("Leonardo (Leo) Venante", &hay, CORPUS).as_deref(), Some("Leonardo"));
+        assert_eq!(ground_name("Leo / Leonardo", &hay, CORPUS).as_deref(), Some("Leonardo"));
         // A name the text never contains is a hallucination and is dropped.
-        assert_eq!(ground_name("Mirela Aldaravi", &hay), None);
+        assert_eq!(ground_name("Mirela Aldaravi", &hay, CORPUS), None);
         // A name written verbatim survives intact.
-        assert_eq!(ground_name("Salazar Bessa", &hay).as_deref(), Some("Salazar Bessa"));
+        assert_eq!(ground_name("Salazar Bessa", &hay, CORPUS).as_deref(), Some("Salazar Bessa"));
     }
 
     #[test]
@@ -2089,11 +2243,71 @@ O Rei Yan Serafine chegou depois. Leo correu.";
                 .collect();
         // The chapter writes only "Charlotte"; the saved card is "Charlotte Bessa".
         // Either spelling must land on the saved name so merge_extracted updates it.
-        assert_eq!(ground_known_name("Charlotte Bessa", &hay, &known).as_deref(), Some("Charlotte Bessa"));
-        assert_eq!(ground_known_name("Charlotte", &hay, &known).as_deref(), Some("Charlotte Bessa"));
+        assert_eq!(ground_known_name("Charlotte Bessa", &hay, CORPUS, &known).as_deref(), Some("Charlotte Bessa"));
+        assert_eq!(ground_known_name("Charlotte", &hay, CORPUS, &known).as_deref(), Some("Charlotte Bessa"));
         // A saved name the window never mentions gets no free pass — the roster
         // must not be copied in wholesale.
-        assert_eq!(ground_known_name("Mirela Aldaravi", &hay, &known), None);
+        assert_eq!(ground_known_name("Mirela Aldaravi", &hay, CORPUS, &known), None);
+    }
+
+    /// The 29-chapter symptoms: a bare "mãe" vertex beside the named "Elisa", and
+    /// "de Leonardo" sliced out of "a mãe de Leonardo" as an entity of its own.
+    #[test]
+    fn relational_terms_never_become_entities() {
+        let corpus = "Elisa deposita dinheiro para Leonardo. A mãe de Leonardo é feroz. \
+Chamavam a velha de A Bruxa naquela vila.";
+        let hay = fold(corpus);
+        // Generic role, with or without the person attached → no entity.
+        assert_eq!(ground_name("mãe", &hay, corpus), None);
+        assert_eq!(ground_name("a mãe de Leonardo", &hay, corpus), None);
+        assert_eq!(ground_name("Mãe (mencionada)", &hay, corpus), None);
+        // The preposition is dropped, folding the fragment back onto the real person.
+        assert_eq!(ground_name("de Leonardo", &hay, corpus).as_deref(), Some("Leonardo"));
+        // An epithet the text capitalizes mid-sentence is a real name and survives.
+        assert!(appears_as_proper_noun(corpus, "A Bruxa"));
+        assert!(!appears_as_proper_noun(corpus, "mãe"));
+        // Named people are untouched.
+        assert_eq!(ground_name("Elisa", &hay, corpus).as_deref(), Some("Elisa"));
+    }
+
+    #[test]
+    fn windows_break_on_chapter_boundaries() {
+        let mk = |doc: &str, n: usize| Chunk {
+            id: format!("{doc}-{n}"),
+            doc_id: doc.to_string(),
+            doc_name: doc.to_string(),
+            ordinal: n,
+            text: "x".repeat(5_000),
+            vector: vec![],
+        };
+        // Two 5k chapters: each is past the 4k split floor, so neither gets welded
+        // to the other even though together they fit inside one 12k window.
+        let w = build_windows(&[mk("Capítulo 1.txt", 0), mk("Capítulo 2.txt", 0)]);
+        assert_eq!(w.len(), 2);
+        assert!(w[0].contains("Capítulo 1.txt") && !w[0].contains("Capítulo 2.txt"));
+        // Short chapters still share a window — one LLM call per tiny chapter would
+        // be pure cost.
+        let tiny = |doc: &str| Chunk {
+            id: doc.to_string(),
+            doc_id: doc.to_string(),
+            doc_name: doc.to_string(),
+            ordinal: 0,
+            text: "y".repeat(300),
+            vector: vec![],
+        };
+        assert_eq!(build_windows(&[tiny("a.txt"), tiny("b.txt"), tiny("c.txt")]).len(), 1);
+    }
+
+    #[test]
+    fn running_registry_grows_within_a_run() {
+        let mut known: std::collections::HashMap<String, String> = Default::default();
+        let mut roster: Vec<String> = Vec::new();
+        register(&mut known, &mut roster, "Elisa");
+        register(&mut known, &mut roster, "elisa"); // same entity, different casing
+        register(&mut known, &mut roster, "Leonardo");
+        assert_eq!(roster, vec!["Elisa".to_string(), "Leonardo".to_string()]);
+        // The next window's prompt already lists what this window found.
+        assert!(roster_block(&roster, &[], &[]).contains("Elisa; Leonardo"));
     }
 
     #[test]
