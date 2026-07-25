@@ -1061,6 +1061,281 @@ pub struct ExtractResult {
     pub covered_docs: Vec<String>,
     /// True when the run stopped early because the user cancelled.
     pub cancelled: bool,
+    /// Per-layer accounting of what the run threw away or merged. Always filled —
+    /// recall loss has to be measurable without asking the user to flip a switch.
+    pub diag: ExtractDiag,
+}
+
+/// Why a name did not survive grounding. The distinction is the whole point of the
+/// diagnostic: "the model made it up" and "the text writes it, but a filter of ours
+/// refused it" are opposite problems with opposite fixes.
+enum GroundFail {
+    /// Empty after cleaning, or too many words to be a name.
+    Shape,
+    /// No run of its words occurs verbatim in the window.
+    NotInText,
+    /// The grounded form is headed by a role/kinship noun and the text never uses
+    /// it as a proper name.
+    RoleNoun {
+        /// The run that was rejected ("mãe de Leonardo").
+        run: String,
+        /// The text capitalizes it somewhere, but only at the start of a sentence —
+        /// so `appears_as_proper_noun` cannot tell it from a common noun. This is the
+        /// signature of a real epithet ("o Corvo") lost by bad luck of position.
+        capitalized_sentence_initial_only: bool,
+        /// A non-role alternative of the same length existed and was never tried,
+        /// because the role-noun check short-circuits the whole search ("mãe Elisa"
+        /// losing "Elisa").
+        alternative: Option<String>,
+    },
+}
+
+impl GroundFail {
+    fn layer(&self) -> &'static str {
+        match self {
+            GroundFail::Shape => "forma",
+            GroundFail::NotInText => "grounding",
+            GroundFail::RoleNoun { .. } => "termo relacional",
+        }
+    }
+    fn detail(&self) -> String {
+        match self {
+            GroundFail::Shape => "vazio ou longo demais para ser nome".into(),
+            GroundFail::NotInText => "nenhuma palavra do nome aparece literalmente na janela".into(),
+            GroundFail::RoleNoun { run, capitalized_sentence_initial_only, alternative } => {
+                let mut s = format!("\"{run}\" tem substantivo de papel na cabeça");
+                if *capitalized_sentence_initial_only {
+                    s.push_str("; o texto o escreve com maiúscula APENAS em início de frase (indistinguível de nome próprio)");
+                }
+                if let Some(alt) = alternative {
+                    s.push_str(&format!("; alternativa não-papel do mesmo tamanho descartada junto: \"{alt}\""));
+                }
+                s
+            }
+        }
+    }
+}
+
+/// One name that did not reach the vault, and where it died.
+#[derive(Debug, Clone)]
+pub struct DropRecord {
+    /// "grounding" | "termo relacional" | "forma" | "relação"
+    pub layer: String,
+    /// "personagem" | "lugar" | "habilidade" | "relação"
+    pub kind: String,
+    pub name: String,
+    pub window: usize,
+    pub docs: String,
+    pub detail: String,
+}
+
+/// A canonical name and every name folded into it.
+#[derive(Debug, Clone)]
+pub struct MergeGroup {
+    pub canonical: String,
+    pub absorbed: Vec<String>,
+}
+
+/// What one window returned, before filtering. A window that answers with 2
+/// characters for 12k chars of prose points at the MODEL under-reporting, which no
+/// amount of loosening our filters would fix — the opposite diagnosis from a window
+/// that returned 20 and had 18 rejected.
+#[derive(Debug, Clone)]
+pub struct WindowStat {
+    pub window: usize,
+    pub docs: String,
+    pub chars: usize,
+    pub characters: usize,
+    pub places: usize,
+    pub abilities: usize,
+    pub relations: usize,
+    pub kept_characters: usize,
+}
+
+/// A window whose LLM call never produced usable JSON. Its exclusive cast simply
+/// does not exist in the result — and nothing retries it.
+#[derive(Debug, Clone)]
+pub struct WindowFailure {
+    pub window: usize,
+    pub docs: String,
+    pub error: String,
+}
+
+/// Everything measured about one extraction run, per layer. Built unconditionally;
+/// the caller turns it into a text report.
+#[derive(Debug, Clone, Default)]
+pub struct ExtractDiag {
+    pub windows: usize,
+    pub window_limit: usize,
+    /// Chunks left unread because `MAX_WINDOWS` cut the corpus short.
+    pub chunks_dropped_by_limit: usize,
+    pub corpus_chars: usize,
+    pub concurrency: usize,
+    pub model: String,
+    /// Windows that answered with parseable JSON.
+    pub windows_ok: usize,
+    pub window_failures: Vec<WindowFailure>,
+    pub window_stats: Vec<WindowStat>,
+    /// Candidates the model emitted, before any filter of ours.
+    pub raw_characters: usize,
+    pub raw_places: usize,
+    pub raw_abilities: usize,
+    pub raw_relations: usize,
+    pub drops: Vec<DropRecord>,
+    pub merged_deterministic: Vec<MergeGroup>,
+    pub merged_llm: Vec<MergeGroup>,
+    pub pending: usize,
+    pub final_characters: usize,
+    pub final_places: usize,
+    pub final_abilities: usize,
+    pub final_relations: usize,
+}
+
+impl ExtractDiag {
+    fn count(&self, layer: &str) -> usize {
+        self.drops.iter().filter(|d| d.layer == layer).count()
+    }
+
+    /// Human-readable report. Lists are capped: totals stay exact, examples are
+    /// enough to judge a layer without a 4000-line file.
+    pub fn report(&self) -> String {
+        const MAX_LIST: usize = 80;
+        let mut o = String::new();
+        let push_drops = |o: &mut String, layer: &str, title: &str| {
+            let items: Vec<&DropRecord> = self.drops.iter().filter(|d| d.layer == layer).collect();
+            o.push_str(&format!("\n{title}: {}\n", items.len()));
+            for d in items.iter().take(MAX_LIST) {
+                o.push_str(&format!(
+                    "  - \"{}\" ({}, janela {} [{}]) — {}\n",
+                    d.name, d.kind, d.window, d.docs, d.detail
+                ));
+            }
+            if items.len() > MAX_LIST {
+                o.push_str(&format!("  … (+{} não listados)\n", items.len() - MAX_LIST));
+            }
+        };
+
+        o.push_str("== JANELAS ==\n");
+        o.push_str(&format!(
+            "janelas geradas: {} (limite {}) · {} chars de corpus · concorrência {} · modelo {}\n",
+            self.windows, self.window_limit, self.corpus_chars, self.concurrency, self.model
+        ));
+        if self.chunks_dropped_by_limit > 0 {
+            o.push_str(&format!(
+                "!! {} trechos NÃO foram lidos: o limite de {} janelas cortou o corpus. \
+Os personagens exclusivos deles nunca foram procurados.\n",
+                self.chunks_dropped_by_limit, self.window_limit
+            ));
+        }
+        o.push_str(&format!(
+            "janelas com JSON válido: {} · falhas: {}\n",
+            self.windows_ok,
+            self.window_failures.len()
+        ));
+        for f in self.window_failures.iter().take(MAX_LIST) {
+            o.push_str(&format!("  - janela {} [{}] — {}\n", f.window, f.docs, f.error));
+        }
+        if !self.window_failures.is_empty() {
+            o.push_str(
+                "  (janela que falha é DESCARTADA sem nova tentativa: quem só aparece nela \
+não existe no resultado)\n",
+            );
+        }
+
+        o.push_str("\n== CANDIDATOS BRUTOS (antes de qualquer filtro nosso) ==\n");
+        o.push_str(&format!(
+            "personagens {} · lugares {} · habilidades {} · relações {}\n",
+            self.raw_characters, self.raw_places, self.raw_abilities, self.raw_relations
+        ));
+        if !self.window_stats.is_empty() {
+            o.push_str(
+                "por janela (chars do texto → brutos: personagens/lugares/habilidades/relações → \
+personagens mantidos):\n",
+            );
+            let mut stats: Vec<&WindowStat> = self.window_stats.iter().collect();
+            stats.sort_by_key(|s| s.window);
+            for s in stats.iter().take(MAX_LIST * 2) {
+                o.push_str(&format!(
+                    "  janela {:>3} [{}] {:>6} chars → {}/{}/{}/{} → {} mantidos{}\n",
+                    s.window,
+                    s.docs,
+                    s.chars,
+                    s.characters,
+                    s.places,
+                    s.abilities,
+                    s.relations,
+                    s.kept_characters,
+                    // A rich window that yields almost nothing is the model's doing,
+                    // not the filters'.
+                    if s.chars > 4_000 && s.characters <= 2 { "   << pouco para o tamanho" } else { "" }
+                ));
+            }
+        }
+
+        o.push_str("\n== DESCARTES POR CAMADA ==");
+        push_drops(&mut o, "grounding", "grounding (nome sem forma literal na janela)");
+        push_drops(&mut o, "termo relacional", "termo relacional (papel/parentesco genérico)");
+        push_drops(&mut o, "forma", "forma inválida");
+        push_drops(&mut o, "relação", "relações descartadas (ponta sem grounding)");
+        o.push_str(&format!("\nvínculos pendentes gerados: {}\n", self.pending));
+
+        o.push_str("\n== FUSÕES ==\n");
+        let dump = |o: &mut String, title: &str, gs: &[MergeGroup]| {
+            o.push_str(&format!("{title}: {} grupos\n", gs.len()));
+            for g in gs.iter().take(MAX_LIST) {
+                o.push_str(&format!("  {} ← {}\n", g.canonical, g.absorbed.join("; ")));
+            }
+            if gs.len() > MAX_LIST {
+                o.push_str(&format!("  … (+{} não listados)\n", gs.len() - MAX_LIST));
+            }
+        };
+        dump(&mut o, "determinística (canonical_map)", &self.merged_deterministic);
+        dump(&mut o, "LLM (dedupEntities)", &self.merged_llm);
+
+        o.push_str("\n== RESULTADO ==\n");
+        o.push_str(&format!(
+            "personagens {} · lugares {} · habilidades {} · relações {} · pendentes {}\n",
+            self.final_characters,
+            self.final_places,
+            self.final_abilities,
+            self.final_relations,
+            self.pending
+        ));
+        o.push_str(&format!(
+            "\nresumo: {} brutos → {} descartados por grounding, {} por termo relacional, \
+{} por forma; {} nomes fundidos ({} det. + {} LLM); {} janelas perdidas.\n",
+            self.raw_characters + self.raw_places + self.raw_abilities,
+            self.count("grounding"),
+            self.count("termo relacional"),
+            self.count("forma"),
+            self.merged_deterministic.iter().map(|g| g.absorbed.len()).sum::<usize>()
+                + self.merged_llm.iter().map(|g| g.absorbed.len()).sum::<usize>(),
+            self.merged_deterministic.len(),
+            self.merged_llm.len(),
+            self.window_failures.len(),
+        ));
+        o
+    }
+}
+
+/// Turn an alias→canonical map into readable groups.
+fn merge_groups(map: &std::collections::HashMap<String, String>) -> Vec<MergeGroup> {
+    let mut by: std::collections::HashMap<String, Vec<String>> = Default::default();
+    for (alias, canonical) in map {
+        if alias.eq_ignore_ascii_case(canonical) {
+            continue;
+        }
+        by.entry(canonical.clone()).or_default().push(alias.clone());
+    }
+    let mut out: Vec<MergeGroup> = by
+        .into_iter()
+        .map(|(canonical, mut absorbed)| {
+            absorbed.sort();
+            MergeGroup { canonical, absorbed }
+        })
+        .collect();
+    out.sort_by(|a, b| a.canonical.cmp(&b.canonical));
+    out
 }
 
 /// Progress of an extraction run, emitted once per completed batch of windows.
@@ -1092,23 +1367,28 @@ struct Window {
     doc_names: Vec<String>,
 }
 
-fn build_windows(chunks: &[Chunk]) -> Vec<Window> {
+/// Cost/time guard. 40 windows ≈ 480k chars, which a 29-chapter work already
+/// overflows — the tail chapters were silently dropped, so their characters simply
+/// never existed. Coverage beats speed; incremental extraction keeps normal runs (a
+/// chapter or two) small, and only a full re-extract pays it all.
+const MAX_WINDOWS: usize = 150;
+
+/// Returns the windows plus how many chunks were left out by `MAX_WINDOWS` — a
+/// silent truncation is exactly the kind of coverage loss the diagnostic report
+/// has to name out loud.
+fn build_windows(chunks: &[Chunk]) -> (Vec<Window>, usize) {
     const WINDOW_CHARS: usize = 12_000;
     // Below this a window is too thin to be worth its own LLM call, so packing
     // continues across the document boundary rather than firing a call per short
     // chapter.
     const MIN_SPLIT: usize = WINDOW_CHARS / 3;
-    // Cost/time guard. 40 windows ≈ 480k chars, which a 29-chapter work already
-    // overflows — the tail chapters were silently dropped, so their characters
-    // simply never existed. Coverage beats speed; incremental extraction keeps
-    // normal runs (a chapter or two) small, and only a full re-extract pays it all.
-    const MAX_WINDOWS: usize = 150;
 
     let mut windows: Vec<Window> = Vec::new();
     let mut cur = String::new();
     let mut ids: Vec<String> = Vec::new();
     let mut names: Vec<String> = Vec::new();
     let mut cur_doc: Option<&str> = None;
+    let mut consumed = 0usize;
     macro_rules! flush {
         () => {{
             windows.push(Window {
@@ -1117,11 +1397,11 @@ fn build_windows(chunks: &[Chunk]) -> Vec<Window> {
                 doc_names: std::mem::take(&mut names),
             });
             if windows.len() >= MAX_WINDOWS {
-                return windows;
+                break;
             }
         }};
     }
-    for c in chunks {
+    for (i, c) in chunks.iter().enumerate() {
         let new_doc = cur_doc.map_or(false, |d| d != c.doc_name.as_str());
         if new_doc && cur.len() >= MIN_SPLIT {
             flush!();
@@ -1132,6 +1412,7 @@ fn build_windows(chunks: &[Chunk]) -> Vec<Window> {
             names.push(c.doc_name.clone());
         }
         cur.push_str(&format!("[{}]\n{}\n\n", c.doc_name, c.text));
+        consumed = i + 1;
         if cur.len() >= WINDOW_CHARS {
             flush!();
         }
@@ -1139,7 +1420,7 @@ fn build_windows(chunks: &[Chunk]) -> Vec<Window> {
     if !cur.trim().is_empty() {
         windows.push(Window { text: cur, doc_ids: ids, doc_names: names });
     }
-    windows
+    (windows, chunks.len() - consumed)
 }
 
 /// Ask the LLM to read the vault's knowledge and extract characters, places and
@@ -1168,7 +1449,20 @@ pub async fn extract_entities(
         cfg.extraction_model.as_str()
     };
 
-    let windows = build_windows(chunks);
+    let (windows, chunks_dropped) = build_windows(chunks);
+
+    // Always-on accounting of what each layer threw away. Recall loss is invisible
+    // by construction — a name filtered out leaves no trace in the vault — so the
+    // run measures itself.
+    let mut diag = ExtractDiag {
+        windows: windows.len(),
+        window_limit: MAX_WINDOWS,
+        chunks_dropped_by_limit: chunks_dropped,
+        corpus_chars: chunks.iter().map(|c| c.text.len()).sum(),
+        concurrency: cfg.extraction_concurrency.max(1),
+        model: ex_model.to_string(),
+        ..Default::default()
+    };
 
     // Accumulate + merge across windows.
     let mut chars_map: std::collections::HashMap<String, ExtractedChar> = Default::default();
@@ -1222,21 +1516,63 @@ pub async fn extract_entities(
     let mut pending_out: Vec<ExtractedRel> = Vec::new();
     let mut pending_set: std::collections::HashSet<(String, String, String)> = Default::default();
 
-    for batch in windows.chunks(concurrency) {
+    for (batch_no, batch) in windows.chunks(concurrency).enumerate() {
         if cancel.load(std::sync::atomic::Ordering::Relaxed) {
             cancelled = true;
             break;
         }
         let roster = roster_block(&roster_chars, &roster_places, &roster_abilities);
+        let base = batch_no * concurrency;
         let futs = batch
             .iter()
-            .map(|w| extract_window(client, cfg, &w.text, ex_model, &roster, &known))
+            .enumerate()
+            .map(|(i, w)| {
+                let idx = base + i + 1; // 1-based, matches the progress label
+                let docs = w.doc_names.join(", ");
+                let roster = &roster;
+                let known = &known;
+                async move {
+                    let r =
+                        extract_window(client, cfg, &w.text, ex_model, roster, known, idx, &docs)
+                            .await;
+                    (idx, docs, r)
+                }
+            })
             .collect::<Vec<_>>();
-        let parsed_windows: Vec<Extraction> = stream::iter(futs)
-            .buffer_unordered(concurrency)
-            .filter_map(|r| async move { r.ok() })
-            .collect()
-            .await;
+        // A window whose call fails is dropped, never retried — so its exclusive
+        // cast is simply absent from the result. That silence is the point of
+        // recording the failure here.
+        let outcomes: Vec<(usize, String, AppResult<(Extraction, WindowRaw)>)> =
+            stream::iter(futs).buffer_unordered(concurrency).collect().await;
+        let mut parsed_windows: Vec<Extraction> = Vec::new();
+        for (idx, docs, r) in outcomes {
+            match r {
+                Ok((parsed, stats)) => {
+                    diag.windows_ok += 1;
+                    diag.window_stats.push(WindowStat {
+                        window: idx,
+                        docs,
+                        chars: stats.chars,
+                        characters: stats.characters,
+                        places: stats.places,
+                        abilities: stats.abilities,
+                        relations: stats.relations,
+                        kept_characters: stats.kept_characters,
+                    });
+                    diag.raw_characters += stats.characters;
+                    diag.raw_places += stats.places;
+                    diag.raw_abilities += stats.abilities;
+                    diag.raw_relations += stats.relations;
+                    diag.drops.extend(stats.drops);
+                    parsed_windows.push(parsed);
+                }
+                Err(e) => diag.window_failures.push(WindowFailure {
+                    window: idx,
+                    docs,
+                    error: e.to_string(),
+                }),
+            }
+        }
 
         for parsed in parsed_windows {
             for r in &parsed.pending {
@@ -1320,11 +1656,19 @@ pub async fn extract_entities(
                 place_aliases: Default::default(),
                 covered_docs,
                 cancelled,
+                diag,
             });
         }
-        return Err(AppError::Msg(
-            "o modelo não retornou entidades válidas — tente outro modelo de LLM".into(),
-        ));
+        // The diagnostic cannot be written on an error path, so the counts that
+        // explain the emptiness go into the message itself.
+        return Err(AppError::Msg(format!(
+            "o modelo não retornou entidades válidas — {} de {} janelas falharam, \
+{} candidatos brutos, {} descartados no grounding. Tente outro modelo de LLM",
+            diag.window_failures.len(),
+            diag.windows,
+            diag.raw_characters + diag.raw_places + diag.raw_abilities,
+            diag.count("grounding"),
+        )));
     }
 
     // Coreference: "Cesar" and "Cesar Magnus" are the same character. Canonicalize
@@ -1359,6 +1703,17 @@ pub async fn extract_entities(
     let mut char_canon = canonical_map(&char_names);
     let mut place_canon = canonical_map(&place_names);
 
+    // Snapshot the deterministic merges before the LLM pass adds to the same maps,
+    // so the report can tell "containment/diminutive folded these" apart from "the
+    // model decided these were the same person" — different failure modes.
+    diag.merged_deterministic = merge_groups(&char_canon)
+        .into_iter()
+        .chain(merge_groups(&place_canon))
+        .chain(merge_groups(&ability_canon))
+        .collect();
+    let det_keys: std::collections::HashSet<String> =
+        char_canon.keys().chain(place_canon.keys()).cloned().collect();
+
     // Optional LLM dedup: catches aliases the substring heuristic can't (titles,
     // nicknames like "o Caçador" = "Cesar Magnus"). Targeted — only names that
     // share a token with another are sent (the dubious ones); unambiguous names
@@ -1383,6 +1738,16 @@ pub async fn extract_entities(
             for (k, v) in m { place_canon.insert(k, v); }
             chain_resolve(&mut place_canon);
         }
+        // Only the keys the LLM pass added: a merge nobody can audit is where two
+        // genuinely different people (siblings, a shared nickname) become one card
+        // and the cast silently shrinks.
+        let llm_only: std::collections::HashMap<String, String> = char_canon
+            .iter()
+            .chain(place_canon.iter())
+            .filter(|(k, _)| !det_keys.contains(*k))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        diag.merged_llm = merge_groups(&llm_only);
     }
 
     let mut chars_final: std::collections::HashMap<String, ExtractedChar> = Default::default();
@@ -1477,7 +1842,7 @@ pub async fn extract_entities(
         })
         .collect();
 
-    let relations = relations_out
+    let relations: Vec<Relation> = relations_out
         .into_iter()
         .map(|r| Relation { from: r.from, to: r.to, label: r.label })
         .collect();
@@ -1508,12 +1873,19 @@ pub async fn extract_entities(
     char_canon.retain(|k, v| *k != v.to_lowercase());
     place_canon.retain(|k, v| *k != v.to_lowercase());
 
+    diag.final_characters = characters.len();
+    diag.final_places = places.len();
+    diag.final_abilities = abilities.len();
+    diag.final_relations = relations.len();
+    diag.pending = pending.len();
+
     Ok(ExtractResult {
         characters,
         places,
         abilities,
         relations,
         pending,
+        diag,
         char_aliases: char_canon,
         place_aliases: place_canon,
         covered_docs,
@@ -1629,6 +2001,17 @@ nova se ela realmente não estiver na lista.\n",
     out
 }
 
+/// What one window produced before our filters ran, plus what they rejected.
+struct WindowRaw {
+    chars: usize,
+    characters: usize,
+    places: usize,
+    abilities: usize,
+    relations: usize,
+    kept_characters: usize,
+    drops: Vec<DropRecord>,
+}
+
 async fn extract_window(
     client: &reqwest::Client,
     cfg: &RagConfig,
@@ -1636,7 +2019,9 @@ async fn extract_window(
     model: &str,
     roster: &str,
     known: &std::collections::HashMap<String, String>,
-) -> AppResult<Extraction> {
+    window: usize,
+    docs: &str,
+) -> AppResult<(Extraction, WindowRaw)> {
     let rules = "Você extrai entidades de textos de ficção/worldbuilding. \
 Responda APENAS com JSON válido, sem texto extra, sem markdown. Formato:\n\
 {\"characters\":[{\"name\":\"\",\"role\":\"\",\"summary\":\"\",\"traits\":[\"\"],\"sourceDoc\":\"\",\"sourceQuote\":\"\"}],\
@@ -1697,7 +2082,18 @@ NÃO use frases nem expressões de várias palavras em traits — qualquer descr
         .ok_or_else(|| AppError::Msg("modelo não retornou JSON válido para extração".into()))?;
     let parsed: Extraction = serde_json::from_str(&json)
         .map_err(|e| AppError::Msg(format!("falha ao ler JSON da extração: {e}")))?;
-    Ok(ground_extraction(parsed, corpus, known))
+    let mut stats = WindowRaw {
+        chars: corpus.len(),
+        characters: parsed.characters.len(),
+        places: parsed.places.len(),
+        abilities: parsed.abilities.len(),
+        relations: parsed.relations.len(),
+        kept_characters: 0,
+        drops: Vec::new(),
+    };
+    let grounded = ground_extraction_diag(parsed, corpus, known, window, docs, &mut stats.drops);
+    stats.kept_characters = grounded.characters.len();
+    Ok((grounded, stats))
 }
 
 /// Keep only what the source text actually says.
@@ -1714,13 +2110,42 @@ NÃO use frases nem expressões de várias palavras em traits — qualquer descr
 /// name that matches one of them keeps the SAVED spelling (as long as the text
 /// really mentions it), so a character met in chapter 3 is recognized in chapter
 /// 20 and updated instead of duplicated.
+#[cfg(test)]
 fn ground_extraction(
-    mut ex: Extraction,
+    ex: Extraction,
     corpus: &str,
     known: &std::collections::HashMap<String, String>,
 ) -> Extraction {
+    ground_extraction_diag(ex, corpus, known, 0, "", &mut Vec::new())
+}
+
+/// `ground_extraction`, recording every rejection into `drops` with the layer that
+/// made it. Nothing about the filtering changes — only that the losses are counted.
+fn ground_extraction_diag(
+    mut ex: Extraction,
+    corpus: &str,
+    known: &std::collections::HashMap<String, String>,
+    window: usize,
+    docs: &str,
+    drops: &mut Vec<DropRecord>,
+) -> Extraction {
     let hay = fold(corpus);
     let ground_name = |raw: &str| ground_known_name(raw, &hay, corpus, known);
+    // Same call, but the failure carries its reason so it can be attributed.
+    let log = |kind: &str, raw: &str, drops: &mut Vec<DropRecord>| {
+        let e = match ground_known_name_reason(raw, &hay, corpus, known) {
+            Ok(_) => return,
+            Err(e) => e,
+        };
+        drops.push(DropRecord {
+            layer: e.layer().to_string(),
+            kind: kind.to_string(),
+            name: raw.to_string(),
+            window,
+            docs: docs.to_string(),
+            detail: e.detail(),
+        });
+    };
 
     ex.characters.retain_mut(|c| match ground_name(&c.name) {
         Some(n) => {
@@ -1728,7 +2153,10 @@ fn ground_extraction(
             c.source_quote = grounded_quote(&c.source_quote, &hay);
             true
         }
-        None => false,
+        None => {
+            log("personagem", &c.name, drops);
+            false
+        }
     });
     ex.places.retain_mut(|p| match ground_name(&p.name) {
         Some(n) => {
@@ -1736,7 +2164,10 @@ fn ground_extraction(
             p.source_quote = grounded_quote(&p.source_quote, &hay);
             true
         }
-        None => false,
+        None => {
+            log("lugar", &p.name, drops);
+            false
+        }
     });
     ex.abilities.retain_mut(|a| match ground_name(&a.name) {
         Some(n) => {
@@ -1744,7 +2175,10 @@ fn ground_extraction(
             a.source_quote = grounded_quote(&a.source_quote, &hay);
             true
         }
-        None => false,
+        None => {
+            log("habilidade", &a.name, drops);
+            false
+        }
     });
     // Relation endpoints get the same treatment, so edges point at the grounded
     // entity names rather than at hallucinated variants (which render as extra,
@@ -1779,7 +2213,20 @@ fn ground_extraction(
                 });
                 false
             }
-            _ => false,
+            _ => {
+                // Both sides failed, or the pair collapsed onto one entity. The edge
+                // is lost — and with it whatever the story said about the pair.
+                drops.push(DropRecord {
+                    layer: "relação".into(),
+                    kind: "relação".into(),
+                    name: format!("{} → {} ({})", r.from, r.to, r.label),
+                    window,
+                    docs: docs.to_string(),
+                    detail: "nenhuma ponta ancorou como nome (ou as duas caíram na mesma entidade)"
+                        .into(),
+                });
+                false
+            }
         }
     });
     ex.pending = pending;
@@ -1938,33 +2385,52 @@ fn ground_known_name(
     corpus: &str,
     known: &std::collections::HashMap<String, String>,
 ) -> Option<String> {
-    let corpus_form = ground_name(raw, hay, corpus)?;
+    ground_known_name_reason(raw, hay, corpus, known).ok()
+}
+
+/// Same as `ground_known_name`, keeping the reason for a rejection so the
+/// diagnostic report can attribute the loss to a layer.
+fn ground_known_name_reason(
+    raw: &str,
+    hay: &str,
+    corpus: &str,
+    known: &std::collections::HashMap<String, String>,
+) -> Result<String, GroundFail> {
+    let corpus_form = ground_name_reason(raw, hay, corpus)?;
     let cleaned = clean_name(raw);
-    Some(
-        known
-            .get(&fold(&cleaned))
-            .or_else(|| known.get(&fold(&corpus_form)))
-            .cloned()
-            .unwrap_or(corpus_form),
-    )
+    Ok(known
+        .get(&fold(&cleaned))
+        .or_else(|| known.get(&fold(&corpus_form)))
+        .cloned()
+        .unwrap_or(corpus_form))
 }
 
 /// The longest run of consecutive words of `raw` that appears verbatim in the
 /// folded corpus `hay`. Ties break on how often the run occurs (a real name is
 /// repeated; an accidental fragment is not), then leftmost. `None` = the model
 /// made the name up.
+#[cfg(test)]
 fn ground_name(raw: &str, hay: &str, corpus: &str) -> Option<String> {
+    ground_name_reason(raw, hay, corpus).ok()
+}
+
+/// The grounding search, reporting WHY it gave up. `ground_name` is the plain
+/// wrapper; behaviour is identical.
+fn ground_name_reason(raw: &str, hay: &str, corpus: &str) -> Result<String, GroundFail> {
     let name = clean_name(raw);
     if name.is_empty() {
-        return None;
+        return Err(GroundFail::Shape);
     }
     let words: Vec<&str> = name.split_whitespace().collect();
     // A "name" longer than this is a sentence, not an entity.
     if words.is_empty() || words.len() > 8 {
-        return None;
+        return Err(GroundFail::Shape);
     }
     for len in (1..=words.len()).rev() {
         let mut best: Option<(usize, usize, String)> = None; // (count, -start, text)
+        // Best run of the same length that is NOT headed by a role noun. Only used
+        // by the diagnostic: it shows what the role-noun rejection took down with it.
+        let mut best_alt: Option<(usize, usize, String)> = None;
         for start in 0..=(words.len() - len) {
             let run = words[start..start + len].join(" ");
             let folded = fold(&run);
@@ -1979,11 +2445,15 @@ fn ground_name(raw: &str, hay: &str, corpus: &str) -> Option<String> {
             if count == 0 {
                 continue;
             }
-            let better = match &best {
+            let better = |cur: &Option<(usize, usize, String)>| match cur {
                 None => true,
                 Some((bc, bs, _)) => count > *bc || (count == *bc && start < *bs),
             };
-            if better {
+            let head = name_tokens(&run).into_iter().next().unwrap_or_default();
+            if !ROLE_NOUNS.contains(&head.as_str()) && better(&best_alt) {
+                best_alt = Some((count, start, run.clone()));
+            }
+            if better(&best) {
                 best = Some((count, start, run));
             }
         }
@@ -1993,12 +2463,46 @@ fn ground_name(raw: &str, hay: &str, corpus: &str) -> Option<String> {
             // only when the text itself uses it as a proper name.
             let head = name_tokens(&run).into_iter().next().unwrap_or_default();
             if ROLE_NOUNS.contains(&head.as_str()) && !appears_as_proper_noun(corpus, &run) {
-                return None;
+                return Err(GroundFail::RoleNoun {
+                    capitalized_sentence_initial_only: appears_capitalized(corpus, &run),
+                    alternative: best_alt.map(|(_, _, r)| r).filter(|r| *r != run),
+                    run,
+                });
             }
-            return Some(run);
+            return Ok(run);
         }
     }
-    None
+    Err(GroundFail::NotInText)
+}
+
+/// Does `name` occur capitalized ANYWHERE in `corpus` (whole word), including at
+/// the start of a sentence? Paired with `appears_as_proper_noun`, this separates
+/// "the text never capitalizes it" (a common noun, correctly rejected) from "the
+/// text capitalizes it but only sentence-initially" (a real epithet our rule cannot
+/// distinguish — a false negative).
+fn appears_capitalized(corpus: &str, name: &str) -> bool {
+    let nc: Vec<char> = name.chars().collect();
+    let cc: Vec<char> = corpus.chars().collect();
+    if nc.is_empty() || cc.len() < nc.len() {
+        return false;
+    }
+    let eq = |a: char, b: char| a == b || a.to_lowercase().eq(b.to_lowercase());
+    for i in 0..=(cc.len() - nc.len()) {
+        if !nc.iter().enumerate().all(|(j, b)| eq(cc[i + j], *b)) {
+            continue;
+        }
+        if i > 0 && cc[i - 1].is_alphanumeric() {
+            continue;
+        }
+        let end = i + nc.len();
+        if end < cc.len() && cc[end].is_alphanumeric() {
+            continue;
+        }
+        if cc[i].is_uppercase() {
+            return true;
+        }
+    }
+    false
 }
 
 /// Does `name` occur in `corpus` capitalized and NOT merely at the start of a
@@ -2597,8 +3101,9 @@ Chamavam a velha de A Bruxa naquela vila.";
         };
         // Two 5k chapters: each is past the 4k split floor, so neither gets welded
         // to the other even though together they fit inside one 12k window.
-        let w = build_windows(&[mk("Capítulo 1.txt", 0), mk("Capítulo 2.txt", 0)]);
+        let (w, dropped) = build_windows(&[mk("Capítulo 1.txt", 0), mk("Capítulo 2.txt", 0)]);
         assert_eq!(w.len(), 2);
+        assert_eq!(dropped, 0, "nada foi cortado pelo limite de janelas");
         assert!(w[0].text.contains("Capítulo 1.txt") && !w[0].text.contains("Capítulo 2.txt"));
         assert_eq!(w[0].doc_ids, vec!["Capítulo 1.txt".to_string()]);
         // Short chapters still share a window — one LLM call per tiny chapter would
@@ -2611,7 +3116,160 @@ Chamavam a velha de A Bruxa naquela vila.";
             text: "y".repeat(300),
             vector: vec![],
         };
-        assert_eq!(build_windows(&[tiny("a.txt"), tiny("b.txt"), tiny("c.txt")]).len(), 1);
+        assert_eq!(build_windows(&[tiny("a.txt"), tiny("b.txt"), tiny("c.txt")]).0.len(), 1);
+    }
+
+    /// The diagnostic has to attribute each loss to the layer that caused it —
+    /// "the model invented it" and "our filter refused it" are opposite problems.
+    #[test]
+    fn drops_are_attributed_to_the_layer_that_made_them() {
+        let corpus = "Elisa chegou. A mãe de Leonardo esperava. Leonardo dormia.";
+        let ex = Extraction {
+            characters: vec![
+                // Never written in the text → grounding.
+                ExtractedChar { name: "Mirela Aldaravi".into(), role: String::new(), summary: String::new(), traits: vec![], source_doc: String::new(), source_quote: String::new() },
+                // Written, but a generic role → relational-term layer.
+                ExtractedChar { name: "a mãe".into(), role: String::new(), summary: String::new(), traits: vec![], source_doc: String::new(), source_quote: String::new() },
+                // Survives.
+                ExtractedChar { name: "Elisa".into(), role: String::new(), summary: String::new(), traits: vec![], source_doc: String::new(), source_quote: String::new() },
+            ],
+            places: vec![],
+            abilities: vec![],
+            relations: vec![ExtractedRel { from: "Mirela Aldaravi".into(), to: "Ninguém".into(), label: "conhece".into() }],
+            pending: vec![],
+        };
+        let mut drops = Vec::new();
+        let g = ground_extraction_diag(ex, corpus, &Default::default(), 7, "Cap 3.txt", &mut drops);
+        assert_eq!(g.characters.len(), 1);
+        let by = |layer: &str| -> Vec<&DropRecord> {
+            drops.iter().filter(|d| d.layer == layer).collect()
+        };
+        assert_eq!(by("grounding").len(), 1);
+        assert_eq!(by("grounding")[0].name, "Mirela Aldaravi");
+        assert_eq!(by("grounding")[0].window, 7);
+        assert_eq!(by("grounding")[0].docs, "Cap 3.txt");
+        assert_eq!(by("termo relacional").len(), 1);
+        assert_eq!(by("termo relacional")[0].name, "a mãe");
+        assert_eq!(by("relação").len(), 1, "aresta sem ponta ancorada também é perda");
+    }
+
+    /// Hypothesis to be measured, not fixed here: an epithet the prose only ever
+    /// writes at the start of a sentence is indistinguishable from a common noun,
+    /// so the role-noun rule drops a real character. The report must flag it.
+    #[test]
+    fn role_noun_drop_flags_sentence_initial_capitalization() {
+        let only_initial = "Velha entrou. Ninguém respondeu. Velha sentou.";
+        match ground_name_reason("Velha", &fold(only_initial), only_initial) {
+            Err(GroundFail::RoleNoun { capitalized_sentence_initial_only, .. }) => {
+                assert!(capitalized_sentence_initial_only, "maiúscula só em início de frase");
+            }
+            other => panic!("esperava rejeição por termo relacional, veio {:?}", other.is_ok()),
+        }
+        // A plain common noun never capitalized: same rejection, different evidence.
+        let lower = "a velha entrou e ninguém respondeu.";
+        match ground_name_reason("velha", &fold(lower), lower) {
+            Err(GroundFail::RoleNoun { capitalized_sentence_initial_only, .. }) => {
+                assert!(!capitalized_sentence_initial_only);
+            }
+            other => panic!("esperava rejeição, veio {:?}", other.is_ok()),
+        }
+    }
+
+    /// Also a measurement, not a fix: the role-noun check aborts the whole search,
+    /// so a real name sitting next to the role noun is lost with it. The report
+    /// names the collateral.
+    #[test]
+    fn role_noun_drop_reports_the_name_it_took_down() {
+        let corpus = "A mãe chegou. A mãe olhou. Elisa sorriu.";
+        match ground_name_reason("mãe Elisa", &fold(corpus), corpus) {
+            Err(GroundFail::RoleNoun { alternative, .. }) => {
+                assert_eq!(alternative.as_deref(), Some("Elisa"));
+            }
+            other => panic!("esperava rejeição por termo relacional, veio {:?}", other.is_ok()),
+        }
+    }
+
+    /// The window cap used to drop the tail of a long work in silence. It still
+    /// caps — but the run now says how much it left unread.
+    #[test]
+    fn window_limit_truncation_is_counted() {
+        let mk = |n: usize| Chunk {
+            id: format!("c{n}"),
+            doc_id: format!("doc{n}"),
+            doc_name: format!("Capítulo {n}.txt"),
+            ordinal: 0,
+            text: "z".repeat(12_000),
+            vector: vec![],
+        };
+        let chunks: Vec<Chunk> = (0..MAX_WINDOWS + 10).map(mk).collect();
+        let (w, dropped) = build_windows(&chunks);
+        assert_eq!(w.len(), MAX_WINDOWS);
+        assert_eq!(dropped, 10, "os trechos que não couberam são contados, não sumidos");
+    }
+
+    #[test]
+    fn merge_groups_list_what_each_canonical_absorbed() {
+        let map: std::collections::HashMap<String, String> = [
+            ("leo", "Leonardo"),
+            ("leonardo venante", "Leonardo"),
+            ("leonardo", "Leonardo"), // identity, not a merge
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let g = merge_groups(&map);
+        assert_eq!(g.len(), 1);
+        assert_eq!(g[0].canonical, "Leonardo");
+        assert_eq!(g[0].absorbed, vec!["leo".to_string(), "leonardo venante".to_string()]);
+    }
+
+    /// The report is the deliverable — every section has to be there, with the
+    /// totals a reader needs to point at one layer.
+    #[test]
+    fn report_covers_every_layer() {
+        let diag = ExtractDiag {
+            windows: 42,
+            window_limit: MAX_WINDOWS,
+            chunks_dropped_by_limit: 3,
+            windows_ok: 40,
+            window_failures: vec![WindowFailure {
+                window: 12,
+                docs: "Capítulo 9.txt".into(),
+                error: "modelo não retornou JSON válido para extração".into(),
+            }],
+            raw_characters: 300,
+            window_stats: vec![
+                WindowStat { window: 1, docs: "Capítulo 1.txt".into(), chars: 11_800, characters: 9, places: 3, abilities: 0, relations: 12, kept_characters: 7 },
+                // Rich window, almost nothing returned: the model, not our filters.
+                WindowStat { window: 2, docs: "Capítulo 2.txt".into(), chars: 11_500, characters: 1, places: 0, abilities: 0, relations: 0, kept_characters: 1 },
+            ],
+            drops: vec![DropRecord {
+                layer: "grounding".into(),
+                kind: "personagem".into(),
+                name: "Mirela".into(),
+                window: 3,
+                docs: "Capítulo 2.txt".into(),
+                detail: "nada".into(),
+            }],
+            merged_llm: vec![MergeGroup {
+                canonical: "Charlotte".into(),
+                absorbed: vec!["Lô".into()],
+            }],
+            final_characters: 96,
+            ..Default::default()
+        };
+        let r = diag.report();
+        for section in ["== JANELAS ==", "== CANDIDATOS BRUTOS", "== DESCARTES POR CAMADA ==", "== FUSÕES ==", "== RESULTADO =="] {
+            assert!(r.contains(section), "falta a seção {section}");
+        }
+        assert!(r.contains("janela 12 [Capítulo 9.txt]"), "falha de janela precisa aparecer");
+        assert!(r.contains("3 trechos NÃO foram lidos"), "corte pelo limite precisa gritar");
+        assert!(r.contains("Charlotte ← Lô"));
+        assert!(r.contains("Mirela"));
+        // Per-window counts, with the under-reporting window called out.
+        assert!(r.contains("janela   2 [Capítulo 2.txt]"));
+        assert!(r.contains("pouco para o tamanho"));
+        assert!(!r.lines().any(|l| l.contains("janela   1 ") && l.contains("pouco para o tamanho")));
     }
 
     #[test]

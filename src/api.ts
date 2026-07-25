@@ -17,7 +17,13 @@ export type Entities = {
   /// Links the text states without naming one side — suggestions, not graph facts.
   pendingRelations: Relation[];
 };
-export type ExtractOutcome = { entities: Entities; durationMs: number; cancelled: boolean };
+export type ExtractOutcome = {
+  entities: Entities;
+  durationMs: number;
+  cancelled: boolean;
+  /// File the per-layer diagnostic of this run was written to.
+  reportPath: string | null;
+};
 export type ExtractionStats = { durationMs: number; at: string; entityCount: number };
 
 // Progress emitted once per completed batch of extraction windows.
@@ -116,6 +122,9 @@ export const api = {
   // Stops between batches, keeping what was already reconciled.
   cancelExtraction: () => tauriInvoke<void>("cancel_extraction"),
   lastExtraction: () => tauriInvoke<ExtractionStats | null>("last_extraction"),
+  // Per-layer diagnostic of the last extraction (what each filter discarded or
+  // merged), as text.
+  extractionReport: () => tauriInvoke<string | null>("extraction_report"),
   promotePendingRelation: (relation: Relation, name: string) =>
     tauriInvoke<void>("promote_pending_relation", { relation, name }),
   addCharacter: (character: Character) => tauriInvoke<void>("add_character", { character }),

@@ -270,7 +270,76 @@ function ExtractionProgress() {
           </div>
         )}
       </Show>
+
+      <Show when={!state.extracting}>
+        <ExtractionReport />
+      </Show>
     </>
+  );
+}
+
+// The extraction discards a lot on purpose (invented names, generic roles) and
+// merges more (nicknames, titles). When the saved cast comes out SMALLER than the
+// text, the only way to tell an over-aggressive filter from a window that silently
+// failed is to read the per-layer numbers — so every run writes them to a file and
+// this opens it.
+function ExtractionReport() {
+  const [text, setText] = createSignal<string | null>(null);
+  const [open, setOpen] = createSignal(false);
+  const [loading, setLoading] = createSignal(false);
+
+  const toggle = async () => {
+    if (open()) {
+      setOpen(false);
+      return;
+    }
+    setLoading(true);
+    const t = await actions.loadExtractionReport();
+    setLoading(false);
+    if (!t) {
+      actions.notify(
+        "Nenhum relatório encontrado. Ele é gravado ao final de cada extração.",
+        "Sem relatório",
+      );
+      return;
+    }
+    setText(t);
+    setOpen(true);
+  };
+
+  return (
+    <div class="flex flex-col gap-2">
+      <div class="flex items-center gap-2 flex-wrap">
+        <button
+          onClick={() => void toggle()}
+          class="px-2.5 py-1 rounded-7px border border-border bg-bg text-fg-muted text-11px font-semibold cursor-pointer transition-colors hover:text-fg hover:border-accent"
+        >
+          {loading() ? "Abrindo…" : open() ? "Fechar diagnóstico" : "Diagnóstico da extração"}
+        </button>
+        <Show when={open() && text()}>
+          {(t) => (
+            <button
+              onClick={() => void navigator.clipboard.writeText(t())}
+              class="px-2.5 py-1 rounded-7px border border-border bg-bg text-fg-muted text-11px font-semibold cursor-pointer transition-colors hover:text-fg hover:border-accent"
+            >
+              Copiar
+            </button>
+          )}
+        </Show>
+        <Show when={open() && state.extractReportPath}>
+          <span class="text-10.5px text-fg-muted font-mono truncate">
+            {state.extractReportPath}
+          </span>
+        </Show>
+      </div>
+      <Show when={open() && text()}>
+        {(t) => (
+          <pre class="border border-border rounded-10px bg-panel p-3 text-10.5px font-mono text-fg-muted overflow-auto max-h-360px whitespace-pre-wrap anim-pop">
+            {t()}
+          </pre>
+        )}
+      </Show>
+    </div>
   );
 }
 

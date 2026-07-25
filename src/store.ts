@@ -157,6 +157,9 @@ export type State = {
   /// Duration + date of the last completed extraction, so the user can predict
   /// how long the next one of similar size will take.
   lastExtraction: { durationMs: number; at: string; entityCount: number } | null;
+  /// File where the last run's per-layer diagnostic was written (what each filter
+  /// discarded, what got merged, which windows failed).
+  extractReportPath: string | null;
   chatInput: string;
   messages: Message[];
   /// Saved conversations for the active vault. `currentSessionId` is "" for a
@@ -262,6 +265,7 @@ const initial: State = {
   extracting: false,
   extractProgress: null,
   lastExtraction: null,
+  extractReportPath: null,
   chatInput: "",
   pending: false,
   // Chat starts empty, like a fresh AI conversation.
@@ -632,6 +636,7 @@ export const actions = {
         abilities: out.entities.abilities,
         relations: out.entities.relations,
         pendingRelations: out.entities.pendingRelations ?? [],
+        extractReportPath: out.reportPath ?? null,
       });
       const total =
         out.entities.characters.length + out.entities.places.length + out.entities.abilities.length;
@@ -654,6 +659,19 @@ export const actions = {
       actions.notify(`${e}`, "Extração falhou");
     } finally {
       setState({ extracting: false, extractProgress: null });
+    }
+  },
+
+  /// Read the last run's diagnostic. Kept out of the extraction result on purpose:
+  /// the report can be thousands of lines, and it is only wanted when someone is
+  /// actually investigating why the cast came out smaller than the text.
+  async loadExtractionReport(): Promise<string | null> {
+    if (!isTauri) return null;
+    try {
+      return await api.extractionReport();
+    } catch (e) {
+      console.error("relatório de extração", e);
+      return null;
     }
   },
 

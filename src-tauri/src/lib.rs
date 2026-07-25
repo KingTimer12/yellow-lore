@@ -401,6 +401,9 @@ struct ExtractOutcome {
     entities: Entities,
     duration_ms: i64,
     cancelled: bool,
+    /// Where the per-layer diagnostic of this run was written. `None` only if the
+    /// file could not be created.
+    report_path: Option<String>,
 }
 
 #[tauri::command]
@@ -429,6 +432,10 @@ async fn extract_entities(
     let chunks = state.db.load_chunks(&vault)?;
     let force = force.unwrap_or(false);
     let started = std::time::Instant::now();
+    // Read before this run overwrites it: "was the saved cast produced by an older
+    // pipeline?" is answered by the previous run's stamp, not by this one's.
+    let prev_stats = state.db.last_extraction(&vault).ok().flatten();
+    let docs = state.db.list_documents(&vault)?;
 
     // Fresh run — clear any leftover cancel request.
     state.cancel_extract.store(false, Ordering::Relaxed);
@@ -440,6 +447,13 @@ async fn extract_entities(
     // Pick the chunks to scan: everything on a forced run, otherwise only chunks
     // from documents not yet extracted.
     let done = state.db.extracted_docs(&vault)?;
+    // Documents this run will NOT read. If the pipeline changed since they were
+    // extracted, their saved entities are frozen at the old behaviour.
+    let skipped: Vec<String> = docs
+        .iter()
+        .filter(|d| done.contains(&d.id))
+        .map(|d| d.name.clone())
+        .collect();
     let target: Vec<_> = if force {
         chunks.clone()
     } else {
@@ -452,6 +466,7 @@ async fn extract_entities(
             entities: state.db.entities(&vault)?,
             duration_ms: 0,
             cancelled: false,
+            report_path: None,
         });
     }
 
@@ -509,11 +524,89 @@ async fn extract_entities(
     if !res.cancelled {
         state.db.set_last_extraction(&vault, duration_ms).ok();
     }
+
+    // Diagnostic report. Written on every run, to a fixed path, because the
+    // interesting runs are the ones nobody thought to instrument beforehand — and
+    // because a recall problem can only be argued from numbers per layer.
+    let report_path = write_extract_report(
+        &state,
+        &vault,
+        force,
+        docs.len(),
+        &skipped,
+        prev_stats,
+        duration_ms,
+        res.cancelled,
+        &res.diag,
+    );
+
     Ok(ExtractOutcome {
         entities: state.db.entities(&vault)?,
         duration_ms,
         cancelled: res.cancelled,
+        report_path,
     })
+}
+
+/// Compose and save the extraction diagnostic. Returns the path, or `None` if the
+/// file could not be written — a failed report must never fail the extraction.
+#[allow(clippy::too_many_arguments)]
+fn write_extract_report(
+    state: &tauri::State<'_, AppState>,
+    vault: &str,
+    force: bool,
+    doc_count: usize,
+    skipped: &[String],
+    prev: Option<db::ExtractionStats>,
+    duration_ms: i64,
+    cancelled: bool,
+    diag: &rag::ExtractDiag,
+) -> Option<String> {
+    let mut o = String::from("RELATÓRIO DE DIAGNÓSTICO DA EXTRAÇÃO — Yellow Lore\n");
+    o.push_str(&format!("versão: {}\n", env!("CARGO_PKG_VERSION")));
+    o.push_str(&format!("vault: {vault}\n"));
+    o.push_str(&format!(
+        "modo: {}\n",
+        if force { "TUDO (re-extrair tudo)" } else { "incremental" }
+    ));
+    o.push_str(&format!(
+        "documentos no vault: {doc_count} · ignorados por já estarem extraídos: {}\n",
+        skipped.len()
+    ));
+    if !skipped.is_empty() {
+        // The single most misleading state: a full run of the OLD pipeline marked
+        // everything as done, so a new run reads nothing and the vault keeps the old
+        // (worse) cast.
+        o.push_str(&format!("  ignorados: {}\n", skipped.join(", ")));
+        o.push_str(
+            "  !! esses capítulos NÃO foram relidos nesta rodada. Se o pipeline mudou desde \
+que foram extraídos, o resultado salvo é o da versão antiga — rode \"Tudo\".\n",
+        );
+    }
+    match prev {
+        Some(s) => o.push_str(&format!(
+            "extração anterior registrada: {} ms em {} ({} entidades)\n",
+            s.duration_ms, s.at, s.entity_count
+        )),
+        None => o.push_str("extração anterior registrada: nenhuma\n"),
+    }
+    o.push_str(&format!(
+        "duração desta rodada: {duration_ms} ms · cancelada: {}\n\n",
+        if cancelled { "sim" } else { "não" }
+    ));
+    o.push_str(&diag.report());
+
+    let path = state.data_dir.join("extract-report.txt");
+    std::fs::write(&path, o).ok()?;
+    Some(path.to_string_lossy().to_string())
+}
+
+/// The diagnostic of the last extraction, as text — so it can be read (and copied)
+/// from inside the app instead of hunting for the file.
+#[tauri::command]
+fn extraction_report(state: tauri::State<'_, AppState>) -> AppResult<Option<String>> {
+    let path = state.data_dir.join("extract-report.txt");
+    Ok(std::fs::read_to_string(path).ok())
 }
 
 /// Stop an in-flight extraction. It finishes the batch already in flight, keeps
@@ -674,6 +767,7 @@ pub fn run() {
             extract_entities,
             cancel_extraction,
             last_extraction,
+            extraction_report,
             promote_pending_relation,
             add_character,
             add_place,
