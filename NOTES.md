@@ -259,7 +259,12 @@ incremental por padrão, `true` re-scaneia tudo — apaga só `status='Extraído
   conectados" e limite de nós desenhados (top N por conexões, default 60) com
   contagem do que está oculto; sem isso uma obra de 29 capítulos vira um borrão.
   Posições são salvas a cada frame, senão mudar filtro joga o layout de volta na
-  espiral inicial. Para vaults enormes ainda vale trocar a repulsão O(n²) por
+  espiral inicial. Um toggle **pendentes** (off, só aparece se houver algum)
+  desenha os vínculos ainda sem nome como **nó fantasma tracejado** ligado por
+  aresta tracejada; clicar no fantasma pergunta quem é e promove. Fica off por
+  padrão para o mapa nunca sugerir um vínculo que a obra não nomeou, e o modo de
+  ligar aresta se recusa a apontar para um fantasma — seria justamente o vértice
+  morto que a extração passou a rejeitar. Para vaults enormes ainda vale trocar a repulsão O(n²) por
   Barnes-Hut.
 
 ## Limitações conhecidas (levantadas em uso real)

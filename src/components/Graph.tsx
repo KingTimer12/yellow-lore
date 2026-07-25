@@ -3,7 +3,10 @@ import { state, actions } from "../store";
 
 // A node in the lore graph. Characters and places share one canvas — the world
 // is one web of relationships, not two separate lists.
-type Kind = "character" | "place" | "ability" | "unknown";
+// "pending" is not an entity: it is the unnamed side of a link the text asserts
+// ("a mãe de Leonardo"). Drawn as a ghost, off by default, and never a real node —
+// clicking it asks who it is instead of opening an editor.
+type Kind = "character" | "place" | "ability" | "unknown" | "pending";
 type Node = {
   id: string; // lowercased name (relations reference names)
   name: string;
@@ -17,13 +20,14 @@ type Node = {
   fy?: number;
   deg: number;
 };
-type Edge = { a: string; b: string; label: string };
+type Edge = { a: string; b: string; label: string; pending?: boolean };
 
 const COLOR: Record<Kind, string> = {
   character: "var(--accent)",
   place: "oklch(0.68 0.11 195)",
   ability: "oklch(0.66 0.15 300)",
   unknown: "var(--fg-muted)",
+  pending: "var(--fg-muted)",
 };
 
 // Persisted layout so re-extraction / tab switches don't reshuffle the map.
@@ -47,6 +51,9 @@ export default function Graph() {
   const [kinds, setKinds] = createSignal({ character: true, place: true, ability: true });
   const [onlyLinked, setOnlyLinked] = createSignal(false);
   const [cap, setCap] = createSignal(60);
+  // Pending links are suggestions, not facts — hidden unless asked for, so the map
+  // never implies a relationship the story has not named.
+  const [showPending, setShowPending] = createSignal(false);
   const [focus, setFocus] = createSignal("");
   const toggleKind = (k: "character" | "place" | "ability") =>
     setKinds((s) => ({ ...s, [k]: !s[k] }));
@@ -94,10 +101,34 @@ export default function Graph() {
       }
     }
 
+    // Ghost nodes for pending links, only when asked for. They carry no entity id
+    // and are excluded from every filter below — there are few of them and hiding
+    // one behind the cap would just look like a bug.
+    const ghosts: Node[] = [];
+    if (showPending()) {
+      for (const r of state.pendingRelations) {
+        const a = r.from.trim().toLowerCase();
+        const b = r.to.trim().toLowerCase();
+        if (!a || !nodes.has(b) || nodes.has(a)) continue;
+        const prev = savedPos.get(a);
+        ghosts.push({
+          id: a,
+          name: r.from,
+          kind: "pending",
+          x: prev?.x ?? Math.cos(ghosts.length) * 150,
+          y: prev?.y ?? Math.sin(ghosts.length) * 150,
+          vx: 0,
+          vy: 0,
+          deg: 1,
+        });
+        edges.push({ a, b, label: r.label, pending: true });
+      }
+    }
+
     // ---- Apply the volume controls ----------------------------------------
     const all = [...nodes.values()];
     const k = kinds();
-    let vis = all.filter((n) => n.kind === "unknown" || k[n.kind]);
+    let vis = all.filter((n) => n.kind === "unknown" || n.kind === "pending" || k[n.kind]);
 
     // Focus search: the matches plus everything directly related to them, so a
     // name search yields that character's neighbourhood instead of a lone dot.
@@ -120,6 +151,12 @@ export default function Graph() {
         .sort((a, b) => b.deg - a.deg || a.name.localeCompare(b.name, "pt"))
         .slice(0, cap());
     }
+
+    // Ghosts join after the cap — they are suggestions the user asked to see. A
+    // ghost only shows if the named side survived the filters, otherwise it would
+    // float alone with nothing to point at.
+    const shown = new Set(vis.map((n) => n.id));
+    vis = [...vis, ...ghosts.filter((g) => edges.some((e) => e.a === g.id && shown.has(e.b)))];
 
     const visible = new Set(vis.map((n) => n.id));
     return {
@@ -263,6 +300,8 @@ export default function Graph() {
     // Connect mode (started from the drawer): the clicked node is the target.
     const src = state.linkSource;
     if (src) {
+      // A ghost is not an entity — an edge to "a mãe" is the dead vertex we reject.
+      if (nd.kind === "pending") { actions.cancelLink(); return; }
       if (nd.name.toLowerCase() !== src.toLowerCase()) {
         const a = src;
         const b = nd.name;
@@ -307,7 +346,19 @@ export default function Graph() {
     if (drag) {
       const nd = nodeById().get(drag.id);
       if (nd) { nd.fx = undefined; nd.fy = undefined; }
-      if (nd && !drag.moved && nd.refId && nd.kind !== "unknown") {
+      if (nd && !drag.moved && nd.kind === "pending") {
+        const link = state.pendingRelations.find(
+          (r) => r.from.trim().toLowerCase() === nd.id,
+        );
+        if (link)
+          actions.askPrompt({
+            title: "Quem é?",
+            message: `"${link.from}" ${link.label ? `(${link.label}) ` : ""}de ${link.to}`,
+            placeholder: "nome próprio (ex.: Elisa)",
+            confirmLabel: "Nomear",
+            onSubmit: (name) => void actions.promotePending(link, name),
+          });
+      } else if (nd && !drag.moved && nd.refId && nd.kind !== "unknown") {
         actions.openEdit(nd.kind as "character" | "place" | "ability", nd.refId);
       }
       drag = null;
@@ -364,7 +415,8 @@ export default function Graph() {
                     d={geo().d}
                     fill="none"
                     stroke-width={active() ? 1.8 : 1}
-                    style={{ stroke: active() ? "var(--accent)" : "var(--border)", opacity: hover() && !active() ? 0.25 : 0.7 }}
+                    stroke-dasharray={e.pending ? "4 4" : undefined}
+                    style={{ stroke: active() ? "var(--accent)" : "var(--border)", opacity: hover() && !active() ? 0.25 : e.pending ? 0.45 : 0.7 }}
                   />
                   <Show when={active() && e.label}>
                     <text
@@ -410,16 +462,25 @@ export default function Graph() {
               >
                 <circle
                   r={radius(nd)}
-                  fill={COLOR[nd.kind]}
-                  stroke="var(--panel)"
+                  fill={nd.kind === "pending" ? "var(--panel)" : COLOR[nd.kind]}
+                  stroke={nd.kind === "pending" ? "var(--fg-muted)" : "var(--panel)"}
                   stroke-width={2}
+                  stroke-dasharray={nd.kind === "pending" ? "3 3" : undefined}
                   style={{ filter: hover() === nd.id ? "brightness(1.15)" : "none" }}
                 />
                 <text
                   y={radius(nd) + 12}
                   text-anchor="middle"
                   class="font-serif"
-                  style={{ "font-size": "11.5px", "font-weight": 600, fill: "var(--fg)", "paint-order": "stroke", stroke: "var(--panel)", "stroke-width": "3px" }}
+                  style={{
+                    "font-size": "11.5px",
+                    "font-weight": nd.kind === "pending" ? 400 : 600,
+                    "font-style": nd.kind === "pending" ? "italic" : "normal",
+                    fill: nd.kind === "pending" ? "var(--fg-muted)" : "var(--fg)",
+                    "paint-order": "stroke",
+                    stroke: "var(--panel)",
+                    "stroke-width": "3px",
+                  }}
                 >
                   {nd.name}
                 </text>
@@ -477,6 +538,19 @@ export default function Graph() {
           >
             só conectados
           </div>
+          <Show when={state.pendingRelations.length > 0}>
+            <div
+              onClick={() => { setShowPending((v) => !v); reheat(); }}
+              title="Mostra os vínculos que o texto afirma mas não nomeia — clique no nó fantasma para dizer quem é"
+              class="px-2 py-1 rounded-6px border border-dashed text-10.5px font-semibold cursor-pointer transition-colors select-none"
+              classList={{
+                "bg-accent-soft text-accent border-accent": showPending(),
+                "bg-bg/85 text-fg-muted border-border": !showPending(),
+              }}
+            >
+              pendentes ({state.pendingRelations.length})
+            </div>
+          </Show>
           <select
             value={String(cap())}
             onChange={(e) => { setCap(Number(e.currentTarget.value)); reheat(); }}
@@ -517,6 +591,15 @@ export default function Graph() {
         <div class="flex items-center gap-1.5"><span class="w-2.5 h-2.5 rounded-full" style={{ background: COLOR.character }} /> Personagem</div>
         <div class="flex items-center gap-1.5"><span class="w-2.5 h-2.5 rounded-full" style={{ background: COLOR.place }} /> Lugar</div>
         <div class="flex items-center gap-1.5"><span class="w-2.5 h-2.5 rounded-full" style={{ background: COLOR.ability }} /> Habilidade</div>
+        <Show when={showPending()}>
+          <div class="flex items-center gap-1.5 text-fg-muted">
+            <span
+              class="w-2.5 h-2.5 rounded-full border border-dashed"
+              style={{ "border-color": "var(--fg-muted)" }}
+            />
+            Pendente (clique para nomear)
+          </div>
+        </Show>
       </div>
       <div class="absolute right-3 bottom-3 text-10.5px text-fg-muted">
         arraste o nó para mover · rolar para zoom · clique para editar (e ligar no painel)
