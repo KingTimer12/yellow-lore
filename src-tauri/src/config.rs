@@ -91,6 +91,21 @@ pub struct RagConfig {
     /// Internal RAG steps never think regardless of this.
     #[serde(default)]
     pub show_thinking: bool,
+
+    /// Cache provider responses on disk, keyed by the exact request. Free tiers
+    /// meter requests per minute/day, and this app repeats identical calls often
+    /// (re-extracting a chapter, re-indexing, asking the same question) — a hit
+    /// costs no request at all. On by default; turn it off to always hit the model.
+    #[serde(default = "default_true")]
+    pub cache_llm: bool,
+
+    /// Characters of text per extraction window. Each window is one LLM request, so
+    /// this is the main lever on how many requests an extraction spends: doubling it
+    /// halves the request count. The default is sized for small local models; cloud
+    /// models with large context windows take far more per call, which matters when
+    /// the free tier allows only a few requests per day.
+    #[serde(default = "default_window_chars")]
+    pub extraction_window_chars: usize,
 }
 
 fn default_true() -> bool {
@@ -115,6 +130,10 @@ fn default_gemini_base_url() -> String {
 
 fn default_extraction_concurrency() -> usize {
     1
+}
+
+fn default_window_chars() -> usize {
+    12_000
 }
 
 pub const DEFAULT_SYSTEM_PROMPT: &str = "Você é o assistente do Yellow Lore. \
@@ -150,6 +169,8 @@ impl Default for RagConfig {
             rerank: false,
             corrective: false,
             show_thinking: false,
+            cache_llm: true,
+            extraction_window_chars: default_window_chars(),
         }
     }
 }

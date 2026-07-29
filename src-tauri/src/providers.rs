@@ -1,3 +1,4 @@
+use crate::cache;
 use crate::config::RagConfig;
 use crate::error::{AppError, AppResult};
 use futures_util::StreamExt;
@@ -21,7 +22,67 @@ const MAX_RETRIES: u32 = 3;
 
 /// Embed texts with the configured embedding provider/model. Inputs are chunked
 /// into batches of `EMBED_BATCH` and the resulting vectors concatenated in order.
+///
+/// Already-embedded texts are served from the cache and left out of the request,
+/// so re-indexing a vault or re-asking a question costs nothing. A batch whose
+/// texts are all cached fires no request at all.
 pub async fn embed(
+    client: &reqwest::Client,
+    cfg: &RagConfig,
+    inputs: &[String],
+) -> AppResult<Vec<Vec<f32>>> {
+    if !cfg.cache_llm {
+        return embed_uncached(client, cfg, inputs).await;
+    }
+    let keys: Vec<String> = inputs.iter().map(|t| embed_key(cfg, t)).collect();
+    let mut slots: Vec<Option<Vec<f32>>> = keys
+        .iter()
+        .map(|k| cache::get(k).and_then(|v| serde_json::from_str::<Vec<f32>>(&v).ok()))
+        .collect();
+
+    let misses: Vec<usize> = slots
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.is_none())
+        .map(|(i, _)| i)
+        .collect();
+    if !misses.is_empty() {
+        let texts: Vec<String> = misses.iter().map(|&i| inputs[i].clone()).collect();
+        let vecs = embed_uncached(client, cfg, &texts).await?;
+        for (&i, v) in misses.iter().zip(vecs) {
+            if let Ok(json) = serde_json::to_string(&v) {
+                cache::put(&keys[i], &json);
+            }
+            slots[i] = Some(v);
+        }
+    }
+    // Every slot is filled: cached ones up front, the rest by the request above.
+    Ok(slots.into_iter().map(|s| s.unwrap_or_default()).collect())
+}
+
+/// The embedding of a text depends only on the provider, endpoint and model.
+fn embed_key(cfg: &RagConfig, text: &str) -> String {
+    cache::key(
+        "embed",
+        &[
+            &cfg.embedding_provider,
+            embed_endpoint(cfg),
+            &cfg.embedding_model,
+            text,
+        ],
+    )
+}
+
+fn embed_endpoint(cfg: &RagConfig) -> &str {
+    match cfg.embedding_provider.as_str() {
+        "openai" => &cfg.openai_base_url,
+        "vllm" => &cfg.vllm_base_url,
+        "gemini" => &cfg.gemini_base_url,
+        _ => &cfg.ollama_endpoint,
+    }
+}
+
+async fn embed_uncached(
     client: &reqwest::Client,
     cfg: &RagConfig,
     inputs: &[String],
@@ -75,6 +136,50 @@ pub async fn chat_internal(
 }
 
 async fn chat_impl(
+    client: &reqwest::Client,
+    cfg: &RagConfig,
+    messages: &[ChatMessage],
+    model: &str,
+    think: bool,
+) -> AppResult<String> {
+    let ck = cfg.cache_llm.then(|| chat_key(cfg, messages, model, think));
+    if let Some(hit) = ck.as_deref().and_then(cache::get) {
+        return Ok(hit);
+    }
+    let out = chat_request(client, cfg, messages, model, think).await;
+    if let (Some(k), Ok(text)) = (&ck, &out) {
+        cache::put(k, text);
+    }
+    out
+}
+
+/// Everything that can change a completion: where it is sent, which model answers,
+/// the sampling settings, whether it reasons, and the prompt itself.
+fn chat_key(cfg: &RagConfig, messages: &[ChatMessage], model: &str, think: bool) -> String {
+    let endpoint = match cfg.llm_provider.as_str() {
+        "openai" => &cfg.openai_base_url,
+        "vllm" => &cfg.vllm_base_url,
+        "gemini" => &cfg.gemini_base_url,
+        _ => &cfg.ollama_endpoint,
+    };
+    let temp = cfg.temperature.to_string();
+    let ctx = cfg.ollama_num_ctx.to_string();
+    let mut parts: Vec<&str> = vec![
+        &cfg.llm_provider,
+        endpoint,
+        model,
+        &temp,
+        &ctx,
+        if think { "think" } else { "no-think" },
+    ];
+    for m in messages {
+        parts.push(m.role);
+        parts.push(&m.content);
+    }
+    cache::key("chat", &parts)
+}
+
+async fn chat_request(
     client: &reqwest::Client,
     cfg: &RagConfig,
     messages: &[ChatMessage],
@@ -351,6 +456,34 @@ fn provider_error(code: u16, text: &str, attempts: u32) -> AppError {
 /// Stream a chat completion, invoking `on_token` for each text delta as it
 /// arrives. Returns the full concatenated text once the stream ends.
 pub async fn chat_stream<F: FnMut(&str)>(
+    client: &reqwest::Client,
+    cfg: &RagConfig,
+    messages: &[ChatMessage],
+    think: bool,
+    cancel: &AtomicBool,
+    mut on_token: F,
+) -> AppResult<String> {
+    let ck = cfg
+        .cache_llm
+        .then(|| chat_key(cfg, messages, &cfg.llm_model, think));
+    if let Some(hit) = ck.as_deref().and_then(cache::get) {
+        // Replay as a single delta: the UI renders it the same way, it just lands
+        // all at once instead of typing itself out.
+        on_token(&hit);
+        return Ok(hit);
+    }
+    let out = chat_stream_request(client, cfg, messages, think, cancel, on_token).await;
+    // A cancelled generation returns the partial text it managed to stream —
+    // caching that would serve a truncated answer forever.
+    if let (Some(k), Ok(text)) = (&ck, &out) {
+        if !cancel.load(Ordering::Relaxed) && !text.is_empty() {
+            cache::put(k, text);
+        }
+    }
+    out
+}
+
+async fn chat_stream_request<F: FnMut(&str)>(
     client: &reqwest::Client,
     cfg: &RagConfig,
     messages: &[ChatMessage],

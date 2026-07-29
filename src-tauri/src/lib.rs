@@ -1,3 +1,4 @@
+mod cache;
 mod config;
 mod db;
 mod error;
@@ -705,6 +706,26 @@ fn remove_relation(state: tauri::State<'_, AppState>, relation: db::Relation) ->
     state.db.remove_relation(&vault, &relation)
 }
 
+/// How much the response cache is holding, for the Settings screen.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CacheStats {
+    entries: i64,
+    bytes: i64,
+}
+
+#[tauri::command]
+fn cache_stats() -> CacheStats {
+    let (entries, bytes) = cache::stats();
+    CacheStats { entries, bytes }
+}
+
+#[tauri::command]
+fn clear_cache() -> CacheStats {
+    cache::clear();
+    cache_stats()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let builder = tauri::Builder::default();
@@ -726,6 +747,9 @@ pub fn run() {
 
             let db = Db::open(&data_dir.join("yellow-lore.db"))
                 .expect("falha ao abrir o banco SQLite");
+            // Separate file: the cache is disposable and can grow large, so it has
+            // no business inside a backup of the user's vaults.
+            cache::init(&data_dir.join("llm-cache.db"));
             let config = load_config(&data_dir.join("config.json"));
 
             app.manage(AppState {
@@ -779,7 +803,9 @@ pub fn run() {
             delete_place,
             delete_ability,
             add_relation,
-            remove_relation
+            remove_relation,
+            cache_stats,
+            clear_cache
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
