@@ -64,7 +64,11 @@ renomear, excluir). Comandos: `list_sessions`, `create_session`,
   deixa o raciocínio ligado; `chat_internal()` (rerank, grade do CRAG, dedup,
   extração, título) desliga — no Ollama envia `think:false`, no Gemini
   `reasoning_effort:"none"` (os 2.5 raciocinam por padrão), e os prompts internos
-  ainda carregam o hint `/no_think` p/ modelos OpenAI/vLLM. Corta latência dos
+  ainda carregam o hint `/no_think` p/ modelos OpenAI/vLLM. O `reasoning_effort`
+  **não é universal**: no Gemini os modelos que não desligam o pensamento (2.5 Pro)
+  e os pré-2.5 respondem **400** em vez de ignorar o campo. Um 400 faz a chamada
+  repetir sem o campo e liga um latch no processo, então o custo é uma requisição
+  perdida por sessão, não a extração inteira falhando. Corta latência dos
   passos internos que só devolvem saída curta/estruturada. A **resposta final**
   também não raciocina por padrão (`showThinking` off — evita que modelos que
   "pensam em texto puro" vazem um preâmbulo na resposta); ligável nas Configurações.
