@@ -122,6 +122,11 @@ export type Settings = {
   corrective: boolean;
   /// Deixar a resposta final "pensar" (bloco de raciocínio). Off por padrão.
   showThinking: boolean;
+  /// Cachear respostas do provedor em disco, pela requisição exata. Um acerto não
+  /// gasta requisição — o que importa em free tier medido por requisição/dia.
+  cacheLlm: boolean;
+  /// Caracteres por janela de extração. Cada janela é uma requisição.
+  extractionWindowChars: number;
 };
 
 export type EntityKind = "character" | "place" | "ability";
@@ -256,6 +261,8 @@ export const DEFAULT_SETTINGS: Settings = {
   rerank: false,
   corrective: false,
   showThinking: false,
+  cacheLlm: true,
+  extractionWindowChars: 12000,
 };
 
 // ---- Seed data (browser preview only) -------------------------------------

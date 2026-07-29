@@ -138,7 +138,13 @@ export const api = {
   deleteAbility: (id: string) => tauriInvoke<void>("delete_ability", { id }),
   addRelation: (relation: Relation) => tauriInvoke<void>("add_relation", { relation }),
   removeRelation: (relation: Relation) => tauriInvoke<void>("remove_relation", { relation }),
+
+  // response cache
+  cacheStats: () => tauriInvoke<CacheStats>("cache_stats"),
+  clearCache: () => tauriInvoke<CacheStats>("clear_cache"),
 };
+
+export type CacheStats = { entries: number; bytes: number };
 
 // Mock RAG used only in browser preview (no Rust backend).
 export function mockAnswer(question: string): Message {

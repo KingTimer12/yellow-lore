@@ -1,6 +1,13 @@
-import { For, Show, createMemo, type JSX } from "solid-js";
+import { For, Show, createMemo, createSignal, onMount, type JSX } from "solid-js";
 import { state, actions } from "../store";
+import { api, isTauri, type CacheStats } from "../api";
 import { EMBED_PROVIDERS, LLM_PROVIDERS, type ProviderMeta } from "../theme";
+
+function formatBytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(0)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+}
 
 export default function SettingsView() {
   const usesOpenAI = createMemo(
@@ -15,6 +22,25 @@ export default function SettingsView() {
   const usesGemini = createMemo(
     () => state.settings.llmProvider === "gemini" || state.settings.embeddingProvider === "gemini",
   );
+
+  // Cache size is read from the backend, not the store: it changes as calls run,
+  // and nothing else in the UI needs it.
+  const [cache, setCache] = createSignal<CacheStats>({ entries: 0, bytes: 0 });
+  onMount(() => {
+    if (isTauri) api.cacheStats().then(setCache).catch(() => {});
+  });
+  function clearCache() {
+    actions.askConfirm({
+      title: "Limpar o cache de respostas?",
+      message:
+        "As próximas chamadas iguais voltam a gastar requisição do provedor. Nada do seu vault é apagado.",
+      confirmLabel: "Limpar",
+      danger: true,
+      onConfirm: () => {
+        api.clearCache().then(setCache).catch((e) => actions.notify(`${e}`, "Cache"));
+      },
+    });
+  }
 
   return (
     <div class="p-8 overflow-y-auto overflow-x-hidden h-full w-full box-border flex flex-col gap-7.5 anim-view">
@@ -143,6 +169,17 @@ export default function SettingsView() {
           Deixe vazio para reutilizar o modelo de chat (sem baixar nem carregar um segundo modelo). Aponte para um modelo menor/rápido só se tiver VRAM sobrando.
         </div>
         <Slider
+          label={`Janela por chamada (${(state.settings.extractionWindowChars / 1000).toFixed(0)}k caracteres)`}
+          min={4000}
+          max={80000}
+          step={2000}
+          value={state.settings.extractionWindowChars}
+          onInput={(v) => actions.setSetting("extractionWindowChars", v)}
+        />
+        <div class="text-11.5px text-fg-muted -mt-2">
+          Cada janela é uma requisição ao modelo: dobrar o tamanho corta o número de requisições pela metade. 12k é seguro para modelos locais pequenos; com modelos em nuvem de contexto grande, suba bastante — é o jeito mais direto de caber num limite de poucas requisições por dia. Janelas grandes demais para o modelo pioram a extração (ele começa a esquecer o meio do texto).
+        </div>
+        <Slider
           label={`Janelas em paralelo (${state.settings.extractionConcurrency})`}
           min={1}
           max={8}
@@ -166,6 +203,31 @@ export default function SettingsView() {
             label="Enviar contexto junto dos nomes na unificação"
             hint="Manda também o resumo de uma linha e as relações diretas de cada candidato, o que permite detectar duplicata cujos nomes não têm nada em comum. Custa cerca de dez vezes mais tokens nessa chamada e, como fundir duas pessoas diferentes é pior que deixar uma duplicata, vem desligado."
           />
+        </Show>
+      </div>
+
+      {/* Response cache */}
+      <div class="flex flex-col gap-4">
+        <Divider label="Cache de respostas" />
+        <Toggle
+          on={state.settings.cacheLlm}
+          onToggle={() => actions.setSetting("cacheLlm", !state.settings.cacheLlm)}
+          label="Reaproveitar respostas idênticas do provedor"
+          hint="Guarda em disco a resposta de cada chamada, com chave na requisição exata (provedor, modelo, temperatura e prompt). Repetir a extração de um capítulo, reindexar ou refazer a mesma pergunta passa a não gastar requisição nenhuma. Como qualquer mudança no prompt muda a chave, um acerto é sempre a resposta certa para aquela pergunta."
+        />
+        <Show when={state.settings.cacheLlm}>
+          <div class="flex items-center justify-between gap-3 px-3.5 py-2.5 rounded-8px bg-hover border border-border">
+            <div class="text-11.5px text-fg-muted font-mono">
+              {cache().entries} {cache().entries === 1 ? "resposta guardada" : "respostas guardadas"} · {formatBytes(cache().bytes)}
+            </div>
+            <button
+              onClick={clearCache}
+              disabled={cache().entries === 0}
+              class="px-3 py-1.5 rounded-7px border border-border bg-panel text-11.5px font-semibold cursor-pointer transition-colors hover:text-danger hover:border-danger disabled:opacity-40 disabled:cursor-not-allowed"
+            >
+              Limpar cache
+            </button>
+          </div>
         </Show>
       </div>
 
