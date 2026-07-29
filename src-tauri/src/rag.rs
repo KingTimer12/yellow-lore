@@ -1376,12 +1376,14 @@ const MAX_WINDOWS: usize = 150;
 /// Returns the windows plus how many chunks were left out by `MAX_WINDOWS` — a
 /// silent truncation is exactly the kind of coverage loss the diagnostic report
 /// has to name out loud.
-fn build_windows(chunks: &[Chunk]) -> (Vec<Window>, usize) {
-    const WINDOW_CHARS: usize = 12_000;
+fn build_windows(chunks: &[Chunk], window_chars: usize) -> (Vec<Window>, usize) {
+    // Guard the floor: a tiny value would fire one request per chunk, which on a
+    // metered free tier is the worst thing this function can do.
+    let window_chars = window_chars.max(2_000);
     // Below this a window is too thin to be worth its own LLM call, so packing
     // continues across the document boundary rather than firing a call per short
     // chapter.
-    const MIN_SPLIT: usize = WINDOW_CHARS / 3;
+    let min_split = window_chars / 3;
 
     let mut windows: Vec<Window> = Vec::new();
     let mut cur = String::new();
@@ -1403,7 +1405,7 @@ fn build_windows(chunks: &[Chunk]) -> (Vec<Window>, usize) {
     }
     for (i, c) in chunks.iter().enumerate() {
         let new_doc = cur_doc.map_or(false, |d| d != c.doc_name.as_str());
-        if new_doc && cur.len() >= MIN_SPLIT {
+        if new_doc && cur.len() >= min_split {
             flush!();
         }
         cur_doc = Some(&c.doc_name);
@@ -1413,7 +1415,7 @@ fn build_windows(chunks: &[Chunk]) -> (Vec<Window>, usize) {
         }
         cur.push_str(&format!("[{}]\n{}\n\n", c.doc_name, c.text));
         consumed = i + 1;
-        if cur.len() >= WINDOW_CHARS {
+        if cur.len() >= window_chars {
             flush!();
         }
     }
@@ -1449,7 +1451,7 @@ pub async fn extract_entities(
         cfg.extraction_model.as_str()
     };
 
-    let (windows, chunks_dropped) = build_windows(chunks);
+    let (windows, chunks_dropped) = build_windows(chunks, cfg.extraction_window_chars);
 
     // Always-on accounting of what each layer threw away. Recall loss is invisible
     // by construction — a name filtered out leaves no trace in the vault — so the
@@ -3109,7 +3111,7 @@ Chamavam a velha de A Bruxa naquela vila.";
         };
         // Two 5k chapters: each is past the 4k split floor, so neither gets welded
         // to the other even though together they fit inside one 12k window.
-        let (w, dropped) = build_windows(&[mk("Capítulo 1.txt", 0), mk("Capítulo 2.txt", 0)]);
+        let (w, dropped) = build_windows(&[mk("Capítulo 1.txt", 0), mk("Capítulo 2.txt", 0)], 12_000);
         assert_eq!(w.len(), 2);
         assert_eq!(dropped, 0, "nada foi cortado pelo limite de janelas");
         assert!(w[0].text.contains("Capítulo 1.txt") && !w[0].text.contains("Capítulo 2.txt"));
@@ -3124,7 +3126,7 @@ Chamavam a velha de A Bruxa naquela vila.";
             text: "y".repeat(300),
             vector: vec![],
         };
-        assert_eq!(build_windows(&[tiny("a.txt"), tiny("b.txt"), tiny("c.txt")]).0.len(), 1);
+        assert_eq!(build_windows(&[tiny("a.txt"), tiny("b.txt"), tiny("c.txt")], 12_000).0.len(), 1);
     }
 
     /// The diagnostic has to attribute each loss to the layer that caused it —
@@ -3210,7 +3212,7 @@ Chamavam a velha de A Bruxa naquela vila.";
             vector: vec![],
         };
         let chunks: Vec<Chunk> = (0..MAX_WINDOWS + 10).map(mk).collect();
-        let (w, dropped) = build_windows(&chunks);
+        let (w, dropped) = build_windows(&chunks, 12_000);
         assert_eq!(w.len(), MAX_WINDOWS);
         assert_eq!(dropped, 10, "os trechos que não couberam são contados, não sumidos");
     }
