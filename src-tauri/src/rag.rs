@@ -1660,10 +1660,18 @@ pub async fn extract_entities(
             });
         }
         // The diagnostic cannot be written on an error path, so the counts that
-        // explain the emptiness go into the message itself.
+        // explain the emptiness go into the message itself. When the windows failed
+        // outright the provider's own message is the only thing that identifies the
+        // cause (a rejected field, a bad key, an exhausted quota) — without it the
+        // report blames the model for what was really an HTTP error.
+        let cause = diag
+            .window_failures
+            .first()
+            .map(|f| format!(" Primeira falha: {}.", f.error))
+            .unwrap_or_default();
         return Err(AppError::Msg(format!(
             "o modelo não retornou entidades válidas — {} de {} janelas falharam, \
-{} candidatos brutos, {} descartados no grounding. Tente outro modelo de LLM",
+{} candidatos brutos, {} descartados no grounding.{cause} Tente outro modelo de LLM",
             diag.window_failures.len(),
             diag.windows,
             diag.raw_characters + diag.raw_places + diag.raw_abilities,
