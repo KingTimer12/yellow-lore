@@ -35,6 +35,9 @@ pub async fn embed(
             "vllm" => {
                 oai_embed(client, &cfg.vllm_base_url, &cfg.vllm_api_key, &cfg.embedding_model, batch, false).await
             }
+            "gemini" => {
+                oai_embed(client, &cfg.gemini_base_url, &cfg.gemini_api_key, &cfg.embedding_model, batch, true).await
+            }
             "ollama" => ollama_embed(client, cfg, batch).await,
             other => Err(AppError::Provider(format!(
                 "provedor de embedding desconhecido: {other}"
@@ -59,8 +62,9 @@ pub async fn chat(
 /// entity extraction, title). Reasoning is DISABLED to cut latency — these steps
 /// return short structured output where deliberation only wastes tokens/time.
 /// `model` allows a dedicated extraction model. On Ollama this sends
-/// `think: false`; OpenAI/vLLM have no standard toggle, so the prompts also carry
-/// a `/no_think` hint for models that honor it.
+/// `think: false`, on Gemini `reasoning_effort: "none"`; OpenAI/vLLM have no
+/// standard toggle, so the prompts also carry a `/no_think` hint for models that
+/// honor it.
 pub async fn chat_internal(
     client: &reqwest::Client,
     cfg: &RagConfig,
@@ -79,10 +83,13 @@ async fn chat_impl(
 ) -> AppResult<String> {
     match cfg.llm_provider.as_str() {
         "openai" => {
-            oai_chat(client, &cfg.openai_base_url, &cfg.openai_api_key, model, messages, true, cfg.temperature).await
+            oai_chat(client, &cfg.openai_base_url, &cfg.openai_api_key, model, messages, true, cfg.temperature, None).await
         }
         "vllm" => {
-            oai_chat(client, &cfg.vllm_base_url, &cfg.vllm_api_key, model, messages, false, cfg.temperature).await
+            oai_chat(client, &cfg.vllm_base_url, &cfg.vllm_api_key, model, messages, false, cfg.temperature, None).await
+        }
+        "gemini" => {
+            oai_chat(client, &cfg.gemini_base_url, &cfg.gemini_api_key, model, messages, true, cfg.temperature, gemini_reasoning(think)).await
         }
         "ollama" => ollama_chat(client, cfg, messages, model, think).await,
         other => Err(AppError::Provider(format!(
@@ -91,11 +98,19 @@ async fn chat_impl(
     }
 }
 
-// ---- OpenAI-compatible (OpenAI + vLLM) ------------------------------------
+// ---- OpenAI-compatible (OpenAI + vLLM + Gemini) ---------------------------
 //
-// vLLM serves the same `/v1/chat/completions` and `/v1/embeddings` schema as
-// OpenAI; only the base URL differs and the API key is optional. `key_required`
-// distinguishes OpenAI (needs a key) from a local vLLM (key optional).
+// vLLM and Gemini both serve the same `/chat/completions` and `/embeddings`
+// schema as OpenAI; only the base URL differs (and vLLM's key is optional), so
+// all three share these functions. `key_required` distinguishes a hosted API
+// (needs a key) from a local vLLM.
+
+/// Gemini 2.5 models reason by default and there is no `think` flag in the
+/// compatibility layer — `reasoning_effort: "none"` is how you turn it off.
+/// Omitted when reasoning is wanted so the model keeps its own default budget.
+fn gemini_reasoning(think: bool) -> Option<&'static str> {
+    if think { None } else { Some("none") }
+}
 
 async fn oai_embed(
     client: &reqwest::Client,
@@ -106,7 +121,7 @@ async fn oai_embed(
     key_required: bool,
 ) -> AppResult<Vec<Vec<f32>>> {
     if key_required && api_key.trim().is_empty() {
-        return Err(AppError::Provider("API Key da OpenAI não configurada".into()));
+        return Err(AppError::Provider("API Key do provedor não configurada".into()));
     }
     let url = format!("{}/embeddings", base_url.trim_end_matches('/'));
     let mut req = client.post(url).json(&json!({ "model": model, "input": inputs }));
@@ -128,26 +143,33 @@ async fn oai_chat(
     messages: &[ChatMessage],
     key_required: bool,
     temperature: f32,
+    reasoning_effort: Option<&str>,
 ) -> AppResult<String> {
     if key_required && api_key.trim().is_empty() {
-        return Err(AppError::Provider("API Key da OpenAI não configurada".into()));
+        return Err(AppError::Provider("API Key do provedor não configurada".into()));
     }
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
     let msgs: Vec<Value> = messages
         .iter()
         .map(|m| json!({ "role": m.role, "content": m.content }))
         .collect();
-    let mut req = client
-        .post(url)
-        .json(&json!({ "model": model, "messages": msgs, "temperature": temperature }));
+    let mut body = json!({ "model": model, "messages": msgs, "temperature": temperature });
+    if let Some(effort) = reasoning_effort {
+        body["reasoning_effort"] = json!(effort);
+    }
+    let mut req = client.post(url).json(&body);
     if !api_key.trim().is_empty() {
         req = req.bearer_auth(api_key);
     }
     let body: Value = post_json(req).await?;
-    Ok(body["choices"][0]["message"]["content"]
-        .as_str()
-        .unwrap_or_default()
-        .to_string())
+    let msg = &body["choices"][0]["message"];
+    let content = msg["content"].as_str().unwrap_or_default();
+    let thinking = msg["reasoning_content"].as_str().unwrap_or_default();
+    if thinking.is_empty() {
+        Ok(content.to_string())
+    } else {
+        Ok(format!("<think>{thinking}</think>{content}"))
+    }
 }
 
 // ---- Ollama (local) -------------------------------------------------------
@@ -253,14 +275,21 @@ async fn post_json(req: reqwest::RequestBuilder) -> AppResult<Value> {
 /// Whether an HTTP failure is worth retrying: non-quota 429s and 5xx.
 fn is_retryable(code: u16, body: &str) -> bool {
     let low = body.to_lowercase();
-    let quota = low.contains("insufficient_quota") || low.contains("exceeded your current quota");
-    (code == 429 && !quota) || (500..=599).contains(&code)
+    (code == 429 && !is_quota(&low)) || (500..=599).contains(&code)
 }
 
 /// Map an HTTP error into a friendly, actionable message.
+/// Quota exhaustion, across provider dialects. Gemini answers 429 with
+/// `RESOURCE_EXHAUSTED` for BOTH a spent quota and a plain per-minute rate limit,
+/// so that code alone can't decide — only the explicit quota wording counts,
+/// leaving rate limits retryable.
+fn is_quota(low: &str) -> bool {
+    low.contains("insufficient_quota") || low.contains("exceeded your current quota")
+}
+
 fn provider_error(code: u16, text: &str, attempts: u32) -> AppError {
     let low = text.to_lowercase();
-    if code == 429 && (low.contains("insufficient_quota") || low.contains("exceeded your current quota")) {
+    if code == 429 && is_quota(&low) {
         return AppError::Provider(
             "cota da API esgotada — verifique créditos/billing do provedor, \
              ou use o Ollama local (sem cota) nas Configurações."
@@ -295,10 +324,13 @@ pub async fn chat_stream<F: FnMut(&str)>(
 ) -> AppResult<String> {
     match cfg.llm_provider.as_str() {
         "openai" => {
-            oai_chat_stream(client, &cfg.openai_base_url, &cfg.openai_api_key, &cfg.llm_model, messages, true, cfg.temperature, cancel, on_token).await
+            oai_chat_stream(client, &cfg.openai_base_url, &cfg.openai_api_key, &cfg.llm_model, messages, true, cfg.temperature, None, cancel, on_token).await
         }
         "vllm" => {
-            oai_chat_stream(client, &cfg.vllm_base_url, &cfg.vllm_api_key, &cfg.llm_model, messages, false, cfg.temperature, cancel, on_token).await
+            oai_chat_stream(client, &cfg.vllm_base_url, &cfg.vllm_api_key, &cfg.llm_model, messages, false, cfg.temperature, None, cancel, on_token).await
+        }
+        "gemini" => {
+            oai_chat_stream(client, &cfg.gemini_base_url, &cfg.gemini_api_key, &cfg.llm_model, messages, true, cfg.temperature, gemini_reasoning(think), cancel, on_token).await
         }
         "ollama" => ollama_chat_stream(client, cfg, messages, think, cancel, on_token).await,
         other => Err(AppError::Provider(format!(
@@ -326,20 +358,24 @@ async fn oai_chat_stream<F: FnMut(&str)>(
     messages: &[ChatMessage],
     key_required: bool,
     temperature: f32,
+    reasoning_effort: Option<&str>,
     cancel: &AtomicBool,
     mut on_token: F,
 ) -> AppResult<String> {
     if key_required && api_key.trim().is_empty() {
-        return Err(AppError::Provider("API Key da OpenAI não configurada".into()));
+        return Err(AppError::Provider("API Key do provedor não configurada".into()));
     }
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
     let msgs: Vec<Value> = messages
         .iter()
         .map(|m| json!({ "role": m.role, "content": m.content }))
         .collect();
-    let mut req = client
-        .post(url)
-        .json(&json!({ "model": model, "messages": msgs, "stream": true, "temperature": temperature }));
+    let mut body =
+        json!({ "model": model, "messages": msgs, "stream": true, "temperature": temperature });
+    if let Some(effort) = reasoning_effort {
+        body["reasoning_effort"] = json!(effort);
+    }
+    let mut req = client.post(url).json(&body);
     if !api_key.trim().is_empty() {
         req = req.bearer_auth(api_key);
     }
@@ -348,8 +384,17 @@ async fn oai_chat_stream<F: FnMut(&str)>(
     let mut stream = resp.bytes_stream();
     let mut buf = String::new();
     let mut full = String::new();
+    // Reasoning models behind an OpenAI-compatible façade (vLLM/deepseek, Gemini)
+    // put their reasoning in `delta.reasoning_content` while `content` stays
+    // empty. Wrap it in <think>…</think> so the UI renders it in the collapsible
+    // block instead of sitting on the loading dots — same shape as Ollama.
+    let mut in_think = false;
     while let Some(chunk) = stream.next().await {
         if cancel.load(Ordering::Relaxed) {
+            if in_think {
+                on_token("</think>");
+                full.push_str("</think>");
+            }
             return Ok(full);
         }
         buf.push_str(&String::from_utf8_lossy(&chunk?));
@@ -360,17 +405,42 @@ async fn oai_chat_stream<F: FnMut(&str)>(
             let Some(data) = line.strip_prefix("data:") else { continue };
             let data = data.trim();
             if data == "[DONE]" {
+                if in_think {
+                    on_token("</think>");
+                    full.push_str("</think>");
+                }
                 return Ok(full);
             }
             if let Ok(v) = serde_json::from_str::<Value>(data) {
-                if let Some(tok) = v["choices"][0]["delta"]["content"].as_str() {
+                let delta = &v["choices"][0]["delta"];
+                if let Some(th) = delta["reasoning_content"].as_str() {
+                    if !th.is_empty() {
+                        if !in_think {
+                            full.push_str("<think>");
+                            on_token("<think>");
+                            in_think = true;
+                        }
+                        full.push_str(th);
+                        on_token(th);
+                    }
+                }
+                if let Some(tok) = delta["content"].as_str() {
                     if !tok.is_empty() {
+                        if in_think {
+                            full.push_str("</think>");
+                            on_token("</think>");
+                            in_think = false;
+                        }
                         full.push_str(tok);
                         on_token(tok);
                     }
                 }
             }
         }
+    }
+    if in_think {
+        on_token("</think>");
+        full.push_str("</think>");
     }
     Ok(full)
 }

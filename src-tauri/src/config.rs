@@ -29,6 +29,12 @@ pub struct RagConfig {
     pub vllm_base_url: String,
     #[serde(default)]
     pub vllm_api_key: String,
+    /// Google Gemini, consumed through its OpenAI-compatible endpoint so it reuses
+    /// the same chat/embeddings/SSE code paths as OpenAI.
+    #[serde(default)]
+    pub gemini_api_key: String,
+    #[serde(default = "default_gemini_base_url")]
+    pub gemini_base_url: String,
 
     // --- Agent behaviour ---
     /// System prompt the user can tune to steer answers.
@@ -103,6 +109,10 @@ fn default_vllm_base_url() -> String {
     "http://localhost:8000/v1".into()
 }
 
+fn default_gemini_base_url() -> String {
+    "https://generativelanguage.googleapis.com/v1beta/openai".into()
+}
+
 fn default_extraction_concurrency() -> usize {
     1
 }
@@ -125,6 +135,8 @@ impl Default for RagConfig {
             ollama_num_ctx: default_num_ctx(),
             vllm_base_url: default_vllm_base_url(),
             vllm_api_key: String::new(),
+            gemini_api_key: String::new(),
+            gemini_base_url: default_gemini_base_url(),
             system_prompt: DEFAULT_SYSTEM_PROMPT.into(),
             chunk_size: 800,
             chunk_overlap: 120,
