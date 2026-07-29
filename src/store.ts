@@ -101,6 +101,8 @@ export type Settings = {
   ollamaNumCtx: number;
   vllmBaseUrl: string;
   vllmApiKey: string;
+  geminiApiKey: string;
+  geminiBaseUrl: string;
   systemPrompt: string;
   chunkSize: number;
   chunkOverlap: number;
@@ -238,6 +240,8 @@ export const DEFAULT_SETTINGS: Settings = {
   ollamaNumCtx: 8192,
   vllmBaseUrl: "http://localhost:8000/v1",
   vllmApiKey: "",
+  geminiApiKey: "",
+  geminiBaseUrl: "https://generativelanguage.googleapis.com/v1beta/openai",
   systemPrompt:
     "Você é o assistente do Yellow Lore. Responda SEMPRE com base nos trechos de conhecimento fornecidos no contexto. Se a resposta não estiver no contexto, diga que não encontrou nos documentos indexados.",
   chunkSize: 800,

@@ -12,6 +12,9 @@ export default function SettingsView() {
   const usesVllm = createMemo(
     () => state.settings.llmProvider === "vllm" || state.settings.embeddingProvider === "vllm",
   );
+  const usesGemini = createMemo(
+    () => state.settings.llmProvider === "gemini" || state.settings.embeddingProvider === "gemini",
+  );
 
   return (
     <div class="p-8 overflow-y-auto overflow-x-hidden h-full w-full box-border flex flex-col gap-7.5 anim-view">
@@ -31,7 +34,7 @@ export default function SettingsView() {
         model={state.settings.llmModel}
         onModel={(v) => actions.setSetting("llmModel", v)}
         modelLabel="Modelo de LLM"
-        modelPlaceholder="llama3.1 / gpt-4o"
+        modelPlaceholder="llama3.1 / gpt-4o / gemini-2.5-flash"
       />
 
       {/* Embedding */}
@@ -52,6 +55,16 @@ export default function SettingsView() {
           <Divider label="OpenAI" />
           <Field label="API Key" type="password" value={state.settings.openaiApiKey} onInput={(v) => actions.setSetting("openaiApiKey", v)} />
           <Field label="Base URL" value={state.settings.openaiBaseUrl} onInput={(v) => actions.setSetting("openaiBaseUrl", v)} />
+        </div>
+      </Show>
+      <Show when={usesGemini()}>
+        <div class="flex flex-col gap-4">
+          <Divider label="Gemini" />
+          <Field label="API Key" type="password" value={state.settings.geminiApiKey} onInput={(v) => actions.setSetting("geminiApiKey", v)} />
+          <Field label="Base URL" value={state.settings.geminiBaseUrl} onInput={(v) => actions.setSetting("geminiBaseUrl", v)} placeholder="https://generativelanguage.googleapis.com/v1beta/openai" />
+          <div class="text-11.5px text-fg-muted">
+            Pegue a chave no Google AI Studio. Usa a camada compatível com OpenAI do Gemini, então streaming e citações funcionam igual. O raciocínio dos modelos 2.5 fica desligado enquanto "Mostrar raciocínio" estiver desmarcado.
+          </div>
         </div>
       </Show>
       <Show when={usesOllama()}>
@@ -186,7 +199,7 @@ function ProviderSection(props: {
   return (
     <div class="flex flex-col gap-3">
       <div class="text-12px font-bold text-fg-muted uppercase tracking-[0.04em]">{props.title}</div>
-      <div class="grid grid-cols-3 gap-2.5">
+      <div class="grid grid-cols-2 lg:grid-cols-4 gap-2.5">
         <For each={props.providers}>
           {(p) => {
             const active = () => p.id === props.selected;

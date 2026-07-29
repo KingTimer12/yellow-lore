@@ -81,17 +81,19 @@ export function initials(name: string): string {
 
 export type ProviderMeta = { id: string; label: string; hint: string };
 
-// Ollama (local), OpenAI and vLLM (OpenAI-compatible server) are wired in the
-// Rust backend. LLM and embedding pick a provider independently.
+// Ollama (local), OpenAI, Gemini and vLLM (OpenAI-compatible server) are wired
+// in the Rust backend. LLM and embedding pick a provider independently.
 export const LLM_PROVIDERS: ProviderMeta[] = [
   { id: "ollama", label: "Ollama (local)", hint: "Modelos locais, sem API key" },
   { id: "openai", label: "OpenAI", hint: "GPT-4o, GPT-4.1, o-series" },
+  { id: "gemini", label: "Gemini", hint: "gemini-2.5-flash, gemini-2.5-pro" },
   { id: "vllm", label: "vLLM", hint: "Servidor OpenAI-compatível (self-hosted)" },
 ];
 
 export const EMBED_PROVIDERS: ProviderMeta[] = [
   { id: "ollama", label: "Ollama (local)", hint: "nomic-embed-text, mxbai-embed-large" },
   { id: "openai", label: "OpenAI", hint: "text-embedding-3-small / large" },
+  { id: "gemini", label: "Gemini", hint: "gemini-embedding-001" },
   { id: "vllm", label: "vLLM", hint: "Modelos de embedding servidos via vLLM" },
 ];
 

@@ -12,6 +12,7 @@ export default function CreateVaultModal() {
   const usesOpenAI = createMemo(() => s().llmProvider === "openai" || s().embeddingProvider === "openai");
   const usesOllama = createMemo(() => s().llmProvider === "ollama" || s().embeddingProvider === "ollama");
   const usesVllm = createMemo(() => s().llmProvider === "vllm" || s().embeddingProvider === "vllm");
+  const usesGemini = createMemo(() => s().llmProvider === "gemini" || s().embeddingProvider === "gemini");
 
   const canCreate = () => name().trim().length > 0;
 
@@ -69,7 +70,7 @@ export default function CreateVaultModal() {
               onSelect={(id) => actions.setSetting("llmProvider", id)}
               model={s().llmModel}
               onModel={(v) => actions.setSetting("llmModel", v)}
-              modelPlaceholder="llama3.1 / gpt-4o"
+              modelPlaceholder="llama3.1 / gpt-4o / gemini-2.5-flash"
             />
 
             <ProviderPick
@@ -86,6 +87,12 @@ export default function CreateVaultModal() {
               <div class="flex flex-col gap-3">
                 <Divider label="OpenAI" />
                 <Field label="API Key" type="password" value={s().openaiApiKey} onInput={(v) => actions.setSetting("openaiApiKey", v)} />
+              </div>
+            </Show>
+            <Show when={usesGemini()}>
+              <div class="flex flex-col gap-3">
+                <Divider label="Gemini" />
+                <Field label="API Key" type="password" value={s().geminiApiKey} onInput={(v) => actions.setSetting("geminiApiKey", v)} />
               </div>
             </Show>
             <Show when={usesOllama()}>
@@ -138,7 +145,7 @@ function ProviderPick(props: {
   return (
     <div class="flex flex-col gap-2.5">
       <div class="text-11.5px font-bold text-fg-muted uppercase tracking-[0.04em]">{props.title}</div>
-      <div class="grid grid-cols-3 gap-2">
+      <div class="grid grid-cols-4 gap-2">
         <For each={props.providers}>
           {(p) => {
             const active = () => p.id === props.selected;
