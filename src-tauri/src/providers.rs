@@ -105,11 +105,41 @@ async fn chat_impl(
 // all three share these functions. `key_required` distinguishes a hosted API
 // (needs a key) from a local vLLM.
 
+/// Set once a server has answered 400 to `reasoning_effort`, so the rest of the
+/// session stops paying a rejected request per call. Sticky for the process: the
+/// cost of being wrong after a model switch is only that internal steps reason
+/// (slower), never a failure.
+static NO_REASONING_FIELD: AtomicBool = AtomicBool::new(false);
+
 /// Gemini 2.5 models reason by default and there is no `think` flag in the
 /// compatibility layer — `reasoning_effort: "none"` is how you turn it off.
 /// Omitted when reasoning is wanted so the model keeps its own default budget.
 fn gemini_reasoning(think: bool) -> Option<&'static str> {
-    if think { None } else { Some("none") }
+    if think || NO_REASONING_FIELD.load(Ordering::Relaxed) {
+        None
+    } else {
+        Some("none")
+    }
+}
+
+/// Whether the failure is an HTTP 400 (see `provider_error`'s generic arm, which
+/// prefixes the body with the status code).
+fn is_bad_request(e: &AppError) -> bool {
+    matches!(e, AppError::Provider(m) if m.starts_with("400:"))
+}
+
+/// `reasoning_effort` is not universally accepted: Gemini rejects it outright on
+/// models whose thinking cannot be turned off (2.5 Pro) and on pre-2.5 models,
+/// answering 400 instead of ignoring the field. Drop it and say so, so the caller
+/// can retry a request that is otherwise fine — better a reasoning internal step
+/// than a failed extraction.
+fn drop_reasoning_field(body: &mut Value) -> bool {
+    let had = body.get("reasoning_effort").is_some();
+    if had {
+        body.as_object_mut().map(|o| o.remove("reasoning_effort"));
+        NO_REASONING_FIELD.store(true, Ordering::Relaxed);
+    }
+    had
 }
 
 async fn oai_embed(
@@ -157,11 +187,17 @@ async fn oai_chat(
     if let Some(effort) = reasoning_effort {
         body["reasoning_effort"] = json!(effort);
     }
-    let mut req = client.post(url).json(&body);
-    if !api_key.trim().is_empty() {
-        req = req.bearer_auth(api_key);
-    }
-    let body: Value = post_json(req).await?;
+    let send = |body: &Value| {
+        let mut req = client.post(&url).json(body);
+        if !api_key.trim().is_empty() {
+            req = req.bearer_auth(api_key);
+        }
+        post_json(req)
+    };
+    let body: Value = match send(&body).await {
+        Err(e) if is_bad_request(&e) && drop_reasoning_field(&mut body) => send(&body).await?,
+        r => r?,
+    };
     let msg = &body["choices"][0]["message"];
     let content = msg["content"].as_str().unwrap_or_default();
     let thinking = msg["reasoning_content"].as_str().unwrap_or_default();
@@ -375,11 +411,17 @@ async fn oai_chat_stream<F: FnMut(&str)>(
     if let Some(effort) = reasoning_effort {
         body["reasoning_effort"] = json!(effort);
     }
-    let mut req = client.post(url).json(&body);
-    if !api_key.trim().is_empty() {
-        req = req.bearer_auth(api_key);
-    }
-    let resp = stream_status_guard(req.send().await?).await?;
+    let open = |body: &Value| {
+        let mut req = client.post(&url).json(body);
+        if !api_key.trim().is_empty() {
+            req = req.bearer_auth(api_key);
+        }
+        async move { stream_status_guard(req.send().await?).await }
+    };
+    let resp = match open(&body).await {
+        Err(e) if is_bad_request(&e) && drop_reasoning_field(&mut body) => open(&body).await?,
+        r => r?,
+    };
 
     let mut stream = resp.bytes_stream();
     let mut buf = String::new();
