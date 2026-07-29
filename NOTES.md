@@ -57,11 +57,13 @@ renomear, excluir). Comandos: `list_sessions`, `create_session`,
 - `vector_store.rs` — a matemática: cosseno + busca top-k, **+ `keyword_search`
   lexical com peso IDF** (termo raro vence palavras comuns) para a **busca
   híbrida** (semântico + lexical), cobrindo match literal que o embedding perde.
-- `providers.rs` — embedding + chat via **Ollama** (local), **OpenAI** e
-  **vLLM** (servidor OpenAI-compatível, key opcional), escolhidos de forma
-  independente. **Thinking só na resposta final**: `chat()` (resposta ao usuário)
+- `providers.rs` — embedding + chat via **Ollama** (local), **OpenAI**,
+  **Gemini** e **vLLM** (servidor OpenAI-compatível, key opcional), escolhidos de
+  forma independente. Gemini entra pela **camada compatível com OpenAI**
+  (`/v1beta/openai`), então reusa `oai_chat`/`oai_embed`/SSE sem código próprio. **Thinking só na resposta final**: `chat()` (resposta ao usuário)
   deixa o raciocínio ligado; `chat_internal()` (rerank, grade do CRAG, dedup,
-  extração, título) desliga — no Ollama envia `think:false`, e os prompts internos
+  extração, título) desliga — no Ollama envia `think:false`, no Gemini
+  `reasoning_effort:"none"` (os 2.5 raciocinam por padrão), e os prompts internos
   ainda carregam o hint `/no_think` p/ modelos OpenAI/vLLM. Corta latência dos
   passos internos que só devolvem saída curta/estruturada. A **resposta final**
   também não raciocina por padrão (`showThinking` off — evita que modelos que

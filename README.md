@@ -28,7 +28,8 @@ nada de servidores externos ou Python.
   crie arestas ligando nós pelo painel, edite o rótulo e exclua.
 - **Busca e ordenação** — filtre por nome/tipo/traço; listas em ordem
   alfabética.
-- **Provedores** — Ollama (local), OpenAI e vLLM (servidor OpenAI-compatível);
+- **Provedores** — Ollama (local), OpenAI, Gemini e vLLM (servidor
+  OpenAI-compatível);
   modelo de LLM e de embedding configurados de forma **independente**.
 - **RAG configurável** — chunk size, overlap, top-k, temperatura, num_ctx,
   prompt do sistema.
