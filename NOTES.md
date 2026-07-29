@@ -57,6 +57,24 @@ renomear, excluir). Comandos: `list_sessions`, `create_session`,
 - `vector_store.rs` — a matemática: cosseno + busca top-k, **+ `keyword_search`
   lexical com peso IDF** (termo raro vence palavras comuns) para a **busca
   híbrida** (semântico + lexical), cobrindo match literal que o embedding perde.
+- `cache.rs` — **cache de respostas** do provedor em SQLite próprio
+  (`llm-cache.db`, fora do banco dos vaults: é descartável e não entra em backup).
+  Chave = blake3 de tudo que determina a resposta (provedor, endpoint, modelo,
+  temperatura, num_ctx, thinking e o prompt inteiro), então **acerto é
+  byte-idêntico** ao que o provedor devolveria e stale é impossível — mudou o
+  documento, mudou o prompt, mudou a chave. Existe porque free tier mede
+  **requisições** (o `gemini-3.6-flash` permite 5/min e 20/dia), e o app repete
+  chamada idêntica bastante: re-extrair o mesmo capítulo, reindexar, repetir a
+  pergunta. Cobre chat, chat com streaming (acerto reproduz o texto num delta só;
+  geração cancelada **não** é gravada, senão a resposta truncada ficaria pra
+  sempre) e embedding (cache por texto — só os que faltam entram na requisição, e
+  lote todo em cache = zero requisições). Toda operação é best-effort: cache
+  quebrado degrada em requisição extra, nunca em erro. `cacheLlm` desliga; as
+  Configurações mostram tamanho e limpam. Nota: a janela de extração carrega o
+  **roster** de entidades já salvas, então re-extração incremental muda o prompt e
+  não acerta — quem acerta de fato é o re-extrair completo e a mesma pergunta.
+  Complemento: `extractionWindowChars` é o outro lado da mesma economia — cada
+  janela é uma requisição, dobrar a janela corta as requisições pela metade.
 - `providers.rs` — embedding + chat via **Ollama** (local), **OpenAI**,
   **Gemini** e **vLLM** (servidor OpenAI-compatível, key opcional), escolhidos de
   forma independente. Gemini entra pela **camada compatível com OpenAI**

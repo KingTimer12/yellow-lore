@@ -33,6 +33,8 @@ nada de servidores externos ou Python.
   modelo de LLM e de embedding configurados de forma **independente**.
 - **RAG configurável** — chunk size, overlap, top-k, temperatura, num_ctx,
   prompt do sistema.
+- **Cache de respostas** — chamada idêntica ao provedor não é repetida; economiza
+  o limite de requisições por minuto/dia dos free tiers.
 - **Auto-update** (desktop) via Tauri updater a partir do GitHub Release.
 - Tema claro/escuro, escala da UI conforme a tela, micro-animações,
   tudo offline-first.
